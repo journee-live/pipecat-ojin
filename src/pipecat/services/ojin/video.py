@@ -88,6 +88,9 @@ class OjinPersonaSettings:
     push_bot_stopped_speaking_frames: bool = field(
         default=True
     )  # whether to push bot stopped speaking frames to the output
+    mode: str | None = field(
+        default=None
+    )
 
 
 class ConversationSignal(Enum):
@@ -532,6 +535,7 @@ class OjinPersonaService(FrameProcessor):
                 ws_url=settings.ws_url,
                 api_key=settings.api_key,
                 config_id=settings.persona_config_id,
+                mode=settings.mode,
             )
         else:
             self._client = client

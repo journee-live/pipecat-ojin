@@ -400,7 +400,7 @@ class OjinPersonaFSM:
                 image_frame = OutputImageRawFrame(
                     image=idle_frame.image,
                     size=self._settings.image_size,
-                    format="BGR",
+                    format="RGB",
                 )
                 image_frame.pts = self._playback_loop.get_current_frame_idx()
                 return image_frame
@@ -424,7 +424,7 @@ class OjinPersonaFSM:
                     image_frame = OutputImageRawFrame(
                         image=idle_frame.image,
                         size=self._settings.image_size,
-                        format="BGR",
+                        format="RGB",
                     )
                     image_frame.pts = self._playback_loop.get_current_frame_idx()
 
@@ -474,6 +474,7 @@ class OjinPersonaInteraction:
     ending_timestamp: float = 0.0
     mouth_opening_scale: float = 0.0
     received_all_interaction_inputs: bool = False
+    should_update_animation_keyframes: bool = False
 
     def __post_init__(self):
         """Initialize queues after instance creation."""
@@ -578,11 +579,6 @@ class OjinPersonaService(FrameProcessor):
                 audio_int16_bytes=silence_audio,
                 interaction_id=self._interaction.interaction_id,
                 is_last_input=is_last_input,
-                params={
-                    "start_frame_idx": self._interaction.start_frame_idx,
-                    "filter_amount": self._interaction.filter_amount,
-                    "mouth_opening_scale": self._interaction.mouth_opening_scale,
-                },
             )
         )
 
@@ -600,7 +596,7 @@ class OjinPersonaService(FrameProcessor):
         if new_state == PersonaState.INITIALIZING:
             self._server_fps_tracker.start()
             # Send silence to persona with idle_sequence_duration
-            await self._start_interaction(is_speech=False)
+            await self._start_interaction(is_speech=False, should_update_animation_keyframes=True)
             assert self._interaction is not None
             self._interaction.set_state(InteractionState.ALL_AUDIO_PROCESSED)
             await self._generate_and_send_silence(self._settings.idle_sequence_duration, True)
@@ -837,7 +833,7 @@ class OjinPersonaService(FrameProcessor):
             image_frame = OutputImageRawFrame(
                 image=message.video_frame_bytes,
                 size=self._settings.image_size,
-                format="BGR",
+                format="RGB",
             )
             image_frame.pts = self._interaction.frame_idx
             # Push the image frame to the FSM if it exists for advanced processing or directly to the output to outsource the processing to the client
@@ -877,12 +873,12 @@ class OjinPersonaService(FrameProcessor):
                 self._interaction is not None
                 and self._interaction.state == InteractionState.WAITING_READY
             ):
-                self._interaction.start_frame_idx = self._fsm.get_transition_frame_idx()
-                self._interaction.frame_idx = self._fsm.get_transition_frame_idx()
                 self._interaction.set_state(InteractionState.ACTIVE)
                 await self._fsm.on_conversation_signal(
                     ConversationSignal.SPEECH_AUDIO_STARTED_PROCESSING
                 )
+                self._interaction.start_frame_idx = self._fsm.get_transition_frame_idx()
+                self._interaction.frame_idx = self._fsm.get_transition_frame_idx()
 
         elif isinstance(message, ErrorResponseMessage):
             is_fatal = False
@@ -984,7 +980,7 @@ class OjinPersonaService(FrameProcessor):
         elif isinstance(frame, StartInterruptionFrame):
             logger.debug("StartInterruptionFrame")
             # only interrupt if we are allowed to send TTS input
-            if self.is_pending_initialization():
+            if not self.is_pending_initialization() and self.is_tts_input_allowed():
                 await self._interrupt()
 
             await self.push_frame(frame, direction)
@@ -1021,6 +1017,7 @@ class OjinPersonaService(FrameProcessor):
         self,
         new_interaction: Optional[OjinPersonaInteraction] = None,
         is_speech: bool = False,
+        should_update_animation_keyframes: bool = False,
     ):
         """Start a new interaction with the persona.
 
@@ -1056,6 +1053,7 @@ class OjinPersonaService(FrameProcessor):
         logger.debug(f"Started interaction with id: {interaction_id}")
         self._interaction.interaction_id = interaction_id
         self._interaction.set_state(InteractionState.WAITING_READY)
+        self._interaction.should_update_animation_keyframes = should_update_animation_keyframes
 
     async def _end_interaction(self):
         """End the current interaction.
@@ -1117,22 +1115,10 @@ class OjinPersonaService(FrameProcessor):
 
             assert self._interaction is not None and self._interaction.audio_input_queue is not None
 
-            # TODO(mouad): should we set the start_frame_idx in StartInteraction instead?
-            # Queue the audio for later processing
-            start_frame_idx = 0
-            if self._interaction.pending_first_input:
-                start_frame_idx = self._interaction.start_frame_idx or 0
-
-            logger.info(f"start index: {start_frame_idx}")
             await self._interaction.audio_input_queue.put(
                 OjinPersonaInteractionInputMessage(
                     interaction_id=self._interaction.interaction_id,
                     audio_int16_bytes=resampled_audio,
-                    params={
-                        "start_frame_idx": start_frame_idx,
-                        "filter_amount": self._interaction.filter_amount,
-                        "mouth_opening_scale": self._interaction.mouth_opening_scale,
-                    },
                 )
             )
             self._interaction.pending_first_input = False
@@ -1211,12 +1197,20 @@ class OjinPersonaService(FrameProcessor):
                     logger.error(
                         f"Audio queue empty! state = {self._interaction.state} is_final_message = {is_final_message}"
                     )
+                    continue
+
 
             if is_final_message:
                 logger.debug("sending last audio input")
                 self._interaction.set_state(InteractionState.ALL_AUDIO_PROCESSED)
                 message.is_last_input = True
 
+            message.params ={
+                "start_frame_idx": self._interaction.start_frame_idx,
+                "filter_amount": self._interaction.filter_amount,
+                "mouth_opening_scale": self._interaction.mouth_opening_scale,
+                "should_update_animation_keyframes": self._interaction.should_update_animation_keyframes
+            }
             logger.debug(
                 f"Sending audio int16: {len(message.audio_int16_bytes)} is_final: {message.is_last_input}"
             )

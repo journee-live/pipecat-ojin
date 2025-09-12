@@ -450,6 +450,7 @@ IDLE_FILTER_AMOUNT = 1000.0
 IDLE_MOUTH_OPENING_SCALE = 0.0
 SPEECH_MOUTH_OPENING_SCALE = 1.0
 
+IDLE_ANIMATION_KEYFRAMES_SLOT = 0
 
 @dataclass
 class OjinPersonaInteraction:
@@ -474,7 +475,8 @@ class OjinPersonaInteraction:
     ending_timestamp: float = 0.0
     mouth_opening_scale: float = 0.0
     received_all_interaction_inputs: bool = False
-    should_update_animation_keyframes: bool = False
+    active_keyframes_slot: int = IDLE_ANIMATION_KEYFRAMES_SLOT
+    keyframe_slot_to_update: int = -1
 
     def __post_init__(self):
         """Initialize queues after instance creation."""
@@ -579,6 +581,13 @@ class OjinPersonaService(FrameProcessor):
                 audio_int16_bytes=silence_audio,
                 interaction_id=self._interaction.interaction_id,
                 is_last_input=is_last_input,
+                params={
+                    "start_frame_idx": self._interaction.start_frame_idx,
+                    "filter_amount": self._interaction.filter_amount,
+                    "mouth_opening_scale": self._interaction.mouth_opening_scale,
+                    "active_keyframe_slot_index": self._interaction.active_keyframes_slot,
+                    "to_update_keyframe_slot_index": self._interaction.keyframe_slot_to_update,
+                }
             )
         )
 
@@ -596,7 +605,11 @@ class OjinPersonaService(FrameProcessor):
         if new_state == PersonaState.INITIALIZING:
             self._server_fps_tracker.start()
             # Send silence to persona with idle_sequence_duration
-            await self._start_interaction(is_speech=False, should_update_animation_keyframes=True)
+            await self._start_interaction(
+                is_speech=False,
+                active_keyframes_slot=IDLE_ANIMATION_KEYFRAMES_SLOT,
+                keyframe_slot_to_update=IDLE_ANIMATION_KEYFRAMES_SLOT
+            )
             assert self._interaction is not None
             self._interaction.set_state(InteractionState.ALL_AUDIO_PROCESSED)
             await self._generate_and_send_silence(self._settings.idle_sequence_duration, True)
@@ -1017,7 +1030,8 @@ class OjinPersonaService(FrameProcessor):
         self,
         new_interaction: Optional[OjinPersonaInteraction] = None,
         is_speech: bool = False,
-        should_update_animation_keyframes: bool = False,
+        active_keyframes_slot: int = IDLE_ANIMATION_KEYFRAMES_SLOT,
+        keyframe_slot_to_update: int = -1
     ):
         """Start a new interaction with the persona.
 
@@ -1053,7 +1067,8 @@ class OjinPersonaService(FrameProcessor):
         logger.debug(f"Started interaction with id: {interaction_id}")
         self._interaction.interaction_id = interaction_id
         self._interaction.set_state(InteractionState.WAITING_READY)
-        self._interaction.should_update_animation_keyframes = should_update_animation_keyframes
+        self._interaction.active_keyframes_slot   = active_keyframes_slot
+        self._interaction.keyframe_slot_to_update = keyframe_slot_to_update
 
     async def _end_interaction(self):
         """End the current interaction.
@@ -1186,7 +1201,7 @@ class OjinPersonaService(FrameProcessor):
                 if is_final_message:
                     # TODO Tell server to end interaction by finish processing pending data. No more audio frames expected.
                     logger.warning("Pushing final message with empty audio")
-                    silence_duration = 0.1
+                    silence_duration = 0.01
                     num_samples = int(silence_duration * OJIN_PERSONA_SAMPLE_RATE)
                     silence_audio = b"\x00\x00" * num_samples
                     message = OjinPersonaInteractionInputMessage(
@@ -1209,7 +1224,8 @@ class OjinPersonaService(FrameProcessor):
                 "start_frame_idx": self._interaction.start_frame_idx,
                 "filter_amount": self._interaction.filter_amount,
                 "mouth_opening_scale": self._interaction.mouth_opening_scale,
-                "should_update_animation_keyframes": self._interaction.should_update_animation_keyframes
+                "active_keyframe_slot_index": self._interaction.active_keyframes_slot,
+                "to_update_keyframe_slot_index": self._interaction.keyframe_slot_to_update,
             }
             logger.debug(
                 f"Sending audio int16: {len(message.audio_int16_bytes)} is_final: {message.is_last_input}"

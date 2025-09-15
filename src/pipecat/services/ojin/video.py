@@ -1420,12 +1420,6 @@ def mirror_index(index: int, size: int) -> int:
         int: The mirrored index that creates the ping-pong effect
 
     """
-    turn = index // size
-    res = index % size
-    if turn % 2 == 0:
-        return res
-    else:
-        return size - res - 1
 
     # Calculate period length (going up and down)
     period = (size - 1) * 2
@@ -1438,4 +1432,4 @@ def mirror_index(index: int, size: int) -> int:
         return normalized_idx
     else:
         # If in second half, return the mirrored index
-        return period - normalized_idx
+        return period - normalized_idx - 1

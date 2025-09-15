@@ -475,8 +475,8 @@ class OjinPersonaInteraction:
     ending_timestamp: float = 0.0
     mouth_opening_scale: float = 0.0
     received_all_interaction_inputs: bool = False
-    active_keyframes_slot: int = IDLE_ANIMATION_KEYFRAMES_SLOT
-    keyframe_slot_to_update: int = -1
+    source_keyframes_index: int = IDLE_ANIMATION_KEYFRAMES_SLOT
+    destination_keyframes_index: int = -1
 
     def __post_init__(self):
         """Initialize queues after instance creation."""
@@ -585,8 +585,8 @@ class OjinPersonaService(FrameProcessor):
                     "start_frame_idx": self._interaction.start_frame_idx,
                     "filter_amount": self._interaction.filter_amount,
                     "mouth_opening_scale": self._interaction.mouth_opening_scale,
-                    "active_keyframe_slot_index": self._interaction.active_keyframes_slot,
-                    "to_update_keyframe_slot_index": self._interaction.keyframe_slot_to_update,
+                    "source_keyframes_index": self._interaction.source_keyframes_index,
+                    "destination_keyframes_index": self._interaction.destination_keyframes_index,
                 }
             )
         )
@@ -1067,8 +1067,8 @@ class OjinPersonaService(FrameProcessor):
         logger.debug(f"Started interaction with id: {interaction_id}")
         self._interaction.interaction_id = interaction_id
         self._interaction.set_state(InteractionState.WAITING_READY)
-        self._interaction.active_keyframes_slot   = active_keyframes_slot
-        self._interaction.keyframe_slot_to_update = keyframe_slot_to_update
+        self._interaction.source_keyframes_index   = active_keyframes_slot
+        self._interaction.destination_keyframes_index = keyframe_slot_to_update
 
     async def _end_interaction(self):
         """End the current interaction.
@@ -1224,8 +1224,8 @@ class OjinPersonaService(FrameProcessor):
                 "start_frame_idx": self._interaction.start_frame_idx,
                 "filter_amount": self._interaction.filter_amount,
                 "mouth_opening_scale": self._interaction.mouth_opening_scale,
-                "active_keyframe_slot_index": self._interaction.active_keyframes_slot,
-                "to_update_keyframe_slot_index": self._interaction.keyframe_slot_to_update,
+                "source_keyframes_index": self._interaction.source_keyframes_index,
+                "destination_keyframes_index": self._interaction.destination_keyframes_index,
             }
             logger.debug(
                 f"Sending audio int16: {len(message.audio_int16_bytes)} is_final: {message.is_last_input}"

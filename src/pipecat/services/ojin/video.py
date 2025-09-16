@@ -412,8 +412,7 @@ class OjinPersonaFSM:
 
                 if frame is None:
                     self._num_frames_missed += 1
-                    if self._num_frames_missed % 100 == 0:
-                        logger.debug(f"Frames missed {self._num_frames_missed}")
+                    logger.debug(f"Frames missed {self._num_frames_missed}")
 
                     if self._previous_speech_frame is not None:
                         return self._previous_speech_frame

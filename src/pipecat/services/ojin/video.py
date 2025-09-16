@@ -1200,7 +1200,7 @@ class OjinPersonaService(FrameProcessor):
                 if is_final_message:
                     # TODO Tell server to end interaction by finish processing pending data. No more audio frames expected.
                     logger.warning("Pushing final message with empty audio")
-                    silence_duration = 0.0
+                    silence_duration = 0.01
                     num_samples = int(silence_duration * OJIN_PERSONA_SAMPLE_RATE)
                     silence_audio = b"\x00\x00" * num_samples
                     message = OjinPersonaInteractionInputMessage(

@@ -361,8 +361,6 @@ class OjinPersonaFSM:
             case PersonaState.SPEECH:
                 self.fps_tracker.start()
                 self._transition_time = -1
-                self.num_speech_frames_played = 0
-                pass
 
             case PersonaState.IDLE_TO_SPEECH:
                 self._waiting_for_image_frames = True
@@ -374,6 +372,7 @@ class OjinPersonaFSM:
 
             case _:
                 logger.debug(f"State: {self._state} - Unknown state")
+        self.num_speech_frames_played = 0
 
     async def get_next_persona_frame(self) -> OutputImageRawFrame | None:
         """Get the next frame to display based on the current persona state.
@@ -464,6 +463,7 @@ IDLE_MOUTH_OPENING_SCALE = 0.0
 SPEECH_MOUTH_OPENING_SCALE = 1.0
 
 IDLE_ANIMATION_KEYFRAMES_SLOT = 0
+
 
 @dataclass
 class OjinPersonaInteraction:
@@ -1012,11 +1012,6 @@ class OjinPersonaService(FrameProcessor):
 
         elif isinstance(frame, TTSStoppedFrame):
             logger.debug("TTSStoppedFrame")
-            # TODO(@JM): Avoid ending interaction here since some TTS services continue to send audio frames
-            if self._pending_interaction:
-                self._pending_interaction = None
-            else:
-                await self._end_interaction()
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -1152,7 +1147,6 @@ class OjinPersonaService(FrameProcessor):
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
 
-
         interaction_to_use: OjinPersonaInteraction
         if (
             self._interaction is not None
@@ -1220,11 +1214,14 @@ class OjinPersonaService(FrameProcessor):
                 await asyncio.sleep(0.001)
                 continue
 
-            some_threshold = 36
+            some_threshold = 35
             if self._interaction.audio_input_queue.empty() and (
-                self._interaction.expected_frames - self._fsm.num_speech_frames_played
-                < some_threshold
+                self._fsm.num_speech_frames_played + some_threshold
+                > self._interaction.expected_frames
             ):
+                logger.debug(
+                    f"Ending interaction because idle loop doesn't have enough frames queued: expected: {self._interaction.expected_frames}, played: {self._fsm.num_speech_frames_played}"
+                )
                 await self._end_interaction()
 
             # while there is more audio coming we wait for it if we don't have any to process atm
@@ -1251,9 +1248,7 @@ class OjinPersonaService(FrameProcessor):
                 "source_keyframes_index": self._interaction.source_keyframes_index,
                 "destination_keyframes_index": self._interaction.destination_keyframes_index,
             }
-            logger.debug(
-                f"Sending audio int16: {len(message.audio_int16_bytes)}"
-            )
+            logger.debug(f"Sending audio int16: {len(message.audio_int16_bytes)}")
 
             await self.push_ojin_message(message)
             await self.enqueue_audio_output(message.audio_int16_bytes)

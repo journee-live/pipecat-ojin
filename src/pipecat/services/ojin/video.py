@@ -973,7 +973,7 @@ class OjinPersonaService(FrameProcessor):
             True if the persona is in a state that can accept TTS input, False otherwise
 
         """
-        return self.get_fsm_state() not in [
+        return self.get_fsm_state() in [
             PersonaState.INITIALIZING,
             PersonaState.INVALID,
         ]
@@ -1056,7 +1056,6 @@ class OjinPersonaService(FrameProcessor):
                 )
             )
             if self._fsm is not None:
-                await self._fsm.interrupt()
                 await self._fsm.on_conversation_signal(
                     ConversationSignal.USER_INTERRUPTED_AI
                 )

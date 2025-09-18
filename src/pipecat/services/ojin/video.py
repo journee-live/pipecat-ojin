@@ -5,7 +5,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Awaitable, Callable, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 # Will use numpy when implementing persona-specific processing
 from loguru import logger
@@ -163,8 +163,12 @@ class OjinPersonaFSM:
         self._transition_timestamp: float = -1.0
         self.num_speech_frames_played: int = 0
 
-    async def start(self):
+    async def start(self, parameters: Dict[str, Any] | None):
         await self.set_state(PersonaState.INITIALIZING)
+        if parameters is not None:
+            self._playback_loop.is_mirrored_loop = parameters.get(
+                "is_mirrored_loop", False
+            )
 
     async def close(self):
         await self._stop_playback()
@@ -918,7 +922,7 @@ class OjinPersonaService(FrameProcessor):
 
         elif isinstance(message, OjinPersonaSessionReadyMessage):
             if self._fsm is not None:
-                await self._fsm.start()
+                await self._fsm.start(message.parameters)
 
         elif isinstance(message, OjinPersonaInteractionReadyMessage):
             logger.debug("Received interaction ready message")
@@ -1304,6 +1308,7 @@ class PersonaPlaybackLoop:
     duration: int = 0  # seconds
     frames: list[AnimationKeyframe] = []  # Keyframes of the idle animation
     playback_time: float = 0  # Total elapsed playback time in seconds
+    is_mirrored_loop: bool = False  # whether to mirror the idle loop
 
     def __init__(
         self,
@@ -1336,7 +1341,7 @@ class PersonaPlaybackLoop:
         frame_idx = len(self.frames)
         expected_frames = self.duration * self.fps
         keyframe = AnimationKeyframe(
-            mirror_frame_idx=mirror_index(frame_idx, expected_frames),
+            mirror_frame_idx=mirror_index(frame_idx, expected_frames, 2 if self.is_mirrored_loop else 1),
             frame_idx=frame_idx,
             image=image,
         )
@@ -1373,7 +1378,7 @@ class PersonaPlaybackLoop:
         # Get total frames passed
         current_frame_idx = math.floor(playback_time * self.fps)
 
-        mirror_frame_idx = mirror_index(current_frame_idx, len(self.frames))
+        mirror_frame_idx = mirror_index(current_frame_idx, len(self.frames), 2 if self.is_mirrored_loop else 1)
 
         return self.frames[mirror_frame_idx]
 
@@ -1443,21 +1448,21 @@ class PersonaPlaybackLoop:
 #         return period - normalized_idx - 1
 
 
-def mirror_index(index: int, size:int, period: int =2):
+def mirror_index(index: int, size: int, period: int = 2):
     """Calculate a mirrored index for creating a ping-pong animation effect.
 
-    This method maps a continuously increasing index to a back-and-forth pattern
-    within the given size, creating a ping-pong effect for smooth looping animations.
+        This method maps a continuously increasing index to a back-and-forth pattern
+        within the given size, creating a ping-pong effect for smooth looping animations.
 
-    Args:
-        index (int): The original frame index
-        size (int): The number of available frames
-        period (int): Period of the mirrored indices
+        Args:
+            index (int): The original frame index
+            size (int): The number of available frames
+            period (int): Period of the mirrored indices
 
-    Returns:
-        int: The mirrored index that creates the ping-pong effect
+        Returns:
+            int: The mirrored index that creates the ping-pong effect
 
-#     """
+    #"""
     turn = index // size
     res = index % size
     if turn % period == 0:

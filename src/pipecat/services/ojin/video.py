@@ -99,6 +99,9 @@ class OjinPersonaSettings:
     push_bot_stopped_speaking_frames: bool = field(
         default=True
     )  # whether to push bot stopped speaking frames to the output
+    frame_count_threshold_for_end_interaction: int = field(
+        default=35
+    ) # If the number of frames in the loopback is less than or equal to this value then end the interaction to avoid frame misses.
 
 
 class ConversationSignal(Enum):
@@ -1213,9 +1216,9 @@ class OjinPersonaService(FrameProcessor):
                 await asyncio.sleep(0.001)
                 continue
 
-            some_threshold = 35
+            
             if self._interaction.audio_input_queue.empty() and (
-                self._fsm.num_speech_frames_played + some_threshold
+                self._fsm.num_speech_frames_played + self._settings.frame_count_threshold_for_end_interaction
                 > self._interaction.expected_frames
             ):
                 logger.debug(

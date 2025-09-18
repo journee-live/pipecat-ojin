@@ -101,7 +101,7 @@ class OjinPersonaSettings:
     )  # whether to push bot stopped speaking frames to the output
     frame_count_threshold_for_end_interaction: int = field(
         default=35
-    ) # If the number of frames in the loopback is less than or equal to this value then end the interaction to avoid frame misses.
+    )  # If the number of frames in the loopback is less than or equal to this value then end the interaction to avoid frame misses.
 
 
 class ConversationSignal(Enum):
@@ -1216,9 +1216,9 @@ class OjinPersonaService(FrameProcessor):
                 await asyncio.sleep(0.001)
                 continue
 
-            
             if self._interaction.audio_input_queue.empty() and (
-                self._fsm.num_speech_frames_played + self._settings.frame_count_threshold_for_end_interaction
+                self._fsm.num_speech_frames_played
+                + self._settings.frame_count_threshold_for_end_interaction
                 > self._interaction.expected_frames
             ):
                 logger.debug(
@@ -1427,7 +1427,23 @@ class PersonaPlaybackLoop:
         self.playback_time += delta_time
 
 
-def mirror_index(index: int, size: int) -> int:
+# def mirror_index(index: int, size: int) -> int:
+
+#     # Calculate period length (going up and down)
+#     period = (size - 1) * 2
+
+#     # Get position within one period
+#     normalized_idx = index % period
+
+#     # If in first half, return the index directly
+#     if normalized_idx < size:
+#         return normalized_idx
+#     else:
+#         # If in second half, return the mirrored index
+#         return period - normalized_idx - 1
+
+
+def mirror_index(index: int, size:int, period: int =2):
     """Calculate a mirrored index for creating a ping-pong animation effect.
 
     This method maps a continuously increasing index to a back-and-forth pattern
@@ -1436,21 +1452,15 @@ def mirror_index(index: int, size: int) -> int:
     Args:
         index (int): The original frame index
         size (int): The number of available frames
+        period (int): Period of the mirrored indices
 
     Returns:
         int: The mirrored index that creates the ping-pong effect
 
-    """
-
-    # Calculate period length (going up and down)
-    period = (size - 1) * 2
-
-    # Get position within one period
-    normalized_idx = index % period
-
-    # If in first half, return the index directly
-    if normalized_idx < size:
-        return normalized_idx
+#     """
+    turn = index // size
+    res = index % size
+    if turn % period == 0:
+        return res
     else:
-        # If in second half, return the mirrored index
-        return period - normalized_idx - 1
+        return size - res - 1

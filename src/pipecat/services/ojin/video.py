@@ -1431,23 +1431,6 @@ class PersonaPlaybackLoop:
         """
         self.playback_time += delta_time
 
-
-# def mirror_index(index: int, size: int) -> int:
-
-#     # Calculate period length (going up and down)
-#     period = (size - 1) * 2
-
-#     # Get position within one period
-#     normalized_idx = index % period
-
-#     # If in first half, return the index directly
-#     if normalized_idx < size:
-#         return normalized_idx
-#     else:
-#         # If in second half, return the mirrored index
-#         return period - normalized_idx - 1
-
-
 def mirror_index(index: int, size: int, period: int = 2):
     """Calculate a mirrored index for creating a ping-pong animation effect.
 

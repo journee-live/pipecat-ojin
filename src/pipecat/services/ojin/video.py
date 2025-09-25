@@ -3,6 +3,10 @@
 import asyncio
 import math
 import time
+import io
+from contextlib import suppress
+from PIL import Image
+from PIL.Image import Resampling
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -102,6 +106,7 @@ class OjinPersonaSettings:
     frame_count_threshold_for_end_interaction: int = field(
         default=35
     )  # If the number of frames in the loopback is less than or equal to this value then end the interaction to avoid frame misses.
+    decode_image: bool = field(default=False) # Decode the image before passing to any other transport e.g. Daily or tinywebrtc
 
 
 class ConversationSignal(Enum):
@@ -597,6 +602,12 @@ class OjinPersonaService(FrameProcessor):
         self._last_frame_timestamp: float | None = None
         self._stopping = False
 
+    def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
+        image = Image.open(io.BytesIO(frame_bytes))
+        rgb_image = image.convert('RGB')
+        rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
+        return rgb_image.tobytes()
+
     async def _generate_and_send_silence(self, duration: float):
         num_samples = int(duration * OJIN_PERSONA_SAMPLE_RATE)
         silence_audio = b"\x00\x00" * num_samples
@@ -887,7 +898,7 @@ class OjinPersonaService(FrameProcessor):
             # logger.info(f"Video frame received: {self._interaction.frame_idx} isFinal: {message.is_final_response}")
             # Create and push the image frame
             image_frame = OutputImageRawFrame(
-                image=message.video_frame_bytes,
+                image=self.get_frame_bytes(message.video_frame_bytes) if self._settings.decode_image else message.video_frame_bytes,
                 size=self._settings.image_size,
                 format="RGB",
             )

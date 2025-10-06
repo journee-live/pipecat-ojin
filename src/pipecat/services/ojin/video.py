@@ -605,7 +605,7 @@ class OjinPersonaService(FrameProcessor):
     def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
         image = Image.open(io.BytesIO(frame_bytes))
         rgb_image = image.convert('RGB')
-        rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
+        # rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
         return rgb_image.tobytes()
 
     async def _generate_and_send_silence(self, duration: float):
@@ -898,7 +898,7 @@ class OjinPersonaService(FrameProcessor):
             # logger.info(f"Video frame received: {self._interaction.frame_idx} isFinal: {message.is_final_response}")
             # Create and push the image frame
             image_frame = OutputImageRawFrame(
-                image=message.video_frame_bytes,  #self.get_frame_bytes(message.video_frame_bytes) if self._settings.decode_image else message.video_frame_bytes,
+                image=self.get_frame_bytes(message.video_frame_bytes) if self._settings.decode_image else message.video_frame_bytes,
                 size=self._settings.image_size,
                 format="RGB",
             )

@@ -898,7 +898,7 @@ class OjinPersonaService(FrameProcessor):
             # logger.info(f"Video frame received: {self._interaction.frame_idx} isFinal: {message.is_final_response}")
             # Create and push the image frame
             image_frame = OutputImageRawFrame(
-                image=self.get_frame_bytes(message.video_frame_bytes) if self._settings.decode_image else message.video_frame_bytes,
+                image=message.video_frame_bytes,  #self.get_frame_bytes(message.video_frame_bytes) if self._settings.decode_image else message.video_frame_bytes,
                 size=self._settings.image_size,
                 format="RGB",
             )

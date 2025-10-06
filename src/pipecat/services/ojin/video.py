@@ -1,6 +1,7 @@
 """Ojin Persona implementation for Pipecat."""
 
 import asyncio
+from email import message
 import math
 import time
 import io
@@ -322,7 +323,7 @@ class OjinPersonaFSM:
                     if frame is not None:
                         await self._frame_processor.push_frame(frame)
 
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.04)
         except Exception as e:
             logger.exception(f"Playback loop stopped with error: {e}")
 
@@ -854,10 +855,31 @@ class OjinPersonaService(FrameProcessor):
         """
         while True:
             assert self._client is not None
-            message = await self._client.receive_message()
-            if message is not None:
-                await self._handle_ojin_message(message)
+            try:
+                # CHANGE: Add timeout to prevent indefinite blocking
+                message = await asyncio.wait_for(
+                    self._client.receive_message(), 
+                    timeout=5.0
+                )
+                if message is not None:
+                    await self._handle_ojin_message(message)
+            except asyncio.TimeoutError:
+                # No message received, check if we should continue
+                logger.debug("No message received in 5s, continuing...")
+                continue
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}")
+                await asyncio.sleep(1.0)
+                
+            # CHANGE: Small sleep to prevent tight loop
             await asyncio.sleep(0.001)
+        
+        # while True:
+        #     assert self._client is not None
+        #     message = await self._client.receive_message()
+        #     if message is not None:
+        #         await self._handle_ojin_message(message)
+        #     await asyncio.sleep(0.001)
 
     async def push_ojin_message(self, message: BaseModel):
         """Send a message to the proxy.
@@ -1231,7 +1253,7 @@ class OjinPersonaService(FrameProcessor):
                 or self._interaction.state == InteractionState.WAITING_READY
                 or self._interaction.state == InteractionState.ALL_AUDIO_PROCESSED
             ):
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.05)
                 continue
 
             if self._interaction.audio_input_queue.empty() and (
@@ -1252,11 +1274,14 @@ class OjinPersonaService(FrameProcessor):
             # Get audio from the queue
             should_finish_task = False
             try:
-                message: OjinPersonaInteractionInputMessage = (
-                    self._interaction.audio_input_queue.get_nowait()
-                )
+                # message: OjinPersonaInteractionInputMessage = (
+                #     self._interaction.audio_input_queue.get_nowait()
+                # )
+                message: OjinPersonaInteractionInputMessage = await asyncio.wait_for(self._interaction.audio_input_queue.get(), timeout=0.1)
                 message.interaction_id = self._interaction.interaction_id
                 should_finish_task = True
+            except asyncio.TimeoutError:
+                continue
             except asyncio.QueueEmpty:
                 should_finish_task = False
                 assert False, "the queue should never be empty here"

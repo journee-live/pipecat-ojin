@@ -605,7 +605,7 @@ class OjinPersonaService(FrameProcessor):
     def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
         image = Image.open(io.BytesIO(frame_bytes))
         # rgb_image = image.convert('RGB')
-        logger.info(f"size {rgb_image.size}")
+        # logger.info(f"size {rgb_image.size}")
         # rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
         return image.tobytes()
 

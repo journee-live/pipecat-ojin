@@ -604,10 +604,10 @@ class OjinPersonaService(FrameProcessor):
 
     def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
         image = Image.open(io.BytesIO(frame_bytes))
-        rgb_image = image.convert('RGB')
+        # rgb_image = image.convert('RGB')
         logger.info(f"size {rgb_image.size}")
         # rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
-        return rgb_image.tobytes()
+        return image.tobytes()
 
     async def _generate_and_send_silence(self, duration: float):
         num_samples = int(duration * OJIN_PERSONA_SAMPLE_RATE)

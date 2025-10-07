@@ -1059,9 +1059,9 @@ class OjinPersonaService(FrameProcessor):
         elif isinstance(frame, TTSAudioRawFrame):
             logger.debug("TTSAudioRawFrame")
             # TODO(@JM): Check if speech interaction is already possible
-            await self._handle_input_audio(frame)
-            if self._settings.tts_audio_passthrough:
-                await self.push_frame(frame, direction)
+            # await self._handle_input_audio(frame)
+            # if self._settings.tts_audio_passthrough:
+            await self.push_frame(frame, direction)
 
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._stop()

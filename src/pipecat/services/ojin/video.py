@@ -856,7 +856,7 @@ class OjinPersonaService(FrameProcessor):
         while True:
             assert self._client is not None
             try:
-                message = self._client.receive_message(), 
+                message = self._client.receive_message()
                 if message is not None:
                     await self._handle_ojin_message(message)
             except Exception as e:

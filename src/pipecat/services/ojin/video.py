@@ -320,8 +320,8 @@ class OjinPersonaFSM:
                 # Process output image frames
                 if self.should_process_output():
                     frame = await self.get_next_persona_frame()
-                    if frame is not None:
-                        await self._frame_processor.push_frame(frame)
+                    # if frame is not None:
+                    #     await self._frame_processor.push_frame(frame)
 
                 await asyncio.sleep(0.04)
         except Exception as e:
@@ -853,18 +853,20 @@ class OjinPersonaService(FrameProcessor):
         This method runs as a background task and handles all incoming messages
         from the proxy.
         """
+        loop = asyncio.get_event_loop()
+
         while True:
             assert self._client is not None
             try:
-                message = self._client.receive_message()
+                message = await loop.run_in_executor(None, self._client.receive_message)
+                # message = self._client.receive_message()
                 if message is not None:
                     await self._handle_ojin_message(message)
+                else:
+                    await asyncio.sleep(0.01)
             except Exception as e:
                 logger.error(f"Error receiving message: {e}")
                 await asyncio.sleep(1.0)
-                
-            # CHANGE: Small sleep to prevent tight loop
-            await asyncio.sleep(0.1)
         
         # while True:
         #     assert self._client is not None
@@ -930,7 +932,7 @@ class OjinPersonaService(FrameProcessor):
                 if self._audio_output_task is None:
                     self._start_pushing_audio_output()
 
-                await self.push_frame(image_frame)
+                # await self.push_frame(image_frame)
 
             self._interaction.next_frame()
             self._last_frame_timestamp = time.perf_counter()

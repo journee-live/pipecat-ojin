@@ -320,8 +320,8 @@ class OjinPersonaFSM:
                 # Process output image frames
                 if self.should_process_output():
                     frame = await self.get_next_persona_frame()
-                    # if frame is not None:
-                    #     await self._frame_processor.push_frame(frame)
+                    if frame is not None:
+                        await self._frame_processor.push_frame(frame)
 
                 await asyncio.sleep(0.04)
         except Exception as e:
@@ -932,7 +932,7 @@ class OjinPersonaService(FrameProcessor):
                 if self._audio_output_task is None:
                     self._start_pushing_audio_output()
 
-                # await self.push_frame(image_frame)
+                await self.push_frame(image_frame)
 
             self._interaction.next_frame()
             self._last_frame_timestamp = time.perf_counter()

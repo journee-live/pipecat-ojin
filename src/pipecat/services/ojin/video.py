@@ -857,10 +857,7 @@ class OjinPersonaService(FrameProcessor):
             assert self._client is not None
             try:
                 # CHANGE: Add timeout to prevent indefinite blocking
-                message = await asyncio.wait_for(
-                    self._client.receive_message(), 
-                    timeout=5.0
-                )
+                message = self._client.receive_message()
                 if message is not None:
                     await self._handle_ojin_message(message)
             except asyncio.TimeoutError:

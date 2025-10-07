@@ -82,7 +82,7 @@ moondream = [ "accelerate~=1.10.0", "einops~=0.8.0", "pyvips[binary]~=3.0.0", "t
 nim = []
 neuphonic = [ "pipecat-ai[websockets-base]" ]
 noisereduce = [ "noisereduce~=3.0.3" ]
-ojin = [ "ojin-client==0.4.5.dev0" ]
+ojin = [ "ojin-client==0.4.5.dev1" ]
 openai = [ "pipecat-ai[websockets-base]" ]
 openpipe = [ "openpipe~=4.50.0" ]
 openrouter = []

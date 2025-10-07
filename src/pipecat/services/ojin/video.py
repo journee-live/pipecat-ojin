@@ -320,8 +320,8 @@ class OjinPersonaFSM:
                 # Process output image frames
                 if self.should_process_output():
                     frame = await self.get_next_persona_frame()
-                    if frame is not None:
-                        await self._frame_processor.push_frame(frame)
+                    # if frame is not None:
+                        # await self._frame_processor.push_frame(frame)
 
                 await asyncio.sleep(0.04)
         except Exception as e:
@@ -581,12 +581,13 @@ class OjinPersonaService(FrameProcessor):
             )
         else:
             self._client = client
+        self._fsm = None
 
-        self._fsm = OjinPersonaFSM(
-            self,
-            settings,
-            on_state_changed_callback=self._on_state_changed,
-        )
+        # self._fsm = OjinPersonaFSM(
+        #     self,
+        #     settings,
+        #     on_state_changed_callback=self._on_state_changed,
+        # )
 
         # Generate a UUID if avatar_id is not provided
         assert self._settings.persona_config_id is not None
@@ -702,6 +703,7 @@ class OjinPersonaService(FrameProcessor):
         # Create tasks to process audio and video
         # self._audio_input_task = self.create_task(self._process_queued_audio())
         self._receive_task = self.create_task(self._receive_messages())
+        
         # TODO Jorge / Edgar : To handle edge cases with new messages for ending interation not cancelling, since the server still has audio to be processed and it's lost after cancelling
         # self._handle_incomming_frame_task = self.create_task(self._incomming_frame_task())
 
@@ -857,16 +859,16 @@ class OjinPersonaService(FrameProcessor):
 
         while True:
             assert self._client is not None
-            try:
-                message = await loop.run_in_executor(None, self._client.receive_message)
-                # message = self._client.receive_message()
-                if message is not None:
-                    await self._handle_ojin_message(message)
-                else:
-                    await asyncio.sleep(0.01)
-            except Exception as e:
-                logger.error(f"Error receiving message: {e}")
-                await asyncio.sleep(1.0)
+            # try:
+            message = await loop.run_in_executor(None, self._client.receive_message)
+            # message = self._client.receive_message()
+            if message is not None:
+                await self._handle_ojin_message(message)
+            else:
+                await asyncio.sleep(0.01)
+            # except Exception as e:
+            #     logger.error(f"Error receiving message: {e}")
+            #     await asyncio.sleep(1.0)
         
         # while True:
         #     assert self._client is not None
@@ -950,22 +952,24 @@ class OjinPersonaService(FrameProcessor):
                 # TODO(mouad): should we stop the interaction here?
 
         elif isinstance(message, OjinPersonaSessionReadyMessage):
+            await self._on_state_changed(PersonaState.INVALID, PersonaState.INITIALIZING)
             if self._fsm is not None:
                 await self._fsm.start(message.parameters)
 
         elif isinstance(message, OjinPersonaInteractionReadyMessage):
             logger.debug("Received interaction ready message")
-            assert self._fsm is not None
-            if (
-                self._interaction is not None
-                and self._interaction.state == InteractionState.WAITING_READY
-            ):
-                self._interaction.set_state(InteractionState.ACTIVE)
-                await self._fsm.on_conversation_signal(
-                    ConversationSignal.SPEECH_AUDIO_STARTED_PROCESSING
-                )
-                self._interaction.start_frame_idx = self._fsm.get_transition_frame_idx()
-                self._interaction.frame_idx = self._fsm.get_transition_frame_idx()
+            
+            # assert self._fsm is not None
+            # if (
+            #     self._interaction is not None
+            #     and self._interaction.state == InteractionState.WAITING_READY
+            # ):
+            #     self._interaction.set_state(InteractionState.ACTIVE)
+            #     await self._fsm.on_conversation_signal(
+            #         ConversationSignal.SPEECH_AUDIO_STARTED_PROCESSING
+            #     )
+            #     self._interaction.start_frame_idx = self._fsm.get_transition_frame_idx()
+            #     self._interaction.frame_idx = self._fsm.get_transition_frame_idx()
 
         elif isinstance(message, ErrorResponseMessage):
             is_fatal = False
@@ -1136,7 +1140,7 @@ class OjinPersonaService(FrameProcessor):
             self._interaction.frame_idx = 0
 
         assert self._client is not None
-        assert self._fsm is not None
+        # assert self._fsm is not None
         interaction_id = await self._client.start_interaction()
         logger.debug(f"Started interaction with id: {interaction_id}")
         self._interaction.interaction_id = interaction_id

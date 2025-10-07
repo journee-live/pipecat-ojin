@@ -700,8 +700,8 @@ class OjinPersonaService(FrameProcessor):
             return
 
         # Create tasks to process audio and video
-        self._audio_input_task = self.create_task(self._process_queued_audio())
-        # self._receive_task = self.create_task(self._receive_messages())
+        # self._audio_input_task = self.create_task(self._process_queued_audio())
+        self._receive_task = self.create_task(self._receive_messages())
         # TODO Jorge / Edgar : To handle edge cases with new messages for ending interation not cancelling, since the server still has audio to be processed and it's lost after cancelling
         # self._handle_incomming_frame_task = self.create_task(self._incomming_frame_task())
 

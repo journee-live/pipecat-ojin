@@ -869,7 +869,7 @@ class OjinPersonaService(FrameProcessor):
                 await asyncio.sleep(1.0)
                 
             # CHANGE: Small sleep to prevent tight loop
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.01)
         
         # while True:
         #     assert self._client is not None

@@ -573,14 +573,14 @@ class OjinPersonaService(FrameProcessor):
         logger.debug(f"OjinPersonaService initialized with settings {settings}")
         # Use provided settings or create default settings
         self._settings = settings
-        # if client is None:
-        #     self._client = OjinPersonaClient(
-        #         ws_url=settings.ws_url,
-        #         api_key=settings.api_key,
-        #         config_id=settings.persona_config_id,
-        #     )
-        # else:
-        #     self._client = client
+        if client is None:
+            self._client = OjinPersonaClient(
+                ws_url=settings.ws_url,
+                api_key=settings.api_key,
+                config_id=settings.persona_config_id,
+            )
+        else:
+            self._client = client
 
         self._fsm = OjinPersonaFSM(
             self,
@@ -694,7 +694,7 @@ class OjinPersonaService(FrameProcessor):
         Authenticates with the proxy and creates tasks for processing
         audio and receiving messages.
         """
-        is_connected = True #await self.connect_with_retry()
+        is_connected = await self.connect_with_retry()
 
         if not is_connected:
             return

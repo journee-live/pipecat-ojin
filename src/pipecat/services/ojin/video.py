@@ -856,20 +856,21 @@ class OjinPersonaService(FrameProcessor):
         while True:
             assert self._client is not None
             try:
-                # CHANGE: Add timeout to prevent indefinite blocking
-                message = self._client.receive_message()
-                if message is not None:
-                    await self._handle_ojin_message(message)
-            except asyncio.TimeoutError:
-                # No message received, check if we should continue
-                logger.debug("No message received in 5s, continuing...")
-                continue
+                try:
+                    message = await asyncio.wait_for(
+                        self._client.receive_message(), 
+                        timeout=0.1  # 100ms - balance between responsiveness and CPU
+                    )
+                    if message is not None:
+                        await self._handle_ojin_message(message)
+                except asyncio.TimeoutError:
+                    continue
             except Exception as e:
                 logger.error(f"Error receiving message: {e}")
                 await asyncio.sleep(1.0)
                 
             # CHANGE: Small sleep to prevent tight loop
-            await asyncio.sleep(0.01)
+            # await asyncio.sleep(0.01)
         
         # while True:
         #     assert self._client is not None

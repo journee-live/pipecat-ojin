@@ -28,7 +28,7 @@ from ojin.ojin_persona_messages import (
 from ojin.profiling_utils import FPSTracker
 from pydantic import BaseModel
 
-from pipecat.audio.utils import create_default_resampler
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
@@ -598,7 +598,7 @@ class OjinPersonaService(FrameProcessor):
         self._interaction: Optional[OjinPersonaInteraction] = None
         self._pending_interaction: Optional[OjinPersonaInteraction] = None
 
-        self._resampler = create_default_resampler()
+        self._resampler = create_stream_resampler()
         self._server_fps_tracker = FPSTracker("OjinPersonaService")
         self.should_generate_silence: bool = False
         self._last_frame_timestamp: float | None = None

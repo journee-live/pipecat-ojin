@@ -1,7 +1,9 @@
 import asyncio
+import io
 import math
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -19,6 +21,8 @@ from ojin.ojin_persona_messages import (
     OjinPersonaSessionReadyMessage,
 )
 from ojin.profiling_utils import FPSTracker
+from PIL import Image
+from PIL.Image import Resampling
 from pydantic import BaseModel
 
 from pipecat.audio.utils import create_default_resampler
@@ -247,6 +251,12 @@ class OjinPersonaService(FrameProcessor):
         self.pending_audio_to_play = bytearray()
         self.extra_frames_lat = settings.extra_frames_lat
 
+    def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
+        image = Image.open(io.BytesIO(frame_bytes))
+        rgb_image = image.convert('RGB')
+        rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
+        return rgb_image.tobytes()
+
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
         last_error: Optional[Exception] = None
@@ -321,7 +331,7 @@ class OjinPersonaService(FrameProcessor):
             frame_idx = message.index
             animation_frame = AnimationKeyframe(
                 frame_idx=frame_idx,
-                image=message.video_frame_bytes,
+                image=self.get_frame_bytes(message.video_frame_bytes),
             )
             if self.persona_state == PersonaState.INITIALIZING:
                 # IDLE frame
@@ -692,7 +702,9 @@ class OjinPersonaService(FrameProcessor):
                 logger.debug(f"Duplicate frame: {dup_frame.frame_idx}")
 
             image_frame = OutputImageRawFrame(
-                image=animation_frame.image, size=self._settings.image_size, format="RGB"
+                image=animation_frame.image,
+                size=self._settings.image_size,
+                format="RGB"
             )
             audio_frame = OutputAudioRawFrame(
                 audio=audio_to_play,

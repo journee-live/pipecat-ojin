@@ -11,10 +11,10 @@ const isMac = process.platform === 'darwin';
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 800,
-    minHeight: 600,
+    width: 300,
+    height: 600,
+    minWidth: 300,
+    minHeight: 300,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -53,11 +53,19 @@ function createTray() {
   try {
     trayIcon = nativeImage.createFromPath(iconPath);
     if (trayIcon.isEmpty()) {
-      // Fallback to a simple icon if file doesn't exist
-      trayIcon = nativeImage.createEmpty();
+      // Fallback: Create a simple icon programmatically
+      // Create a 16x16 data URL with a simple "O" icon
+      const canvas = `<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="8" cy="8" r="7" fill="none" stroke="white" stroke-width="2"/>
+      </svg>`;
+      trayIcon = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(canvas).toString('base64')}`);
     }
   } catch (error) {
-    trayIcon = nativeImage.createEmpty();
+    // Last resort: Create a simple visible icon
+    const canvas = `<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="8" cy="8" r="7" fill="none" stroke="white" stroke-width="2"/>
+    </svg>`;
+    trayIcon = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(canvas).toString('base64')}`);
   }
 
   tray = new Tray(trayIcon);
@@ -88,23 +96,40 @@ function createTray() {
 }
 
 // Bot session management
-function startBotSession(personaId, humeConfigId) {
-  if (botProcess) {
-    console.log('Bot session already running, stopping first...');
+function startBotSession(personaId, humeConfigId, environment) {
+  console.log('[startBotSession] Called with:', { personaId, humeConfigId, environment });
+  console.log('[startBotSession] botProcess state:', {
+    exists: !!botProcess,
+    killed: botProcess?.killed,
+    exitCode: botProcess?.exitCode,
+    pid: botProcess?.pid
+  });
+  
+  // Check if process exists AND is still running
+  if (botProcess && !botProcess.killed && botProcess.exitCode === null) {
+    console.log('[startBotSession] Bot session already running, stopping first...');
     stopBotSession();
     
     // Wait a bit for process to terminate before starting new one
     setTimeout(() => {
-      startNewBotProcess(personaId, humeConfigId);
+      console.log('[startBotSession] Timeout elapsed, starting new process after stop');
+      startNewBotProcess(personaId, humeConfigId, environment);
     }, 1000);
     return;
   }
 
-  startNewBotProcess(personaId, humeConfigId);
+  // If process exists but is dead, reset it
+  if (botProcess) {
+    console.log('[startBotSession] Clearing dead bot process reference');
+    botProcess = null;
+  }
+
+  console.log('[startBotSession] Starting new bot process immediately');
+  startNewBotProcess(personaId, humeConfigId, environment);
 }
 
-function startNewBotProcess(personaId, humeConfigId) {
-  console.log(`Starting bot session: persona=${personaId}, hume=${humeConfigId}`);
+function startNewBotProcess(personaId, humeConfigId, environment) {
+  console.log(`Starting bot session: persona=${personaId}, hume=${humeConfigId}, environment=${environment}`);
 
   // Use venv Python if available, fallback to system Python
   const venvPythonPath = process.platform === 'win32' 
@@ -120,7 +145,7 @@ function startNewBotProcess(personaId, humeConfigId) {
   
   const botScriptPath = path.join(__dirname, '..', 'bot.py');
 
-  botProcess = spawn(pythonPath, [botScriptPath, personaId, humeConfigId], {
+  botProcess = spawn(pythonPath, [botScriptPath, personaId, humeConfigId, environment], {
     cwd: path.join(__dirname, '..'),
   });
 
@@ -130,7 +155,11 @@ function startNewBotProcess(personaId, humeConfigId) {
     lines.forEach(line => {
       try {
         const message = JSON.parse(line);
-        console.log('Bot message:', message.type);
+        
+        // Only log non-video-frame messages to avoid console spam
+        if (message.type !== 'video_frame') {
+          console.log('Bot message:', message.type);
+        }
         
         // Forward messages to renderer
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -148,6 +177,7 @@ function startNewBotProcess(personaId, humeConfigId) {
 
   botProcess.on('error', (error) => {
     console.error('Bot process error:', error);
+    botProcess = null; // Reset on error
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('bot-message', {
         type: 'error',
@@ -157,7 +187,8 @@ function startNewBotProcess(personaId, humeConfigId) {
   });
 
   botProcess.on('close', (code) => {
-    console.log(`Bot process exited with code ${code}`);
+    console.log(`[botProcess.close] Bot process exited with code ${code}, PID was: ${botProcess?.pid}`);
+    console.log('[botProcess.close] Setting botProcess to null');
     botProcess = null;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('bot-message', {
@@ -200,9 +231,17 @@ function stopBotSession() {
 }
 
 // IPC handlers
-ipcMain.handle('start-bot-session', async (event, { personaId, humeConfigId }) => {
+ipcMain.handle('start-bot-session', async (event, { personaId, humeConfigId, environment }) => {
+  console.log('[IPC] Received start-bot-session request:', { personaId, humeConfigId, environment });
+  console.log('[IPC] Current botProcess state:', {
+    exists: !!botProcess,
+    killed: botProcess?.killed,
+    exitCode: botProcess?.exitCode,
+    pid: botProcess?.pid
+  });
+  
   try {
-    startBotSession(personaId, humeConfigId);
+    startBotSession(personaId, humeConfigId, environment);
     return { success: true };
   } catch (error) {
     console.error('Failed to start bot session:', error);

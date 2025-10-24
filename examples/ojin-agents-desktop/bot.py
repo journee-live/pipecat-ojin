@@ -72,6 +72,24 @@ class ElectronIPCOutput(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class PersonaInitializedDetector(FrameProcessor):
+    """Detects when Ojin Persona is initialized and notifies Electron."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._initialized = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, OjinPersonaInitializedFrame) and not self._initialized:
+            self._initialized = True
+            logger.info("Ojin Persona initialized")
+            print(json.dumps({"type": "persona_initialized"}), flush=True)
+
+        await self.push_frame(frame, direction)
+
+
 class TranscriptCapture(FrameProcessor):
     """Captures conversation transcript and sends to Electron."""
 
@@ -80,7 +98,6 @@ class TranscriptCapture(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
         # TODO: Capture text frames and send as transcript updates
         # This will depend on how Hume/LLM outputs text
 
@@ -88,16 +105,27 @@ class TranscriptCapture(FrameProcessor):
 
 
 async def main():
-    if len(sys.argv) < 3:
-        logger.error("Usage: python bot.py <persona_id> <hume_config_id>")
+    if len(sys.argv) < 4:
+        logger.error("Usage: python bot.py <persona_id> <hume_config_id> <environment>")
         sys.exit(1)
 
     persona_id = sys.argv[1]
     hume_config_id = sys.argv[2]
+    environment = sys.argv[3]  # 'production' or 'staging'
 
     logger.info(
-        f"Starting bot session with persona_id={persona_id}, hume_config_id={hume_config_id}"
+        f"Starting bot session with persona_id={persona_id}, hume_config_id={hume_config_id}, environment={environment}"
     )
+    
+    # Get environment-specific configuration
+    if environment == 'production':
+        ojin_api_key = os.getenv('OJIN_API_KEY_PRODUCTION')
+        ojin_proxy_url = os.getenv('OJIN_PROXY_URL_PRODUCTION')
+    else:  # staging
+        ojin_api_key = os.getenv('OJIN_API_KEY_STAGING')
+        ojin_proxy_url = os.getenv('OJIN_PROXY_URL_STAGING')
+    
+    logger.info(f"Using {environment} environment: {ojin_proxy_url}")
 
     # Send ready signal to Electron
     print(
@@ -134,14 +162,11 @@ async def main():
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(context)
 
-    # Initialize Ojin Persona service
-    ojin_ws_url = os.getenv("OJIN_PROXY_URL", "wss://models.ojin.ai/realtime")
-
-    # Add mode as query parameter if specified
+    # Initialize Ojin Persona service with environment-specific config
     persona = OjinPersonaService(
         OjinPersonaSettings(
-            ws_url=ojin_ws_url,
-            api_key=os.getenv("OJIN_API_KEY", ""),
+            ws_url=ojin_proxy_url,
+            api_key=ojin_api_key,
             persona_config_id=persona_id,
             image_size=(1280, 720),
             tts_audio_passthrough=False,
@@ -153,6 +178,7 @@ async def main():
     # Suppress video logging when debugging to avoid console spam
     suppress_video = os.getenv("SUPPRESS_VIDEO_LOGS", "false").lower() == "true"
     electron_output = ElectronIPCOutput(suppress_video_logging=suppress_video)
+    persona_detector = PersonaInitializedDetector()
     transcript_capture = TranscriptCapture()
 
     # Build pipeline
@@ -161,6 +187,7 @@ async def main():
             audio_transport.input(),
             context_aggregator.user(),
             llm,
+            persona_detector,  # Detect when persona is initialized
             persona,
             electron_output,  # Send frames to Electron
             transcript_capture,  # Capture transcript
@@ -177,14 +204,14 @@ async def main():
     )
 
     runner = PipelineRunner(handle_sigint=False)
-    
+
     # Setup signal handler for graceful shutdown
     shutdown_event = asyncio.Event()
-    
+
     def signal_handler(sig, frame):
         logger.info(f"Received signal {sig}, shutting down...")
         shutdown_event.set()
-    
+
     # Register signal handlers (Windows doesn't support all signals)
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -196,12 +223,11 @@ async def main():
         # Run with cancellation support
         run_task = asyncio.create_task(runner.run(task))
         shutdown_task = asyncio.create_task(shutdown_event.wait())
-        
+
         done, pending = await asyncio.wait(
-            [run_task, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED
+            [run_task, shutdown_task], return_when=asyncio.FIRST_COMPLETED
         )
-        
+
         # Cancel remaining tasks
         for t in pending:
             t.cancel()
@@ -209,7 +235,7 @@ async def main():
                 await t
             except asyncio.CancelledError:
                 pass
-                
+
     except KeyboardInterrupt:
         logger.info("Bot session interrupted")
     except Exception as e:

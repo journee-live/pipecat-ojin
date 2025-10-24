@@ -4,21 +4,37 @@
     "avatars": [
         {
             "id": "1",
-            "name": "Margot",
+            "name": "Margot - Lufthansa",
             "description": "Lufthansa Travel Agent",
-            "image": "",
+            "image": "/assets/margot.png",
             "tags": ["Travelling"],
-            "ojin_persona_id": "0e9ba105-2bb4-4c7f-af2c-ba1380bf754a",
-            "hume_config_id": "9fbc572b-7ad7-4214-b14f-53777910c9f9"
+            "ojin_persona_id_production": "d144d42f-aa57-429a-ac68-44d3ca87fbbf",
+            "ojin_persona_id_staging": "0e9ba105-2bb4-4c7f-af2c-ba1380bf754a",
+            "hume_config_id": "9fbc572b-7ad7-4214-b14f-53777910c9f9",
+            "initialization_messages": [
+                "Checking flight availability...",
+                "Reviewing your travel preferences...",
+                "Preparing personalized recommendations...",
+                "Connecting to global booking systems...",
+                "Almost ready to assist with your journey..."
+            ]
         },
         {
             "id": "2",
-            "name": "Jordan",
-            "description": "Michael Jordan all time best NBA player",
-            "image": "",
+            "name": "Michael Jordan",
+            "description": "All time best NBA player",
+            "image": "/assets/jordan.png",
             "tags": ["Sports"],
-            "ojin_persona_id": "3c8684f8-abca-4785-94e5-275b1e7bd722",
-            "hume_config_id": "8f0125a9-bfea-4fa5-86f4-6899925bfdbe"
-        }        
+            "ojin_persona_id_production": "6eb49b80-5e75-4f45-a657-fccfeaf95003",
+            "ojin_persona_id_staging": "3c8684f8-abca-4785-94e5-275b1e7bd722",
+            "hume_config_id": "8f0125a9-bfea-4fa5-86f4-6899925bfdbe",
+            "initialization_messages": [
+                "Warming up on the court...",
+                "Lacing up the Air Jordans...",
+                "Reviewing game stats and highlights...",
+                "Getting in championship mindset...",
+                "Ready to talk basketball in just a moment..."
+            ]
+        }   
     ]
 }

@@ -159,14 +159,26 @@ Edit `config.json` to customize avatars:
       "id": "unique_id",
       "name": "Avatar Name",
       "description": "Description text",
-      "image": "path/to/image.jpg",
+      "image": "/assets/image.png",
       "tags": ["Category 1"],
       "ojin_persona_id": "persona_id_from_ojin",
-      "hume_config_id": "hume_config_id_from_hume"
+      "hume_config_id": "hume_config_id_from_hume",
+      "initialization_messages": [
+        "Loading message 1...",
+        "Loading message 2...",
+        "Almost ready..."
+      ]
     }
   ]
 }
 ```
+
+### Adding Avatar Images
+
+1. Place your image files in `public/assets/` folder
+2. Reference them in config.json as `/assets/filename.png`
+3. Supported formats: PNG, JPG, WebP
+4. Recommended size: 512x512px or larger, square aspect ratio
 
 ## Project Structure
 
@@ -177,11 +189,15 @@ ojin-agents-desktop/
 ├── src/               # React application
 │   ├── components/
 │   │   ├── AvatarCard.jsx
-│   │   └── AvatarGrid.jsx
+│   │   ├── AvatarGrid.jsx
+│   │   └── SessionWindow.jsx
 │   ├── App.jsx
 │   ├── main.jsx
 │   └── index.css
+├── public/            # Static assets (served by Vite)
+│   └── assets/        # Avatar images go here
 ├── build/             # App icons
+├── bot.py             # Python bot backend
 ├── config.json        # Avatar configuration
 ├── package.json
 └── vite.config.js
@@ -203,9 +219,11 @@ The app minimizes to the system tray instead of closing. Right-click the tray ic
 
 ## Notes
 
-- Avatar images should be placed in a `public` folder or use absolute URLs
+- Avatar images must be placed in `public/assets/` folder
+- Images load instantly with spinner and smooth fade-in
 - The app prevents multiple instances from running
 - DevTools are enabled in development mode only
+- Virtual environment automatically activated when debugging
 
 ## Usage
 

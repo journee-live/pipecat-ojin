@@ -1,11 +1,22 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 function SessionWindow({ avatar, onHangUp }) {
-  const [status, setStatus] = useState('connecting'); // connecting, active, error
+  const [status, setStatus] = useState('initializing'); // connecting, initializing, active, error, ended
   const [error, setError] = useState(null);
   const [transcript, setTranscript] = useState([]);
+  const [currentMessageIndex, setCurrentMessageIndex] = useState(0);
+  const [hasVideo, setHasVideo] = useState(false);
   const videoRef = useRef(null);
   const sessionRef = useRef(null);
+  const firstVideoFrameReceived = useRef(false);
+  const personaInitialized = useRef(false);
+  const lastBotError = useRef(null);
+  const lastInitializedAvatarId = useRef(null);
+
+  // Log status changes
+  useEffect(() => {
+    console.log(`[SessionWindow] Status changed to: ${status}`);
+  }, [status]);
 
   useEffect(() => {
     // Validate configuration
@@ -15,85 +26,31 @@ function SessionWindow({ avatar, onHangUp }) {
       return;
     }
 
+    // Prevent double initialization (React StrictMode calls effects twice)
+    // Check if we already initialized this specific avatar
+    if (lastInitializedAvatarId.current === avatar.ojin_persona_id) {
+      console.log('[SessionWindow] Session already initialized for this avatar, skipping duplicate');
+      return;
+    }
+    
+    lastInitializedAvatarId.current = avatar.ojin_persona_id;
+    console.log('[SessionWindow] Initializing bot session for', avatar.name, avatar.ojin_persona_id);
+    
     // Initialize bot session
     initializeSession();
 
     // Cleanup on unmount
     return () => {
+      console.log('[SessionWindow] Cleaning up on unmount for', avatar.name);
+      // Don't reset lastInitializedAvatarId here - it prevents StrictMode double init
+      // It will be overwritten when a different avatar is selected
       cleanupSession();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [avatar]);
 
-  // Handle keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape' || (e.ctrlKey && e.key === 'h')) {
-        e.preventDefault();
-        handleHangUp();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
-  const initializeSession = async () => {
-    try {
-      setStatus('connecting');
-      
-      console.log('Starting bot session for:', {
-        name: avatar.name,
-        personaId: avatar.ojin_persona_id,
-        humeConfigId: avatar.hume_config_id,
-      });
-
-      // Start bot session via IPC
-      const { ipcRenderer } = window.require('electron');
-      const result = await ipcRenderer.invoke('start-bot-session', {
-        personaId: avatar.ojin_persona_id,
-        humeConfigId: avatar.hume_config_id,
-      });
-
-      if (!result.success) {
-        throw new Error(result.error || 'Failed to start bot session');
-      }
-
-      // Listen for bot messages
-      const handleBotMessage = (event, message) => {
-        console.log('Bot message received:', message.type);
-
-        if (message.type === 'ready') {
-          console.log('Bot ready');
-        } else if (message.type === 'started') {
-          setStatus('active');
-          setTranscript([
-            { role: 'system', content: `Connected to ${avatar.name}` },
-          ]);
-        } else if (message.type === 'video_frame') {
-          // Update video display
-          updateVideoFrame(message);
-        } else if (message.type === 'transcript') {
-          // Update transcript
-          setTranscript(prev => [...prev, message.data]);
-        } else if (message.type === 'error') {
-          setStatus('error');
-          setError(message.message);
-        } else if (message.type === 'ended') {
-          console.log('Bot session ended');
-        }
-      };
-
-      ipcRenderer.on('bot-message', handleBotMessage);
-      sessionRef.current = { ipcRenderer, handleBotMessage };
-
-    } catch (err) {
-      console.error('Failed to initialize session:', err);
-      setStatus('error');
-      setError(err.message || 'Failed to start bot session');
-    }
-  };
-
-  const cleanupSession = async () => {
+  // Define cleanupSession and handleHangUp first (before useEffects that use them)
+  const cleanupSession = useCallback(async () => {
     if (sessionRef.current) {
       console.log('Cleaning up session');
       const { ipcRenderer, handleBotMessage } = sessionRef.current;
@@ -117,6 +74,113 @@ function SessionWindow({ avatar, onHangUp }) {
       
       sessionRef.current = null;
     }
+  }, []);
+
+  const handleHangUp = useCallback(async () => {
+    await cleanupSession();
+    onHangUp();
+  }, [cleanupSession, onHangUp]);
+
+  // Rotate through initialization messages
+  useEffect(() => {
+    if (status === 'initializing' && avatar.initialization_messages) {
+      const messages = avatar.initialization_messages;
+      const interval = setInterval(() => {
+        setCurrentMessageIndex((prev) => (prev + 1) % messages.length);
+      }, 3000); // Change message every 3 seconds
+
+      return () => clearInterval(interval);
+    }
+  }, [status, avatar.initialization_messages]);
+
+  // Handle keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = async (e) => {
+      if (e.key === 'Escape' || (e.ctrlKey && e.key === 'h')) {
+        e.preventDefault();
+        await handleHangUp();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleHangUp]);
+
+  const initializeSession = async () => {
+    try {
+      // Reset for new session
+      firstVideoFrameReceived.current = false;
+      personaInitialized.current = false;
+      lastBotError.current = null;
+      setHasVideo(false);
+      
+      console.log('Starting bot session for:', {
+        name: avatar.name,
+        personaId: avatar.ojin_persona_id,
+        humeConfigId: avatar.hume_config_id,
+      });
+
+      // Start bot session via IPC
+      const { ipcRenderer } = window.require('electron');
+      const result = await ipcRenderer.invoke('start-bot-session', {
+        personaId: avatar.ojin_persona_id,
+        humeConfigId: avatar.hume_config_id,
+        environment: avatar.environment || 'production', // Default to production if not specified
+      });
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to start bot session');
+      }
+
+      // Listen for bot messages
+      const handleBotMessage = (event, message) => {
+        console.log('Bot message received:', message.type);
+
+        if (message.type === 'ready') {
+          console.log('Bot ready');
+        } else if (message.type === 'started') {
+          console.log('Bot pipeline started, initializing persona...');
+          // Already in 'initializing' status, no need to set again
+        } else if (message.type === 'persona_initialized') {
+          console.log('Persona initialized!');
+          personaInitialized.current = true;
+          setHasVideo(true);
+          setStatus('active');
+          setTranscript([
+            { role: 'system', content: `Connected to ${avatar.name}` },
+          ]);
+        } else if (message.type === 'video_frame') {
+          // Update video display first
+          updateVideoFrame(message);          
+        } else if (message.type === 'transcript') {
+          // Update transcript
+          setTranscript(prev => [...prev, message.data]);
+        } else if (message.type === 'error') {
+          console.error('Bot error:', message.message);
+          lastBotError.current = message.message;
+          setStatus('error');
+          setError(message.message);
+        } else if (message.type === 'ended') {
+          console.log('Bot session ended with code:', message.code);
+          // If ended with non-zero code, treat as error
+          if (message.code && message.code !== 0) {
+            setStatus('error');
+            setError(lastBotError.current || 'Bot session ended unexpectedly. Check console for details.');
+          } else {
+            setStatus('ended');
+          }
+          // Note: Don't call cleanupSession here as it's already called by handleHangUp
+        }
+      };
+
+      ipcRenderer.on('bot-message', handleBotMessage);
+      sessionRef.current = { ipcRenderer, handleBotMessage };
+
+    } catch (err) {
+      console.error('Failed to initialize session:', err);
+      setStatus('error');
+      setError(err.message || 'Failed to start bot session');
+    }
   };
 
   const updateVideoFrame = (frameData) => {
@@ -136,7 +200,7 @@ function SessionWindow({ avatar, onHangUp }) {
             canvasEl.height = frameData.height || 720;
             canvasEl.style.width = '100%';
             canvasEl.style.height = '100%';
-            canvasEl.style.objectFit = 'contain';
+            canvasEl.style.objectFit = 'cover'; // Fill window while maintaining aspect ratio
             canvas.innerHTML = '';
             canvas.appendChild(canvasEl);
           }
@@ -151,15 +215,83 @@ function SessionWindow({ avatar, onHangUp }) {
     }
   };
 
-  const handleHangUp = () => {
-    cleanupSession();
-    onHangUp();
-  };
-
   const handleRetry = () => {
     setError(null);
     initializeSession();
   };
+
+  // Initializing state with rotating messages
+  if (status === 'initializing') {
+    const messages = avatar.initialization_messages || ['Initializing...'];
+    const currentMessage = messages[currentMessageIndex];
+
+    return (
+      <div className="fixed inset-0 bg-gradient-to-br from-gray-900 via-gray-800 to-black flex items-center justify-center z-50">
+        <div className="text-center px-8">
+          {/* Avatar Circle */}
+          <div className="mb-8 flex justify-center">
+            <div className="relative">
+              <div className="w-32 h-32 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-2xl">
+                <span className="text-5xl text-white font-bold">
+                  {avatar.name.charAt(0).toUpperCase()}
+                </span>
+              </div>
+              {/* Animated ring */}
+              <div className="absolute inset-0 rounded-full border-4 border-blue-400 animate-ping opacity-75"></div>
+              <div className="absolute inset-0 rounded-full border-4 border-purple-400 animate-pulse"></div>
+            </div>
+          </div>
+
+          {/* Rotating Message with fade animation */}
+          <div className="h-16 flex items-center justify-center mb-8">
+            <p
+              key={currentMessageIndex}
+              className="text-2xl text-white font-medium animate-fade-in"
+              style={{
+                animation: 'fadeInOut 3s ease-in-out'
+              }}
+            >
+              {currentMessage}
+            </p>
+          </div>
+
+          {/* Modern loading animation */}
+          <div className="flex justify-center gap-2 mb-4">
+            <div className="w-3 h-3 bg-blue-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+            <div className="w-3 h-3 bg-purple-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+            <div className="w-3 h-3 bg-pink-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+          </div>
+
+          {/* Progress bar */}
+          <div className="w-64 mx-auto h-1 bg-gray-700 rounded-full overflow-hidden">
+            <div className="h-full bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 animate-progress"></div>
+          </div>
+
+          {/* ESC hint */}
+          <p className="text-gray-400 text-sm mt-8">
+            Press <kbd className="px-2 py-1 bg-gray-700 rounded text-gray-300 text-xs">ESC</kbd> to cancel
+          </p>
+        </div>
+
+        {/* Add keyframes for animations */}
+        <style>{`
+          @keyframes fadeInOut {
+            0% { opacity: 0; transform: translateY(10px); }
+            10% { opacity: 1; transform: translateY(0); }
+            90% { opacity: 1; transform: translateY(0); }
+            100% { opacity: 0; transform: translateY(-10px); }
+          }
+          @keyframes progress {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+          }
+          .animate-progress {
+            animation: progress 1.5s ease-in-out infinite;
+          }
+        `}</style>
+      </div>
+    );
+  }
 
   // Error state
   if (status === 'error') {
@@ -188,92 +320,27 @@ function SessionWindow({ avatar, onHangUp }) {
     );
   }
 
-  // Main session UI
+  // Fullscreen video view - simple and clean
   return (
-    <div className="fixed inset-0 bg-black z-50 flex flex-col">
-      {/* Header */}
-      <div className="bg-gray-900 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-full bg-gray-700 flex items-center justify-center">
-            <span className="text-xl text-white font-semibold">
-              {avatar.name.charAt(0).toUpperCase()}
-            </span>
-          </div>
-          <div>
-            <h2 className="text-white text-lg font-semibold">{avatar.name}</h2>
-            <div className="flex items-center gap-2">
-              {status === 'connecting' && (
-                <>
-                  <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
-                  <span className="text-yellow-500 text-sm">Connecting...</span>
-                </>
-              )}
-              {status === 'active' && (
-                <>
-                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                  <span className="text-green-500 text-sm">Active</span>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <button
-          onClick={handleHangUp}
-          className="px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
-        >
-          Hang Up
-        </button>
+    <div className="fixed inset-0 bg-black z-50">
+      {/* Fullscreen video - fills window while maintaining aspect ratio */}
+      <div ref={videoRef} className="w-full h-full" style={{ 
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center'
+      }}>
+        <style>{`
+          #root canvas {
+            width: 100% !important;
+            height: 100% !important;
+            object-fit: cover;
+          }
+        `}</style>
       </div>
 
-      {/* Video/Avatar Area */}
-      <div className="flex-1 bg-gradient-to-br from-gray-900 to-gray-800 flex items-center justify-center relative">
-        <div ref={videoRef} className="w-full h-full flex items-center justify-center">
-          {/* Video stream will be rendered here */}
-          <div className="text-gray-500 text-center">
-            <div className="text-6xl mb-4">🎥</div>
-            <p className="text-xl">Video stream will appear here</p>
-            <p className="text-sm mt-2">Persona ID: {avatar.ojin_persona_id}</p>
-            <p className="text-sm">Hume Config: {avatar.hume_config_id || 'Not set'}</p>
-          </div>
-        </div>
-
-        {/* Mic indicator */}
-        <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 bg-gray-800 bg-opacity-75 px-4 py-2 rounded-full flex items-center gap-2">
-          <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
-          <span className="text-white text-sm">Microphone Active</span>
-        </div>
-      </div>
-
-      {/* Transcript Area */}
-      <div className="bg-gray-900 border-t border-gray-700 h-48 overflow-y-auto p-4">
-        <div className="max-w-4xl mx-auto space-y-2">
-          {transcript.length === 0 ? (
-            <p className="text-gray-500 text-center">Conversation transcript will appear here...</p>
-          ) : (
-            transcript.map((message, idx) => (
-              <div
-                key={idx}
-                className={`text-sm ${
-                  message.role === 'user'
-                    ? 'text-blue-400'
-                    : message.role === 'assistant'
-                    ? 'text-green-400'
-                    : 'text-gray-400'
-                }`}
-              >
-                <span className="font-semibold">{message.role}: </span>
-                {message.content}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      {/* Keyboard hint */}
-      <div className="absolute top-20 right-6 text-gray-400 text-xs">
-        Press <kbd className="px-2 py-1 bg-gray-700 rounded">Esc</kbd> or{' '}
-        <kbd className="px-2 py-1 bg-gray-700 rounded">Ctrl+H</kbd> to hang up
+      {/* ESC hint */}
+      <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 text-gray-400 text-sm">
+        Press <kbd className="px-2 py-1 bg-gray-800 rounded text-gray-300 text-xs">ESC</kbd> to hang up
       </div>
     </div>
   );

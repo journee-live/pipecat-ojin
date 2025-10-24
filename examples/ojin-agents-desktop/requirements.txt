@@ -1,0 +1,6 @@
+pipecat-ai[ojin, silero, hume]
+python-dotenv>=1.0.0
+pydantic-settings>=2.7.1
+pyaudio==0.2.14
+opencv-python>=4.10.0.84
+Pillow>=10.4.0

@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../../../ojin"
+		},
+		{
+			"path": "../ojin-agents-desktop"
 		}
 	],
 	"settings": {}

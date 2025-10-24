@@ -20,6 +20,24 @@
             ]
         },
         {
+            "id": "3",
+            "name": "Tessa",
+            "description": "Saudi Arabia Expert Travel Agent",
+            "image": "/assets/zara.png",
+            "tags": ["Travelling"],
+            "ojin_persona_id_production": "dc27ea6a-d20d-4c75-8a5f-71f9fd5f80a5",
+            "ojin_persona_id_staging": "",
+            "hume_config_id": "2e53e94a-e33f-453e-8f23-ebdfcc6c145b",
+            "initialization_messages": [
+                "Verifying Saudi Arabia visa and entry requirements...",
+                "Finding the best flight options to Riyadh and Jeddah...",
+                "Checking hotel availability near your preferred landmarks...",
+                "Lining up desert tours and cultural experiences...",
+                "Preparing real-time prices and smart itinerary options...",
+                "Reviewing weather and local events for your travel dates..."
+            ]
+        },
+        {
             "id": "2",
             "name": "Michael Jordan",
             "description": "All time best NBA player",

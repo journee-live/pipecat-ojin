@@ -42,7 +42,12 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "config.json"
+      "config.json",
+      "bot.py",
+      "requirements.txt"
+    ],
+    "asarUnpack": [
+      "bot.py"
     ],
     "win": {
       "target": ["nsis"],

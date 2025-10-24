@@ -1,15 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import AvatarCard from './AvatarCard';
 
-function AvatarGrid({ config, onAvatarSelect }) {
+function AvatarGrid({ config, onAvatarSelect, environment }) {
   const { main_tags, avatars } = config;
   const [cardSize, setCardSize] = useState('medium');
 
-  // Group avatars by tags
-  const avatarsByTag = main_tags.map((tag) => ({
-    tag,
-    avatars: avatars.filter((avatar) => avatar.tags.includes(tag)),
-  }));
+  // Filter avatars based on environment - only show if they have persona ID for this environment
+  const filteredAvatars = avatars.filter((avatar) => {
+    const personaIdField = environment === 'production' 
+      ? 'ojin_persona_id_production' 
+      : 'ojin_persona_id_staging';
+    return avatar[personaIdField]; // Only include if persona ID exists
+  });
+
+  // Group avatars by tags and filter out empty categories
+  const avatarsByTag = main_tags
+    .map((tag) => ({
+      tag,
+      avatars: filteredAvatars.filter((avatar) => avatar.tags.includes(tag)),
+    }))
+    .filter((category) => category.avatars.length > 0); // Only show categories with avatars
 
   // Determine card size based on viewport width
   useEffect(() => {

@@ -1,0 +1,58 @@
+{
+    "version": "1.0.0",
+    "main_tags": ["Sports", "Travelling"],
+    "avatars": [
+        {
+            "id": "1",
+            "name": "Margot - Lufthansa",
+            "description": "Lufthansa Travel Agent",
+            "image": "/assets/margot.png",
+            "tags": ["Travelling"],
+            "ojin_persona_id_production": "",
+            "ojin_persona_id_staging": "",
+            "hume_config_id": "",
+            "initialization_messages": [
+                "Checking flight availability...",
+                "Reviewing your travel preferences...",
+                "Preparing personalized recommendations...",
+                "Connecting to global booking systems...",
+                "Almost ready to assist with your journey..."
+            ]
+        },
+        {
+            "id": "3",
+            "name": "Tessa",
+            "description": "Saudi Arabia Expert Travel Agent",
+            "image": "/assets/zara.png",
+            "tags": ["Travelling"],
+            "ojin_persona_id_production": "",
+            "ojin_persona_id_staging": "",
+            "hume_config_id": "",
+            "initialization_messages": [
+                "Verifying Saudi Arabia visa and entry requirements...",
+                "Finding the best flight options to Riyadh and Jeddah...",
+                "Checking hotel availability near your preferred landmarks...",
+                "Lining up desert tours and cultural experiences...",
+                "Preparing real-time prices and smart itinerary options...",
+                "Reviewing weather and local events for your travel dates..."
+            ]
+        },
+        {
+            "id": "2",
+            "name": "Michael Jordan",
+            "description": "All time best NBA player",
+            "image": "/assets/jordan.png",
+            "tags": ["Sports"],
+            "ojin_persona_id_production": "",
+            "ojin_persona_id_staging": "",
+            "hume_config_id": "",
+            "initialization_messages": [
+                "Warming up on the court...",
+                "Lacing up the Air Jordans...",
+                "Reviewing game stats and highlights...",
+                "Getting in championship mindset...",
+                "Ready to talk basketball in just a moment..."
+            ]
+        }   
+    ]
+}

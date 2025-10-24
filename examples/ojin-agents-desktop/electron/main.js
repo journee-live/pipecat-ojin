@@ -15,6 +15,7 @@ function createWindow() {
     height: 600,
     minWidth: 300,
     minHeight: 300,
+    autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -28,10 +29,24 @@ function createWindow() {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    const indexPath = path.join(__dirname, '../dist/index.html');
+    console.log('Loading production app from:', indexPath);
+    mainWindow.loadFile(indexPath);
+    
+    // Open DevTools to see errors in production if needed
+    if (process.env.DEBUG === '1') {
+      mainWindow.webContents.openDevTools();
+    }
   }
 
+  // Log any load failures
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('Failed to load:', errorCode, errorDescription);
+  });
+
   mainWindow.once('ready-to-show', () => {
+    // Ensure the menu bar is hidden when the window shows
+    mainWindow.setMenuBarVisibility(false);
     mainWindow.show();
   });
 

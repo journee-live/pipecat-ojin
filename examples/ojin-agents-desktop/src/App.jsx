@@ -125,7 +125,7 @@ function App() {
       </div>
       
       <main className="flex-1 overflow-auto px-3 py-3">
-        <AvatarGrid config={config} onAvatarSelect={handleAvatarSelect} />
+        <AvatarGrid config={config} onAvatarSelect={handleAvatarSelect} environment={environment} />
       </main>
     </div>
   );

@@ -1,7 +1,0 @@
-- Move application to a separate github repo
-- Implement and test autoupdate
-- Split up config.json into shared config and personal config
-- Test on Mac OS
-- Test on Linux
-- Test on Windows 
-- Make agents be able to use MCP to control the computer

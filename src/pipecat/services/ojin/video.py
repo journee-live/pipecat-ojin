@@ -1,6 +1,5 @@
 import asyncio
 import io
-import math
 import os
 import time
 from collections import deque
@@ -290,7 +289,7 @@ class OjinPersonaService(FrameProcessor):
                 # Caching idle frames
                 idle_frame = IdleFrame(
                     frame_idx=frame_idx,
-                    image_bytes=message.video_frame_bytes,
+                    image_bytes=self.get_frame_bytes(message.video_frame_bytes),
                 )
                 self._idle_frames.append(idle_frame)
 
@@ -330,7 +329,7 @@ class OjinPersonaService(FrameProcessor):
                 # NOTE: Server sends audio_bytes along with video frame
                 video_frame = VideoFrame(
                     frame_idx=frame_idx,
-                    image_bytes=message.video_frame_bytes,
+                    image_bytes=self.get_frame_bytes(message.video_frame_bytes),
                     audio_bytes=message.audio_frame_bytes,
                     is_final=message.is_final_response,
                 )

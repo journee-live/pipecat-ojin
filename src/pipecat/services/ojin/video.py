@@ -278,15 +278,18 @@ class OjinPersonaService(FrameProcessor):
                 if not ret:
                     break
                 
-                # Convert BGR to RGB (OpenCV uses BGR by default)
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Resize if needed to match configured image size (frame is in BGR)
+                if frame.shape[:2][::-1] != self._settings.image_size:
+                    frame = cv2.resize(frame, self._settings.image_size)
                 
-                # Resize if needed to match configured image size
-                if frame_rgb.shape[:2][::-1] != self._settings.image_size:
-                    frame_rgb = cv2.resize(frame_rgb, self._settings.image_size)
+                # Encode to JPEG bytes to match the format from the server
+                # This keeps the same compressed format whether loading from video or server
+                success, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                if not success:
+                    logger.error(f"Failed to encode frame {frame_idx} to JPEG")
+                    continue
                 
-                # Convert to bytes
-                image_bytes = frame_rgb.tobytes()
+                image_bytes = encoded.tobytes()
                 
                 idle_frame = IdleFrame(
                     frame_idx=frame_idx,

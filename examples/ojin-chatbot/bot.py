@@ -64,7 +64,7 @@ class ImageFormatConverter(FrameProcessor):
 
                     if decoded_image is None:
                         # This means we loaded from video file and it failed to decode
-                        await self.push_frame(frame, direction)
+                        logger.error("Failed to decode image from bytes")
                         return
 
                     # Convert from BGR to RGB (OpenCV loads as BGR by default)

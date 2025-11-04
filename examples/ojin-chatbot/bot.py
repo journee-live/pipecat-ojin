@@ -63,7 +63,7 @@ class ImageFormatConverter(FrameProcessor):
                     decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
                     if decoded_image is None:
-                        logger.error("Failed to decode image from bytes")
+                        # This means we loaded from video file and it failed to decode
                         await self.push_frame(frame, direction)
                         return
 
@@ -153,6 +153,7 @@ async def main():
             image_size=(1280, 720),
             tts_audio_passthrough=False,
             extra_frames_lat=15,
+            idle_video_path="idle.mp4",
         )
     )
 

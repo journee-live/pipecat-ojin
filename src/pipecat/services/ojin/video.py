@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple
 
+import cv2
+import numpy as np
+
 from loguru import logger
 from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.ojin_persona_client import OjinPersonaClient
@@ -82,6 +85,7 @@ class OjinPersonaSettings:
     image_size: Tuple[int, int] = field(default=(1920, 1080))
     tts_audio_passthrough: bool = field(default=False)
     extra_frames_lat: int = field(default=15)
+    idle_video_path: str = field(default="")
 
 
 @dataclass
@@ -153,6 +157,152 @@ class OjinPersonaService(FrameProcessor):
         self._tts_started_timestamp: Optional[float] = None
         self._tts_first_frame_timestamp: Optional[float] = None
         self._time_to_first_frame_measurements: list[float] = []
+        
+        # Track if we need to save generated idle frames to disk
+        self._save_idle_video_path: Optional[str] = None
+
+    async def _save_idle_frames_to_video(self, video_path: str) -> bool:
+        """Save idle frames to an MP4 video file on disk.
+        
+        Args:
+            video_path: Path where the video file should be saved
+            
+        Returns:
+            True if frames were saved successfully, False otherwise
+        """
+        try:
+            if len(self._idle_frames) == 0:
+                logger.error("No idle frames to save")
+                return False
+            
+            logger.info(f"Saving {len(self._idle_frames)} idle frames to video: {video_path}")
+            
+            # Ensure directory exists
+            video_dir = os.path.dirname(os.path.abspath(video_path))
+            if video_dir:  # Only create if there's a directory path
+                os.makedirs(video_dir, exist_ok=True)
+            
+            # Get frame dimensions from settings
+            width, height = self._settings.image_size
+            
+            # Create video writer - try multiple codecs in order of compatibility
+            codecs_to_try = [
+                ('mp4v', '.mp4'),  # MPEG-4, most compatible
+                ('XVID', '.avi'),  # Xvid codec
+                ('MJPG', '.avi'),  # Motion JPEG, very compatible
+            ]
+            
+            out = None
+            used_codec = None
+            final_path = video_path
+            
+            for codec, extension in codecs_to_try:
+                # Adjust file extension based on codec
+                test_path = video_path
+                if not video_path.endswith(extension):
+                    test_path = os.path.splitext(video_path)[0] + extension
+                
+                logger.debug(f"Trying codec '{codec}' - path: {test_path}, fps: {self.fps}, size: ({width}, {height})")
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(test_path, fourcc, float(self.fps), (width, height))
+                
+                if out.isOpened():
+                    used_codec = codec
+                    final_path = test_path
+                    logger.info(f"Successfully created video writer with codec: {codec}")
+                    break
+                else:
+                    logger.warning(f"Codec '{codec}' not available")
+                    out = None
+            
+            if out is None or not out.isOpened():
+                logger.error(f"Failed to create video writer. Tried codecs: {[c[0] for c in codecs_to_try]}")
+                return False
+            
+            # Write each frame to the video
+            for idle_frame in self._idle_frames:
+                # Decode compressed image bytes to numpy array
+                frame_array = np.frombuffer(idle_frame.image_bytes, dtype=np.uint8)
+                frame_rgb = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+                
+                if frame_rgb is None:
+                    logger.error(f"Failed to decode frame {idle_frame.frame_idx}")
+                    continue
+                
+                # frame_rgb is already in BGR format from cv2.imdecode
+                # Resize if needed to match configured size
+                if frame_rgb.shape[:2][::-1] != (width, height):
+                    frame_rgb = cv2.resize(frame_rgb, (width, height))
+                
+                # Write frame
+                out.write(frame_rgb)
+            
+            out.release()
+            
+            logger.info(f"Successfully saved idle frames to: {final_path} (codec: {used_codec})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving idle frames to video: {e}", exc_info=True)
+            return False
+    
+    async def _load_idle_frames_from_video(self, video_path: str) -> bool:
+        """Load idle frames from a video file on disk.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            True if frames were loaded successfully, False otherwise
+        """
+        try:
+            if not os.path.exists(video_path):
+                logger.error(f"Video file not found: {video_path}")
+                return False
+                
+            logger.info(f"Loading idle frames from video: {video_path}")
+            
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error(f"Failed to open video file: {video_path}")
+                return False
+            
+            # Get video properties
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.info(f"Video properties - FPS: {video_fps}, Total frames: {total_frames}")
+            
+            frame_idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Convert BGR to RGB (OpenCV uses BGR by default)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Resize if needed to match configured image size
+                if frame_rgb.shape[:2][::-1] != self._settings.image_size:
+                    frame_rgb = cv2.resize(frame_rgb, self._settings.image_size)
+                
+                # Convert to bytes
+                image_bytes = frame_rgb.tobytes()
+                
+                idle_frame = IdleFrame(
+                    frame_idx=frame_idx,
+                    image_bytes=image_bytes,
+                )
+                self._idle_frames.append(idle_frame)
+                frame_idx += 1
+            
+            cap.release()
+            
+            logger.info(f"Successfully loaded {len(self._idle_frames)} idle frames from video")
+            return len(self._idle_frames) > 0
+            
+        except Exception as e:
+            logger.error(f"Error loading idle frames from video: {e}")
+            return False
 
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
@@ -254,19 +404,87 @@ class OjinPersonaService(FrameProcessor):
             if message.parameters is not None:
                 self._is_mirrored_loop = message.parameters.get("is_mirrored_loop", True)
 
-            logger.info("Requesting idle frames")
-            # Request idle frames from server
-            await self._client.start_interaction()
-            await self._client.send_message(
-                OjinPersonaInteractionInputMessage(
-                    audio_int16_bytes=bytes(),
-                    params={
-                        "filter_amount": IDLE_FILTER_AMOUNT,
-                        "mouth_opening_scale": IDLE_MOUTH_OPENING_SCALE,
-                        "generate_idle_frames": True,
-                    },
+            # Check if we should load idle frames from a video file
+            if self._settings.idle_video_path:
+                video_path = self._settings.idle_video_path
+                
+                # Check for video file with different extensions (since saving may change extension based on codec)
+                possible_paths = [
+                    video_path,
+                    os.path.splitext(video_path)[0] + '.mp4',
+                    os.path.splitext(video_path)[0] + '.avi',
+                ]
+                
+                existing_path = None
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        existing_path = path
+                        break
+                
+                # Check if video file exists
+                if existing_path:
+                    logger.info(f"Loading idle frames from existing video file: {existing_path}")
+                    success = await self._load_idle_frames_from_video(existing_path)
+                    
+                    if success:
+                        # Frames loaded successfully, transition to IDLE and start playback
+                        logger.info(f"Loaded {len(self._idle_frames)} idle frames from video")
+                        self.set_state(PersonaState.IDLE)
+                        self._run_loop_task = self.create_task(self._run_loop())
+                        
+                        # Notify that we're ready
+                        await self.push_frame(
+                            OjinPersonaInitializedFrame(),
+                            direction=FrameDirection.DOWNSTREAM,
+                        )
+                        await self.push_frame(
+                            OjinPersonaInitializedFrame(), direction=FrameDirection.UPSTREAM
+                        )
+                    else:
+                        # Failed to load from video, fall back to server generation
+                        logger.warning("Failed to load idle frames from video, requesting from server")
+                        self._save_idle_video_path = video_path
+                        await self._client.start_interaction()
+                        await self._client.send_message(
+                            OjinPersonaInteractionInputMessage(
+                                audio_int16_bytes=bytes(),
+                                params={
+                                    "filter_amount": IDLE_FILTER_AMOUNT,
+                                    "mouth_opening_scale": IDLE_MOUTH_OPENING_SCALE,
+                                    "generate_idle_frames": True,
+                                },
+                            )
+                        )
+                else:
+                    # Video file doesn't exist, generate frames and save them
+                    logger.info(f"Video file not found: {video_path}")
+                    logger.info("Requesting idle frames from server and will save to disk")
+                    self._save_idle_video_path = video_path
+                    await self._client.start_interaction()
+                    await self._client.send_message(
+                        OjinPersonaInteractionInputMessage(
+                            audio_int16_bytes=bytes(),
+                            params={
+                                "filter_amount": IDLE_FILTER_AMOUNT,
+                                "mouth_opening_scale": IDLE_MOUTH_OPENING_SCALE,
+                                "generate_idle_frames": True,
+                            },
+                        )
+                    )
+            else:
+                logger.info("Requesting idle frames from server")
+                # Request idle frames from server
+                await self._client.start_interaction()
+                await self._client.send_message(
+                    OjinPersonaInteractionInputMessage(
+                        audio_int16_bytes=bytes(),
+                        params={
+                            "filter_amount": IDLE_FILTER_AMOUNT,
+                            "mouth_opening_scale": IDLE_MOUTH_OPENING_SCALE,
+                            "generate_idle_frames": True,
+                        },
+                    )
                 )
-            )
 
         elif isinstance(message, OjinPersonaInteractionResponseMessage):
             frame_idx = message.index
@@ -281,6 +499,18 @@ class OjinPersonaService(FrameProcessor):
 
                 if message.is_final_response:
                     logger.info(f"Cached {len(self._idle_frames)} idle frames")
+                    
+                    # Save frames to video file if requested
+                    if self._save_idle_video_path:
+                        logger.info(f"Saving generated idle frames to: {self._save_idle_video_path}")
+                        save_success = await self._save_idle_frames_to_video(self._save_idle_video_path)
+                        if save_success:
+                            logger.info("Idle frames saved successfully")
+                        else:
+                            logger.warning("Failed to save idle frames to video")
+                        # Reset flag after saving
+                        self._save_idle_video_path = None
+                    
                     self.set_state(PersonaState.IDLE)
                     self._run_loop_task = self.create_task(self._run_loop())
 

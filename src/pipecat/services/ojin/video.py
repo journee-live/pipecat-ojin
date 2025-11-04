@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -81,7 +82,7 @@ class OjinPersonaSettings:
     persona_config_id: str = field(default="")
     image_size: Tuple[int, int] = field(default=(1920, 1080))
     tts_audio_passthrough: bool = field(default=False)
-    extra_frames_lat: int = field(default=15)
+    extra_frames_lat: int = field(default=3)
 
 
 @dataclass
@@ -150,6 +151,7 @@ class OjinPersonaService(FrameProcessor):
         self._server_fps_tracker = FPSTracker("OjinPersonaService")
 
         # Debugging: Track time from TTSStartedFrame to first video frame
+        self._user_stopped_speaking_time: Optional[float] = None
         self._tts_started_timestamp: Optional[float] = None
         self._tts_first_frame_timestamp: Optional[float] = None
         self._time_to_first_frame_measurements: list[float] = []
@@ -191,6 +193,10 @@ class OjinPersonaService(FrameProcessor):
             logger.debug("StartFrame")
             await self.push_frame(frame, direction)
             await self._start()
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            logger.debug("UserStoppedSpeakingFrame")
+            self.user_stopped_speaking_time = time.perf_counter()
+            await self.push_frame(frame, direction)
         elif isinstance(frame, TTSStartedFrame):
             logger.debug("StartInterruptionFrame")
             # Clear speech frames buffer
@@ -305,8 +311,7 @@ class OjinPersonaService(FrameProcessor):
                     logger.info(f"First video frame for interaction_id: {message.interaction_id}")
 
                     logger.info(
-                        f"Time to first video frame: {self._time_to_first_frame_measurements[-1] * 1000:.2f}ms "
-                        f"(measurement #{len(self._time_to_first_frame_measurements)})"
+                        f"Time to first video frame received: {self._time_to_first_frame_measurements[-1] * 1000:.2f}ms"
                     )
 
                 # Speech frame with bundled audio
@@ -452,6 +457,12 @@ class OjinPersonaService(FrameProcessor):
 
                 logger.debug(f"Playing speech frame {video_frame.frame_idx}")
                 self._num_speech_frames_played += 1
+
+                if self._num_speech_frames_played == 1:
+                    time_to_first_frame_played = time.perf_counter() - self._tts_started_timestamp
+                    logger.info(
+                        f"Time to first video frame played: {time_to_first_frame_played * 1000:.2f}ms"
+                    )
 
                 # Check if this was the last speech frame
                 if video_frame.is_final and len(self._speech_frames) == 0:

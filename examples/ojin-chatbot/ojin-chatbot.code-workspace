@@ -7,7 +7,7 @@
 			"path": "../.."
 		},
 		{
-			"path": "../../../ojin"
+			"path": "../../../ojin/managed-models/avatar/services"
 		}
 	],
 	"settings": {}

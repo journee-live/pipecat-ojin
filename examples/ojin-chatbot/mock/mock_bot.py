@@ -131,6 +131,7 @@ async def main():
             video_out_is_live=True,
             video_out_width=1280,
             video_out_height=720,
+            vad_enabled=False,  
         ),
     )
 

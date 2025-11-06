@@ -38,6 +38,10 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
+class OjinPersonaSpeakingFrame(Frame):
+    """Frame indicating that the persona is speaking."""
+    pass
+
 class OjinPersonaInitializedFrame(Frame):
     """Frame indicating that the persona has been initialized and can now output frames."""
 
@@ -508,8 +512,11 @@ class OjinPersonaService(FrameProcessor):
                 sample_rate=OJIN_PERSONA_SAMPLE_RATE,
                 num_channels=1,
             )
+
+            speaking_frame = OjinPersonaSpeakingFrame()
             await self.push_frame(image_frame)
             await self.push_frame(audio_frame)
+            await self.push_frame(speaking_frame)
 
     async def _start(self):
         """Initialize the persona service and start processing."""

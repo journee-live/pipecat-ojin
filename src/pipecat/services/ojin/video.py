@@ -468,6 +468,8 @@ class OjinPersonaService(FrameProcessor):
                 self._num_speech_frames_played += 1
 
                 # Check if this was the last speech frame
+                speaking_frame = OjinPersonaSpeakingFrame()
+                await self.push_frame(speaking_frame)
                 if video_frame.is_final and len(self._speech_frames) == 0:
                     logger.info("Last speech frame played, transitioning to IDLE")
                     self.set_state(PersonaState.IDLE)
@@ -501,10 +503,8 @@ class OjinPersonaService(FrameProcessor):
                 num_channels=1,
             )
 
-            speaking_frame = OjinPersonaSpeakingFrame()
             await self.push_frame(image_frame)
             await self.push_frame(audio_frame)
-            await self.push_frame(speaking_frame)
 
     async def _start(self):
         """Initialize the persona service and start processing."""

@@ -162,11 +162,10 @@ class OjinPersonaService(FrameProcessor):
         self._tts_first_frame_timestamp: Optional[float] = None
         self._time_to_first_frame_measurements: list[float] = []
 
-    def get_frame_bytes(self, frame_bytes: bytes) -> bytes:
+    def get_frame_bytes(self, frame_bytes: bytes) -> Image:
         image = Image.open(io.BytesIO(frame_bytes))
         rgb_image = image.convert('RGB')
-        rgb_image = rgb_image.resize(self._settings.image_size, Resampling.BILINEAR)
-        return rgb_image.tobytes()
+        return rgb_image
 
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
@@ -289,7 +288,7 @@ class OjinPersonaService(FrameProcessor):
                 # Caching idle frames
                 idle_frame = IdleFrame(
                     frame_idx=frame_idx,
-                    image_bytes=self.get_frame_bytes(message.video_frame_bytes),
+                    image_bytes=message.video_frame_bytes,
                 )
                 self._idle_frames.append(idle_frame)
 
@@ -327,7 +326,7 @@ class OjinPersonaService(FrameProcessor):
                 # NOTE: Server sends audio_bytes along with video frame
                 video_frame = VideoFrame(
                     frame_idx=frame_idx,
-                    image_bytes=self.get_frame_bytes(message.video_frame_bytes),
+                    image_bytes=message.video_frame_bytes,
                     audio_bytes=message.audio_frame_bytes,
                     is_final=message.is_final_response,
                 )
@@ -494,8 +493,9 @@ class OjinPersonaService(FrameProcessor):
                     logger.debug(f"Playing idle frame {self._played_frame_idx}")
 
             # Output frame and audio
+            image = self.get_frame_bytes(image_bytes)
             image_frame = OutputImageRawFrame(
-                image=image_bytes, size=self._settings.image_size, format="RGB"
+                image=image.tobytes(), size=image.size, format="RGB"
             )
             audio_frame = OutputAudioRawFrame(
                 audio=audio_bytes,

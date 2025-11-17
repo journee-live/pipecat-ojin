@@ -42,8 +42,21 @@ class OjinPersonaSpeakingFrame(Frame):
     """Frame indicating that the persona is speaking."""
     pass
 
+@dataclass
 class OjinPersonaInitializedFrame(Frame):
     """Frame indicating that the persona has been initialized and can now output frames."""
+
+    session_data: Optional[dict] = None
+
+
+class OjinFirstFramePlayedFrame(Frame):
+    """Frame indicating that the first frame has been played."""
+
+    pass
+
+
+class OjinLastFramePlayedFrame(Frame):
+    """Frame indicating that the last frame has been played."""
 
     pass
 
@@ -87,7 +100,7 @@ class OjinPersonaSettings:
     client_connect_max_retries: int = field(default=3)
     client_reconnect_delay: float = field(default=3.0)
     persona_config_id: str = field(default="")
-    image_size: Tuple[int, int] = field(default=(1920, 1080))
+    image_size: Tuple[int, int] = field(default=(1280, 720))
     tts_audio_passthrough: bool = field(default=False)
     extra_frames_lat: int = field(default=15)
 
@@ -159,7 +172,7 @@ class OjinPersonaService(FrameProcessor):
 
         # Debugging: Track time from TTSStartedFrame to first video frame
         self._tts_started_timestamp: Optional[float] = None
-        self._tts_first_frame_timestamp: Optional[float] = None
+        self._first_frame_received_timestamp: Optional[float] = None
         self._time_to_first_frame_measurements: list[float] = []
 
     def get_frame_bytes(self, frame_bytes: bytes) -> Image:
@@ -208,12 +221,13 @@ class OjinPersonaService(FrameProcessor):
             logger.debug("StartInterruptionFrame")
             # Clear speech frames buffer
             self._speech_frames.clear()
-            self._tts_first_frame_timestamp = None
+            self._first_frame_received_timestamp = None
+            self._first_frame_played_timestamp = None
 
             # Track timestamp for debugging time to first video frame
             self._tts_started_timestamp = time.perf_counter()
 
-            self.set_state(PersonaState.IDLE)
+            await self.set_state(PersonaState.IDLE)
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -236,7 +250,7 @@ class OjinPersonaService(FrameProcessor):
                     },
                 )
             )
-            self.set_state(PersonaState.SPEAKING)
+            await self.set_state(PersonaState.SPEAKING)
             if self._settings.tts_audio_passthrough:
                 await self.push_frame(frame, direction)
 
@@ -258,14 +272,15 @@ class OjinPersonaService(FrameProcessor):
     async def _handle_ojin_message(self, message: BaseModel):
         """Process incoming messages from the server."""
         if isinstance(message, OjinPersonaSessionReadyMessage):
-            logger.info("Received Session Ready")
-
-            self.set_state(PersonaState.INITIALIZING)
-            assert self._client is not None
-
-            self._server_fps_tracker.start()
             if message.parameters is not None:
                 self._is_mirrored_loop = message.parameters.get("is_mirrored_loop", True)
+                self._session_data = message.parameters
+
+            logger.info(f"Received Session Ready session data: {message}")
+            if self._session_data and self._session_data.get("server_id"):
+                logger.info(f"Connected to server: {self._session_data.get('server_id')}")
+
+            self._server_fps_tracker.start()
 
             logger.info("Requesting idle frames")
             # Request idle frames from server
@@ -294,32 +309,30 @@ class OjinPersonaService(FrameProcessor):
 
                 if message.is_final_response:
                     logger.info(f"Cached {len(self._idle_frames)} idle frames")
-                    self.set_state(PersonaState.IDLE)
+                    await self.set_state(PersonaState.IDLE)
                     self._run_loop_task = self.create_task(self._run_loop())
 
                     # Notify that we're ready
+                    initialized_frame = OjinPersonaInitializedFrame(session_data=self._session_data)
                     await self.push_frame(
-                        OjinPersonaInitializedFrame(),
+                        initialized_frame,
                         direction=FrameDirection.DOWNSTREAM,
                     )
                     await self.push_frame(
-                        OjinPersonaInitializedFrame(), direction=FrameDirection.UPSTREAM
+                        initialized_frame, direction=FrameDirection.UPSTREAM
                     )
             else:
                 # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
                 if self._state == PersonaState.IDLE:
                     return
 
-                if self._tts_first_frame_timestamp is None:
-                    self._tts_first_frame_timestamp = time.perf_counter()
+                if self._first_frame_received_timestamp is None:
+                    self._first_frame_received_timestamp = time.perf_counter()
                     self._time_to_first_frame_measurements.append(
-                        self._tts_first_frame_timestamp - self._tts_started_timestamp
+                        self._first_frame_received_timestamp - self._tts_started_timestamp
                     )
-                    logger.info(f"First video frame for interaction_id: {message.interaction_id}")
-
                     logger.info(
-                        f"Time to first video frame: {self._time_to_first_frame_measurements[-1] * 1000:.2f}ms "
-                        f"(measurement #{len(self._time_to_first_frame_measurements)})"
+                        f"Time to first video frame received for interaction id: {message.interaction_id}: {self._time_to_first_frame_measurements[-1] * 1000:.2f}ms"
                     )
 
                 # Speech frame with bundled audio
@@ -366,14 +379,19 @@ class OjinPersonaService(FrameProcessor):
                 await self.push_frame(EndFrame(), FrameDirection.UPSTREAM)
                 await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
-    def set_state(self, state: PersonaState):
+    async def set_state(self, state: PersonaState):
         """Update the persona state."""
         if self._state == state:
             return
 
-        logger.debug(f"PersonaState changed from {self._state} to {state}")
+        old_state = self._state
+        logger.debug(f"PersonaState changed from {old_state} to {state}")
         match state:
             case PersonaState.IDLE:
+                # Push last frame played if we're coming from SPEAKING state
+                if old_state == PersonaState.SPEAKING:
+                    await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.UPSTREAM)
+                    await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.DOWNSTREAM)
                 self._num_speech_frames_played = 0
         self._state = state
 
@@ -466,12 +484,20 @@ class OjinPersonaService(FrameProcessor):
                 logger.debug(f"Playing speech frame {video_frame.frame_idx}")
                 self._num_speech_frames_played += 1
 
+                if self._first_frame_played_timestamp is None:
+                    self._first_frame_played_timestamp = time.perf_counter()
+                    logger.info(
+                        f"Time to first video frame played: {self._first_frame_played_timestamp - self._tts_started_timestamp}s"
+                    )
+                    await self.push_frame(OjinFirstFramePlayedFrame(), FrameDirection.UPSTREAM)
+                    await self.push_frame(OjinFirstFramePlayedFrame(), FrameDirection.DOWNSTREAM)
+
                 # Check if this was the last speech frame
                 speaking_frame = OjinPersonaSpeakingFrame()
                 await self.push_frame(speaking_frame)
                 if video_frame.is_final and len(self._speech_frames) == 0:
                     logger.info("Last speech frame played, transitioning to IDLE")
-                    self.set_state(PersonaState.IDLE)
+                    await self.set_state(PersonaState.IDLE)
 
             else:
                 if self._num_speech_frames_played > 0:
@@ -486,11 +512,13 @@ class OjinPersonaService(FrameProcessor):
                 image_bytes = idle_frame.image_bytes
                 # audio_bytes is already set to silence
 
-                if self._state == PersonaState.IDLE:
-                    if self._played_frame_idx % 25 == 0:
-                        logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")
-                else:
-                    logger.debug(f"Playing idle frame {self._played_frame_idx}")
+                if self._played_frame_idx % 150 == 0:
+                    logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
+                # if self._state == PersonaState.IDLE:
+                #     if self._played_frame_idx % 25 == 0:
+                #         logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")
+                # else:
+                #     logger.debug(f"Playing idle frame {self._played_frame_idx}")
 
             # Output frame and audio
             image = self.get_frame_bytes(image_bytes)
@@ -546,4 +574,4 @@ class OjinPersonaService(FrameProcessor):
         if self._client is not None:
             await self._client.send_message(OjinPersonaCancelInteractionMessage())
 
-        self.set_state(PersonaState.INTERRUPTING)
+        await self.set_state(PersonaState.INTERRUPTING)

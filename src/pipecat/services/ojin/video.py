@@ -142,7 +142,6 @@ class OjinPersonaService(FrameProcessor):
         # Idle animation frames (cached during initialization)
         self._idle_frames: list[IdleFrame] = []
         self._is_mirrored_loop: bool = True
-        self.last_idle_frame_index = -1
 
         # Speech frames queue (video + audio bundled)
         self._speech_frames: deque[VideoFrame] = deque()
@@ -295,13 +294,9 @@ class OjinPersonaService(FrameProcessor):
                     image_bytes=message.video_frame_bytes,
                 )
 
-                self.last_idle_frame_index += 1
-                if frame_idx != self.last_idle_frame_index:
-                    logger.error(
-                        f"Received wrong idle frame index: {frame_idx} expected: {self.last_idle_frame_index}"
-                    )
-
-                # Ensure list is large enough
+                # Ensure list is large enough.
+                # Idle frames can come at different times if speech is sent before all idle frames arrived,
+                # Speech frames get priority and idle frames continue to arrive from the last speech frame index
                 if len(self._idle_frames) <= frame_idx:
                     self._idle_frames.extend([None] * (frame_idx - len(self._idle_frames) + 1))
 
@@ -324,7 +319,8 @@ class OjinPersonaService(FrameProcessor):
             else:
                 # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
                 if self._state == PersonaState.IDLE:
-                    return
+                    self.set_state(PersonaState.SPEAKING)
+                    logger.warning("Received speech frame while in IDLE state")
 
                 if (
                     self._first_frame_received_timestamp is None
@@ -382,6 +378,7 @@ class OjinPersonaService(FrameProcessor):
 
         old_state = self._state
         logger.debug(f"PersonaState changed from {old_state} to {state}")
+        self._state = state
         match state:
             case PersonaState.IDLE:
                 # Push last frame played if we're coming from SPEAKING state
@@ -389,7 +386,6 @@ class OjinPersonaService(FrameProcessor):
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.UPSTREAM)
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.DOWNSTREAM)
                 self._num_speech_frames_played = 0
-        self._state = state
 
     async def _receive_ojin_messages(self):
         """Continuously receive and process messages from the server."""
@@ -489,37 +485,44 @@ class OjinPersonaService(FrameProcessor):
                     await self.push_frame(OjinFirstFramePlayedFrame(), FrameDirection.DOWNSTREAM)
 
                 # Check if this was the last speech frame
-                if video_frame.is_final and len(self._speech_frames) == 0:
-                    logger.info("Last speech frame played, transitioning to IDLE")
+                if len(self._speech_frames) == 0:
+                    logger.info("No more speech we transitioning to IDLE")
                     await self.set_state(PersonaState.IDLE)
 
-            else:
+            # Case where we don't have speech frame available
+            if image_bytes is None:
                 if self._num_speech_frames_played > 0:
-                    logger.debug(
-                        f"frame missed: {self._current_frame_idx} at {time.perf_counter()}"
-                    )
-                    self._current_frame_idx -= 1
+                    no_frames = len(self._speech_frames) == 0
+                    if no_frames:
+                        next_speech_frame_frame_idx = -1
+                    else:
+                        next_speech_frame_frame_idx = self._speech_frames[0].frame_idx
+
+                    if no_frames and self._state == PersonaState.IDLE:
+                        logger.error("Inconsistent frame miss detection, this should not happen")
+                        self._num_speech_frames_played = 0
+                    else:
+                        logger.debug(
+                            f"frame missed: {self._current_frame_idx} at {time.perf_counter()} state:{self._state}, next_speech_frame_frame_idx:{next_speech_frame_frame_idx}"
+                        )
                     await asyncio.sleep(0.005)
                     continue
 
                 # Play idle frame
                 self._played_frame_idx += 1
+                self._current_frame_idx = self._played_frame_idx
                 idle_frame = self._get_idle_frame_for_index(self._played_frame_idx)
                 if idle_frame is None or idle_frame.image_bytes is None:
                     logger.error(f"Idle frame {self._played_frame_idx} is None")
-                    self._played_frame_idx -= 1
+                    # self._played_frame_idx += 1
                     await asyncio.sleep(0.02)
+                    continue
 
                 image_bytes = idle_frame.image_bytes
                 # audio_bytes is already set to silence
 
                 if self._played_frame_idx % 150 == 0:
                     logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
-                # if self._state == PersonaState.IDLE:
-                #     if self._played_frame_idx % 25 == 0:
-                #         logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")
-                # else:
-                #     logger.debug(f"Playing idle frame {self._played_frame_idx}")
 
             # Output frame and audio
             image_frame = OutputImageRawFrame(

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -10,6 +11,7 @@ from loguru import logger
 from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.ojin_persona_client import OjinPersonaClient
 from ojin.ojin_persona_messages import (
+    FrameType,
     IOjinPersonaClient,
     OjinPersonaCancelInteractionMessage,
     OjinPersonaInteractionInputMessage,
@@ -143,7 +145,6 @@ class OjinPersonaService(FrameProcessor):
 
         # Speech frames queue (video + audio bundled)
         self._speech_frames: deque[VideoFrame] = deque()
-
         # Playback state
         self.fps = 25
         self._num_speech_frames_played = 0
@@ -286,17 +287,24 @@ class OjinPersonaService(FrameProcessor):
         elif isinstance(message, OjinPersonaInteractionResponseMessage):
             frame_idx = message.index
 
-            if self._state == PersonaState.INITIALIZING:
+            if message.frame_type == FrameType.IDLE:
                 # Caching idle frames
                 idle_frame = IdleFrame(
                     frame_idx=frame_idx,
                     image_bytes=message.video_frame_bytes,
                 )
-                self._idle_frames.append(idle_frame)
 
-                if message.is_final_response:
+                # Ensure list is large enough.
+                # Idle frames can come at different times if speech is sent before all idle frames arrived,
+                # Speech frames get priority and idle frames continue to arrive from the last speech frame index
+                if len(self._idle_frames) <= frame_idx:
+                    self._idle_frames.extend([None] * (frame_idx - len(self._idle_frames) + 1))
+
+                logger.debug(f"Cached idle frame {idle_frame.frame_idx}")
+                self._idle_frames[idle_frame.frame_idx] = idle_frame
+
+                if self._state == PersonaState.INITIALIZING:
                     logger.info(f"Cached {len(self._idle_frames)} idle frames")
-                    await self.set_state(PersonaState.IDLE)
                     self._run_loop_task = self.create_task(self._run_loop())
 
                     # Notify that we're ready
@@ -305,15 +313,19 @@ class OjinPersonaService(FrameProcessor):
                         initialized_frame,
                         direction=FrameDirection.DOWNSTREAM,
                     )
-                    await self.push_frame(
-                        initialized_frame, direction=FrameDirection.UPSTREAM
-                    )
+                    await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
+                    await self.set_state(PersonaState.IDLE)
+
             else:
                 # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
                 if self._state == PersonaState.IDLE:
-                    return
+                    self.set_state(PersonaState.SPEAKING)
+                    logger.warning("Received speech frame while in IDLE state")
 
-                if self._first_frame_received_timestamp is None:
+                if (
+                    self._first_frame_received_timestamp is None
+                    and not self._tts_started_timestamp is None
+                ):
                     self._first_frame_received_timestamp = time.perf_counter()
                     self._time_to_first_frame_measurements.append(
                         self._first_frame_received_timestamp - self._tts_started_timestamp
@@ -336,13 +348,6 @@ class OjinPersonaService(FrameProcessor):
                 logger.debug(
                     f"Received video frame {frame_idx}, is_final={message.is_final_response}"
                 )
-
-                # Transition to IDLE when interrupting and final response is received
-                # if self._state == PersonaState.INTERRUPTING and message.is_final_response:
-                #     # Clear speech frames buffer
-                #     self._speech_frames.clear()
-
-                #     self.set_state(PersonaState.IDLE)
 
         elif isinstance(message, ErrorResponseMessage):
             is_fatal = False
@@ -373,6 +378,7 @@ class OjinPersonaService(FrameProcessor):
 
         old_state = self._state
         logger.debug(f"PersonaState changed from {old_state} to {state}")
+        self._state = state
         match state:
             case PersonaState.IDLE:
                 # Push last frame played if we're coming from SPEAKING state
@@ -380,7 +386,6 @@ class OjinPersonaService(FrameProcessor):
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.UPSTREAM)
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.DOWNSTREAM)
                 self._num_speech_frames_played = 0
-        self._state = state
 
     async def _receive_ojin_messages(self):
         """Continuously receive and process messages from the server."""
@@ -480,30 +485,44 @@ class OjinPersonaService(FrameProcessor):
                     await self.push_frame(OjinFirstFramePlayedFrame(), FrameDirection.DOWNSTREAM)
 
                 # Check if this was the last speech frame
-                if video_frame.is_final and len(self._speech_frames) == 0:
-                    logger.info("Last speech frame played, transitioning to IDLE")
+                if len(self._speech_frames) == 0:
+                    logger.info("No more speech we transitioning to IDLE")
                     await self.set_state(PersonaState.IDLE)
 
-            else:
+            # Case where we don't have speech frame available
+            if image_bytes is None:
                 if self._num_speech_frames_played > 0:
-                    logger.debug(f"frame missed: {self._current_frame_idx}")
-                    self._current_frame_idx -= 1
+                    no_frames = len(self._speech_frames) == 0
+                    if no_frames:
+                        next_speech_frame_frame_idx = -1
+                    else:
+                        next_speech_frame_frame_idx = self._speech_frames[0].frame_idx
+
+                    if no_frames and self._state == PersonaState.IDLE:
+                        logger.error("Inconsistent frame miss detection, this should not happen")
+                        self._num_speech_frames_played = 0
+                    else:
+                        logger.debug(
+                            f"frame missed: {self._current_frame_idx} at {time.perf_counter()} state:{self._state}, next_speech_frame_frame_idx:{next_speech_frame_frame_idx}"
+                        )
                     await asyncio.sleep(0.005)
                     continue
 
                 # Play idle frame
                 self._played_frame_idx += 1
+                self._current_frame_idx = self._played_frame_idx
                 idle_frame = self._get_idle_frame_for_index(self._played_frame_idx)
+                if idle_frame is None or idle_frame.image_bytes is None:
+                    logger.error(f"Idle frame {self._played_frame_idx} is None")
+                    # self._played_frame_idx += 1
+                    await asyncio.sleep(0.02)
+                    continue
+
                 image_bytes = idle_frame.image_bytes
                 # audio_bytes is already set to silence
 
                 if self._played_frame_idx % 150 == 0:
                     logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
-                # if self._state == PersonaState.IDLE:
-                #     if self._played_frame_idx % 25 == 0:
-                #         logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")
-                # else:
-                #     logger.debug(f"Playing idle frame {self._played_frame_idx}")
 
             # Output frame and audio
             image_frame = OutputImageRawFrame(
@@ -552,6 +571,8 @@ class OjinPersonaService(FrameProcessor):
         Client just needs to clear buffers.
         """
         logger.info("Interrupting speech")
+        if self._state != PersonaState.SPEAKING:
+            return
 
         # Send cancel to server
         if self._client is not None:

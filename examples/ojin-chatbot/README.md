@@ -54,6 +54,6 @@ python bot.py
 The project relies on:
 
 - [pipecat](https://github.com/pipecat-ai/pipecat) – For building the audio processing pipeline.
-- **Ojin** – For persona video generation from tts audio. https://ojin.ai/
-- **Hume** – For Speech to Speech service covering STT/LLM/TTS in a single service. https://hume.ai/
+- **Ojin** – For persona video generation from tts audio. [https://ojin.ai/](https://ojin.ai/)
+- **Hume** – For Speech to Speech service covering STT/LLM/TTS in a single service. [https://hume.ai/](https://hume.ai/)
 - **Tkinter** – For local audio input and output and video output.

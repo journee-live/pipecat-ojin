@@ -26,6 +26,10 @@ Essentially, it will send a real-time stream of audio from a TTS generator to th
 Install Dependencies:
 
 ```bash
+# Install the local pipecat-ojin package with ojin extras
+pip install -e "../../[ojin,silero,hume]"
+
+# Install remaining dependencies
 pip install -r requirements.txt
 ```
 

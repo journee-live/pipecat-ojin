@@ -2,7 +2,7 @@
 
 Welcome to the **Pipecat Ojin Chatbot Example**!
 
-This example is meant to showcase the realtime speech to video generation capabilities of the Oris model available on the [Ojin platform](https://ojin.ai/).
+This example is meant to showcase the real-time speech-to-video generation capabilities of the Oris model available on the [Ojin platform](https://ojin.ai/).
 Essentially, it will send a real-time stream of audio from a TTS generator to the Ojin Model API, receive a stream of lipsynced video frames and display them in real-time.
 
 ---

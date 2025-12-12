@@ -117,8 +117,6 @@ async def main():
         LocalAudioTransportParams(
             audio_out_enabled=False,
             audio_in_enabled=True,
-            vad_enabled=True,
-            vad_audio_passthrough=True,
             vad_analyzer=SileroVADAnalyzer(),
         )
     )

@@ -300,7 +300,7 @@ class OjinVideoService(FrameProcessor):
                     self._run_loop_task = self.create_task(self._run_loop())
 
                     # Notify that we're ready
-                    initialized_frame = OjinSTVInitializedFrame(session_data=self._session_data)
+                    initialized_frame = OjinVideoServiceInitializedFrame(session_data=self._session_data)
                     await self.push_frame(
                         initialized_frame,
                         direction=FrameDirection.DOWNSTREAM,

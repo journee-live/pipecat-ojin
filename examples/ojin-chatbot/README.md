@@ -10,7 +10,7 @@ Essentially, it will send a real-time stream of audio from a TTS generator to th
 ## 🎉 Features
 
 - **OjinVideoService:**  
-  Connects to Ojin platform through websockets and manages conversation state. It will generate idle frames on startup and cache them in memory so they don't need to be generated again. It will also manage transitions with speech so they feel smooth. You will need an OJIN_API_KEY and OJIN_PERSONA_ID setup in your .env file.
+  Connects to Ojin platform through websockets and manages conversation state. It will generate idle frames on startup and cache them in memory so they don't need to be generated again. It will also manage transitions with speech so they feel smooth. You will need an OJIN_API_KEY and OJIN_CONFIG_ID setup in your .env file.
 
 - **HumeSTSService**
   Connects to Hume platform through websockets which provides a Speech to Speech service covering STT/LLM/TTS in a single service. You will need an HUME_API_KEY and HUME_CONFIG_ID setup in your .env file.
@@ -62,6 +62,6 @@ python bot.py
 The project relies on:
 
 - [pipecat](https://github.com/pipecat-ai/pipecat) – For building the audio processing pipeline.
-- **Ojin** – For persona video generation from tts audio. [https://ojin.ai/](https://ojin.ai/)
+- **Ojin** – For speech to video generation. [https://ojin.ai/](https://ojin.ai/)
 - **Hume** – For Speech to Speech service covering STT/LLM/TTS in a single service. [https://hume.ai/](https://hume.ai/)
 - **Tkinter** – For local audio input and output and video output.

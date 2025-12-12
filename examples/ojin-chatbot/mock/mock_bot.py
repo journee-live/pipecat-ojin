@@ -138,7 +138,7 @@ async def main():
         OjinVideoServiceSettings(
             ws_url=os.getenv("OJIN_REALTIME_API_URL", "wss://models.ojin.ai/realtime"),
             api_key=os.getenv("OJIN_API_KEY", ""),
-            config_id=os.getenv("OJIN_PERSONA_ID", ""),
+            config_id=os.getenv("OJIN_CONFIG_ID", ""),
             image_size=(1280, 720),
             tts_audio_passthrough=False,
         )

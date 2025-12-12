@@ -34,9 +34,6 @@ source venv/bin/activate
 Install Dependencies:
 
 ```bash
-# Install the local pipecat-ojin package with ojin extras
-pip install -e "../../[ojin,silero,hume]"
-
 # Install remaining dependencies
 pip install -r requirements.txt
 ```
@@ -47,7 +44,7 @@ For MacOS instead of pyaudio you can use portaudio
 brew install portaudio
 ```
 
-Make sure to fill out proper values for required environment variables in the `.env` file. An example of the needed variables is provided in .env.example
+Make sure to fill out proper values for required environment variables in the `.env` file. An example of the needed variables is provided in `env.example`.
 
 ## 🚀 Usage
 

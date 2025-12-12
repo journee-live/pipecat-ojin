@@ -23,6 +23,14 @@ Essentially, it will send a real-time stream of audio from a TTS generator to th
 
 ## 🔧 Installation
 
+Setup python environment:
+
+```bash
+python -m venv venv
+
+source venv/bin/activate
+```
+
 Install Dependencies:
 
 ```bash
@@ -39,7 +47,7 @@ For MacOS instead of pyaudio you can use portaudio
 brew install portaudio
 ```
 
-Make sure to fill out proper values for required environment variables in the `.env` file.
+Make sure to fill out proper values for required environment variables in the `.env` file. An example of the needed variables is provided in .env.example
 
 ## 🚀 Usage
 

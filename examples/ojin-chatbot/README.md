@@ -9,7 +9,7 @@ Essentially, it will send a real-time stream of audio from a TTS generator to th
 
 ## 🎉 Features
 
-- **OjinPersonaService:**  
+- **OjinVideoService:**  
   Connects to Ojin platform through websockets and manages conversation state. It will generate idle frames on startup and cache them in memory so they don't need to be generated again. It will also manage transitions with speech so they feel smooth. You will need an OJIN_API_KEY and OJIN_PERSONA_ID setup in your .env file.
 
 - **HumeSTSService**

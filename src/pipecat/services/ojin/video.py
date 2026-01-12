@@ -234,6 +234,7 @@ class OjinVideoService(FrameProcessor):
                         "client_frame_index": self._compute_frame_index_for_server(),
                         "filter_amount": SPEECH_FILTER_AMOUNT,
                         "mouth_opening_scale": SPEECH_MOUTH_OPENING_SCALE,
+                        "frame_depletion_threshold_seconds": 0.65,
                     },
                 )
             )

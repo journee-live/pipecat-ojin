@@ -54,7 +54,7 @@ class OjinLastFramePlayedFrame(Frame):
 
 
 OJIN_PERSONA_SAMPLE_RATE = 16000
-SPEECH_FILTER_AMOUNT = 10000
+SPEECH_FILTER_AMOUNT = 1000.0
 IDLE_FILTER_AMOUNT = 1000.0
 IDLE_MOUTH_OPENING_SCALE = 0.0
 SPEECH_MOUTH_OPENING_SCALE = 1.0
@@ -235,7 +235,6 @@ class OjinVideoService(FrameProcessor):
                         "client_frame_index": self._compute_frame_index_for_server(),
                         "filter_amount": SPEECH_FILTER_AMOUNT,
                         "mouth_opening_scale": SPEECH_MOUTH_OPENING_SCALE,
-                        "frame_depletion_threshold_seconds": 0.9,
                     },
                 )
             )

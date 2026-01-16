@@ -311,6 +311,7 @@ class OjinVideoService(FrameProcessor):
                     await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
             else:
                 # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
+                # TODO this was causing issues sometimes when transitioning to IDLE after new TTS already came
                 # if self._state == OjinVideoServiceState.IDLE:
                 #    return
 

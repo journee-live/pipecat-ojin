@@ -54,7 +54,7 @@ class OjinLastFramePlayedFrame(Frame):
 
 
 OJIN_PERSONA_SAMPLE_RATE = 16000
-SPEECH_FILTER_AMOUNT = 1000.0
+SPEECH_FILTER_AMOUNT = 10000
 IDLE_FILTER_AMOUNT = 1000.0
 IDLE_MOUTH_OPENING_SCALE = 0.0
 SPEECH_MOUTH_OPENING_SCALE = 1.0
@@ -150,6 +150,7 @@ class OjinVideoService(FrameProcessor):
         self._current_frame_idx = -1
         self._played_frame_idx = -1
         self._last_queued_frame_idx = -1
+        self._last_played_image_bytes: Optional[bytes] = None  # For frame repetition fallback
 
         # Audio input handling
         self._resampler = create_default_resampler()
@@ -234,6 +235,7 @@ class OjinVideoService(FrameProcessor):
                         "client_frame_index": self._compute_frame_index_for_server(),
                         "filter_amount": SPEECH_FILTER_AMOUNT,
                         "mouth_opening_scale": SPEECH_MOUTH_OPENING_SCALE,
+                        "frame_depletion_threshold_seconds": 0.9,
                     },
                 )
             )
@@ -380,6 +382,7 @@ class OjinVideoService(FrameProcessor):
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.UPSTREAM)
                     await self.push_frame(OjinLastFramePlayedFrame(), FrameDirection.DOWNSTREAM)
                 self._num_speech_frames_played = 0
+                self._last_played_image_bytes = None  # Clear for next speech session
         self._state = state
 
     async def _receive_ojin_messages(self):
@@ -466,6 +469,7 @@ class OjinVideoService(FrameProcessor):
 
                 logger.debug(f"Playing speech frame {video_frame.frame_idx}")
                 self._num_speech_frames_played += 1
+                self._last_played_image_bytes = image_bytes  # Store for fallback
 
                 if self._first_frame_played_timestamp is None:
                     self._first_frame_played_timestamp = time.perf_counter()
@@ -484,19 +488,30 @@ class OjinVideoService(FrameProcessor):
 
             else:
                 if self._num_speech_frames_played > 0:
-                    logger.debug(f"frame missed: {self._played_frame_idx + 1}")
-                    # self._current_frame_idx -= 1
-                    await asyncio.sleep(0.005)
-                    continue
+                    # Frame not ready - repeat last frame to avoid stutter
+                    if self._last_played_image_bytes is not None:
+                        logger.debug(
+                            f"frame missed: {self._played_frame_idx + 1}, repeating last frame"
+                        )
 
-                # Play idle frame
-                self._played_frame_idx += 1
-                idle_frame = self._get_idle_frame_for_index(self._played_frame_idx)
-                image_bytes = idle_frame.image_bytes
-                # audio_bytes is already set to silence
+                        # Filling a frame with last frame + silence audio
+                        image_bytes = self._last_played_image_bytes
+                        # Don't increment _played_frame_idx - we're repeating, not advancing
+                    else:
+                        logger.debug(
+                            f"frame missed: {self._played_frame_idx + 1}, no fallback available"
+                        )
+                        await asyncio.sleep(0.005)
+                        continue
+                else:
+                    # Play idle frame (only when not in speech mode)
+                    self._played_frame_idx += 1
+                    idle_frame = self._get_idle_frame_for_index(self._played_frame_idx)
+                    image_bytes = idle_frame.image_bytes
+                    # audio_bytes is already set to silence
 
-                if self._played_frame_idx % 150 == 0:
-                    logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
+                    if self._played_frame_idx % 150 == 0:
+                        logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
                 # if self._state == OjinVideoServiceState.IDLE:
                 #     if self._played_frame_idx % 25 == 0:
                 #         logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")

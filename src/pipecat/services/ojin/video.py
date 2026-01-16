@@ -311,8 +311,8 @@ class OjinVideoService(FrameProcessor):
                     await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
             else:
                 # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
-                if self._state == OjinVideoServiceState.IDLE:
-                    return
+                # if self._state == OjinVideoServiceState.IDLE:
+                #    return
 
                 if self._first_frame_received_timestamp is None:
                     self._first_frame_received_timestamp = time.perf_counter()

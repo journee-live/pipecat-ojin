@@ -205,33 +205,61 @@ class OjinTTSService(TTSService):
         # Yield TTSStartedFrame
         yield TTSStartedFrame()
 
-        # Receive audio chunks
-        while True:
-            try:
-                response = await asyncio.wait_for(self._audio_queue.get(), timeout=30.0)
+        # Track if we completed normally
+        completed_normally = False
 
-                if response is None:
-                    # Error or end of stream
+        try:
+            # Receive audio chunks
+            while True:
+                try:
+                    response = await asyncio.wait_for(self._audio_queue.get(), timeout=30.0)
+
+                    if response is None:
+                        # Error or end of stream
+                        break
+
+                    # Yield audio frame only if it has data
+                    if response.audio_frame_bytes:
+                        yield TTSAudioRawFrame(
+                            audio=response.audio_frame_bytes,
+                            sample_rate=self._settings.sample_rate,
+                            num_channels=1,
+                        )
+
+                    if response.is_final_response:
+                        logger.debug("Received final TTS audio chunk")
+                        completed_normally = True
+                        break
+
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for TTS audio chunk")
                     break
-
-                # Yield audio frame only if it has data
-                if response.audio_frame_bytes:
-                    yield TTSAudioRawFrame(
-                        audio=response.audio_frame_bytes,
-                        sample_rate=self._settings.sample_rate,
-                        num_channels=1,
-                    )
-
-                if response.is_final_response:
-                    logger.debug("Received final TTS audio chunk")
-                    break
-
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for TTS audio chunk")
-                break
+        finally:
+            # If generator was interrupted (not completed normally), cancel the interaction
+            if not completed_normally:
+                logger.debug("TTS interrupted - sending cancel to server")
+                await self._cancel_and_clear_queue()
 
         # Yield TTSStoppedFrame
         yield TTSStoppedFrame()
+
+    async def _cancel_and_clear_queue(self) -> None:
+        """Cancel the current interaction and clear any pending audio chunks."""
+        # Send cancel to server
+        if self._client.is_connected():
+            try:
+                await self._client.send_message(OjinCancelInteractionMessage())
+                logger.debug("Sent TTS cancel interaction")
+            except Exception as e:
+                logger.warning(f"Failed to send TTS cancel: {e}")
+
+        # Clear the audio queue to discard any remaining chunks
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        logger.debug("Cleared TTS audio queue")
 
     async def _start_tts(self) -> None:
         """Internal start method to connect and begin receiving messages."""
@@ -287,12 +315,7 @@ class OjinTTSService(TTSService):
         Args:
             frame: The CancelFrame from the pipeline (can be None for standalone use).
         """
-        if self._client.is_connected():
-            try:
-                await self._client.send_message(OjinCancelInteractionMessage())
-                logger.debug("Sent TTS cancel interaction")
-            except Exception as e:
-                logger.warning(f"Failed to send TTS cancel: {e}")
+        await self._cancel_and_clear_queue()
         if frame:
             await super().cancel(frame)
 

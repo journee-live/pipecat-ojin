@@ -21,6 +21,7 @@ from hume.empathic_voice.chat.socket_client import (
 from loguru import logger
 from websockets import ConnectionClosed
 
+from pipecat.audio.utils import create_default_resampler
 from pipecat.frames.frames import (
     AggregationType,
     CancelFrame,
@@ -81,6 +82,7 @@ class HumeSTSService(LLMService):
         system_prompt: str | None = None,
         start_frame_cls: type[Frame] | None = None,
         audio_passthrough: bool = False,
+        debug_audio_file: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -97,8 +99,12 @@ class HumeSTSService(LLMService):
         self.cancelled_conversation_ids: list[str] = []
         self.system_prompt = system_prompt
         self._context: OpenAIRealtimeLLMContext | None = None
+        self._debug_audio_file = debug_audio_file
+        self._debug_wav_writer = None
+        self._debug_wav_file = None
         self._hume_context: Context | None = None
         self._time_to_first_audio_list = []
+        self._resampler = create_default_resampler()
         self._start_frame_cls = start_frame_cls or HumeStartFrame
 
     async def start(self, frame: StartFrame):
@@ -106,6 +112,9 @@ class HumeSTSService(LLMService):
 
     async def stop(self, frame: EndFrame):
         await super().stop(frame)
+        if self._debug_wav_file:
+            self._debug_wav_file.close()
+            logger.info(f"✅ Closed debug audio file: {self._debug_audio_file}")
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
@@ -129,11 +138,25 @@ class HumeSTSService(LLMService):
             await self.push_frame(frame)
 
         elif isinstance(frame, InputAudioRawFrame):
+            resampled_audio = await self._resampler.resample(frame.audio, frame.sample_rate, 16000)
             if self._connection:
-                encoded_audio = base64.b64encode(frame.audio).decode("utf-8")
+                # Record audio to debug file if enabled
+                if self._debug_audio_file and not self._debug_wav_file:
+                    self._debug_wav_file = wave.open(self._debug_audio_file, "wb")
+                    self._debug_wav_file.setnchannels(frame.num_channels)
+                    self._debug_wav_file.setsampwidth(2)  # 16-bit audio
+                    self._debug_wav_file.setframerate(frame.sample_rate)
+                    logger.info(f"📝 Recording sent audio to: {self._debug_audio_file}")
+
+                if self._debug_wav_file:
+                    self._debug_wav_file.writeframes(resampled_audio)
+
+                encoded_audio = base64.b64encode(resampled_audio).decode("utf-8")
                 input = AudioInput(data=encoded_audio)
+
                 while True:
                     try:
+                        # IMPORTANT! Hume expects 20ms chunks of audio at 16kHz
                         await self._connection.send_audio_input(input)
                         break
                     except ConnectionClosed:
@@ -235,7 +258,9 @@ class HumeSTSService(LLMService):
             logger.info(message)
             content: str = message.message.content
             await self.push_frame(LLMTextFrame(text=content))
-            await self.push_frame(TTSTextFrame(text=content, aggregated_by=AggregationType.SENTENCE))
+            await self.push_frame(
+                TTSTextFrame(text=content, aggregated_by=AggregationType.SENTENCE)
+            )
         elif msg_type == "user_message":
             content: str = message.message.content
             logger.info(message)

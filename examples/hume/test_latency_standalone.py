@@ -130,6 +130,7 @@ async def send_audio(
     wav_path: str,
     measurement: LatencyMeasurement,
     initialized_event: asyncio.Event,
+    stop_event: asyncio.Event,
 ):
     """Send audio from WAV file to Hume."""
     logger.info(f"📂 Reading WAV file: {wav_path}")
@@ -168,7 +169,12 @@ async def send_audio(
         avg_volume = sum(abs(s) for s in samples) / len(samples) if samples else 0
 
         # Track the transition from non-zero to zero volume (end of speech)
-        if prev_volume is not None and prev_volume > 0.0 and avg_volume == 0.0:
+        if (
+            prev_volume is not None
+            and prev_volume > 0.0
+            and avg_volume == 0.0
+            and not stop_event.is_set()
+        ):
             measurement.last_silent_chunk_time = time.perf_counter()
             logger.success(
                 f"📍 End of speech detected (transition to silence) at {measurement.last_silent_chunk_time}"
@@ -198,9 +204,11 @@ def create_message_handler(
                 measurement.first_transcript_received_time = time.perf_counter()
 
             measurement.user_transcript = message.message.content
+            logger.info(f"User transcript: {measurement.user_transcript}")
 
         elif msg_type == "assistant_message":
             measurement.assistant_transcript = message.message.content
+            logger.info(f"Assistant transcript: {measurement.assistant_transcript}")
 
         elif msg_type == "audio_output":
             measurement.audio_chunks_received += 1
@@ -285,7 +293,9 @@ async def main():
                 )
             )
             # Send audio and wait for stop signal
-            await send_audio(socket, wav_path, measurement, initialized_event)
+            await send_audio(
+                socket, wav_path, measurement, initialized_event, stop_event=stop_event
+            )
 
             # Wait for first audio response or timeout
             try:

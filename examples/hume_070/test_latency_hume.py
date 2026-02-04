@@ -1,4 +1,4 @@
-"""Test Hume EVI latency using a WAV file input.
+"""Test Hume latency using the old HumeSTSService (hume 0.12.1) with WAV file input.
 
 Measures the time from sending audio to receiving the first audio response.
 """
@@ -25,7 +25,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.hume.hume_evi import HumeEVIService, HumeEVIStartFrame
+from pipecat.services.hume.hume import HumeStartFrame, HumeSTSService
 
 load_dotenv(override=True)
 
@@ -38,7 +38,7 @@ class LatencyMeasurementProcessor(FrameProcessor):
 
     def __init__(self):
         super().__init__()
-        self.audio_sent_time = None
+        self.last_silent_chunk_time = None
         self.first_audio_received_time = None
         self.first_transcript_received_time = None
         self.user_transcript = None
@@ -50,9 +50,9 @@ class LatencyMeasurementProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
-            if not self.first_transcript_received_time:
+            if not self.first_transcript_received_time and self.last_silent_chunk_time:
                 self.first_transcript_received_time = time.time()
-                latency = (self.first_transcript_received_time - self.audio_sent_time) * 1000
+                latency = (self.first_transcript_received_time - self.last_silent_chunk_time) * 1000
                 logger.info(f"⏱️  First transcript latency: {latency:.0f}ms")
             self.user_transcript = frame.text
             logger.info(f"👤 User: {frame.text}")
@@ -63,10 +63,11 @@ class LatencyMeasurementProcessor(FrameProcessor):
 
         elif isinstance(frame, TTSAudioRawFrame):
             self.audio_chunks_received += 1
-            if not self.first_audio_received_time:
+            if not self.first_audio_received_time and self.last_silent_chunk_time:
                 self.first_audio_received_time = time.time()
-                latency = (self.first_audio_received_time - self.audio_sent_time) * 1000
+                latency = (self.first_audio_received_time - self.last_silent_chunk_time) * 1000
                 logger.success(f"🎵 First audio latency: {latency:.0f}ms")
+                await self.push_frame(EndFrame())
 
             # Calculate audio duration
             samples = len(frame.audio) / 2  # 16-bit audio
@@ -78,15 +79,15 @@ class LatencyMeasurementProcessor(FrameProcessor):
     def print_summary(self):
         """Print latency summary."""
         logger.info("\n" + "=" * 60)
-        logger.info("LATENCY TEST SUMMARY")
+        logger.info("LATENCY TEST SUMMARY (OLD HUME SERVICE)")
         logger.info("=" * 60)
 
-        if self.audio_sent_time and self.first_audio_received_time:
-            latency = (self.first_audio_received_time - self.audio_sent_time) * 1000
+        if self.last_silent_chunk_time and self.first_audio_received_time:
+            latency = (self.first_audio_received_time - self.last_silent_chunk_time) * 1000
             logger.success(f"⏱️  Time to first audio: {latency:.0f}ms")
 
-        if self.audio_sent_time and self.first_transcript_received_time:
-            latency = (self.first_transcript_received_time - self.audio_sent_time) * 1000
+        if self.last_silent_chunk_time and self.first_transcript_received_time:
+            latency = (self.first_transcript_received_time - self.last_silent_chunk_time) * 1000
             logger.info(f"⏱️  Time to first transcript: {latency:.0f}ms")
 
         logger.info(f"📊 Audio chunks received: {self.audio_chunks_received}")
@@ -105,7 +106,7 @@ async def send_wav_file(
 ):
     """Read WAV file and send as audio frames."""
     logger.info(f"📂 Reading WAV file: {wav_path}")
-
+    await task.queue_frame(HumeStartFrame())
     with wave.open(wav_path, "rb") as wav_file:
         sample_rate = wav_file.getframerate()
         num_channels = wav_file.getnchannels()
@@ -121,28 +122,54 @@ async def send_wav_file(
     logger.info(f"⏱️  Audio duration: {duration:.2f}s")
 
     # Wait for connection
-    await asyncio.sleep(1)
+    await asyncio.sleep(6)
 
-    # Send start frame to trigger connection
-    await task.queue_frame(HumeEVIStartFrame())
-    await asyncio.sleep(1)
+    logger.info("🚀 Sending audio to Hume...")
 
-    # Mark the time we start sending audio
-    measurement.audio_sent_time = time.time()
-    logger.info("🚀 Sending audio to Hume EVI...")
+    # Send audio in chunks at real-time pace (20ms chunks every 20ms)
+    chunk_size = 640  # 20ms chunks at 16kHz after resampling
 
-    # Send audio in chunks at real-time pace (100ms chunks every 100ms)
-    chunk_size = sample_rate * 2 * num_channels // 10  # 100ms chunks
+    logger.info("🎵 Sending WAV audio...")
+
+    import struct
+
+    prev_volume = None
+
     for i in range(0, len(audio_data), chunk_size):
         chunk = audio_data[i : i + chunk_size]
+
         frame = InputAudioRawFrame(audio=chunk, sample_rate=sample_rate, num_channels=num_channels)
+
+        samples = struct.unpack(f"{len(frame.audio) // 2}h", frame.audio)
+        avg_volume = sum(abs(s) for s in samples) / len(samples) if samples else 0
+
+        # Track the transition from non-zero to zero volume (end of speech)
+        if prev_volume is not None and prev_volume > 0.0 and avg_volume == 0.0:
+            measurement.last_silent_chunk_time = time.time()
+            logger.debug(
+                f"📍 End of speech detected (transition to silence) at {measurement.last_silent_chunk_time}"
+            )
+
+        prev_volume = avg_volume
+
+        # logger.info(f"Sending audio input: {len(frame.audio)} bytes, avg_volume: {avg_volume:.1f}")
         await task.queue_frame(frame)
-        await asyncio.sleep(0.1)  # Real-time: 100ms delay for 100ms chunks
+        await asyncio.sleep(0.02)  # Real-time: 20ms delay for 20ms chunks
 
-    logger.info("✅ Audio sent, waiting for response...")
+    await asyncio.sleep(5)
+    # Continue sending silence for the remaining test duration
+    # Create a silence chunk (all zeros)
+    # silence_chunk = b"\x00" * chunk_size
 
-    # Wait for response
-    await asyncio.sleep(10)
+    # # Send silence for 10 seconds (500 chunks of 20ms each)
+    # for _ in range(500):
+    #     frame = InputAudioRawFrame(
+    #         audio=silence_chunk, sample_rate=sample_rate, num_channels=num_channels
+    #     )
+    #     await task.queue_frame(frame)
+    #     await asyncio.sleep(0.02)
+
+    # logger.info("✅ Silence sent, ending test...")
 
     # End the task
     await task.queue_frame(EndFrame())
@@ -163,14 +190,20 @@ async def main():
         logger.error(f"❌ WAV file not found: {wav_path}")
         sys.exit(1)
 
-    logger.info("🎯 Starting Hume EVI Latency Test")
+    logger.info("🎯 Starting Hume Latency Test (OLD SERVICE - hume 0.12.1)")
     logger.info("=" * 60)
 
-    # Create Hume service
-    hume_service = HumeEVIService(
+    # Create old Hume service with debug audio recording
+    hume_service = HumeSTSService(
         api_key=os.getenv("HUME_API_KEY"),
         config_id=os.getenv("HUME_CONFIG_ID"),
+        debug_audio_file="sent_audio_debug.wav",
     )
+
+    # hume_service = HumeEVIService(
+    #     api_key=os.getenv("HUME_API_KEY"),
+    #     config_id=os.getenv("HUME_CONFIG_ID"),
+    # )
 
     # Create measurement processor
     measurement = LatencyMeasurementProcessor()

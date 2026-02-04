@@ -13,9 +13,7 @@ import wave
 
 import numpy as np
 from dotenv import load_dotenv
-from hume import AsyncHumeClient
-from hume.empathic_voice import AudioConfiguration, AudioInput, SessionSettings
-from hume.empathic_voice.chat.socket_client import ChatConnectOptions, ChatWebsocketConnection
+from hume_client import SimpleHumeClient
 from loguru import logger
 
 from pipecat.audio.utils import create_default_resampler
@@ -63,9 +61,7 @@ class LatencyMeasurement:
         logger.info("=" * 60)
 
 
-async def send_audio(
-    socket: ChatWebsocketConnection, wav_path: str, measurement: LatencyMeasurement
-):
+async def send_audio(client: SimpleHumeClient, wav_path: str, measurement: LatencyMeasurement):
     """Send audio from WAV file to Hume."""
     logger.info(f"📂 Reading WAV file: {wav_path}")
 
@@ -89,7 +85,7 @@ async def send_audio(
     logger.info("🚀 Sending audio to Hume...")
 
     # At 16kHz, 20ms = 320 samples = 640 bytes (16-bit PCM)
-    chunk_size = 1280  # 20ms at 16kHz
+    chunk_size = 640  # 20ms at 16kHz
 
     logger.info("🎵 Sending WAV audio...")
 
@@ -114,10 +110,7 @@ async def send_audio(
 
         chunk = await resampler.resample(chunk, 48000, 16000)
 
-        # Encode audio chunk to base64 and send
-        encoded_audio = base64.b64encode(chunk).decode("utf-8")
-        audio_input = AudioInput(data=encoded_audio)
-        await socket.send_audio_input(audio_input)
+        await client.send_audio(chunk)
         await asyncio.sleep(0.02)  # Real-time: 20ms delay for 20ms chunks
 
     logger.info("✅ Audio sent, waiting for response...")
@@ -186,49 +179,31 @@ async def main():
         logger.error(f"❌ WAV file not found: {wav_path}")
         sys.exit(1)
 
-    logger.info("🎯 Starting Standalone Hume Latency Test (hume 0.12.1)")
+    logger.info("🎯 Starting Standalone Hume Latency Test (hume 0.7.0)")
     logger.info("=" * 60)
 
     # Create measurement tracker
     measurement = LatencyMeasurement()
 
-    # Create Hume client
-    client = AsyncHumeClient(api_key=os.getenv("HUME_API_KEY"))
-
     # Create stop event to signal when to end the test
     stop_event = asyncio.Event()
-
-    # Create message handler
     on_message = create_message_handler(measurement, stop_event)
+    # Create Hume client
+    hume_client = SimpleHumeClient(
+        on_message=on_message,
+    )
 
     try:
         # Connect to Hume with callbacks
-        async with client.empathic_voice.chat.connect_with_callbacks(
-            options=ChatConnectOptions(config_id=os.getenv("HUME_CONFIG_ID")),
-            on_open=lambda: logger.info("🔌 Connected to Hume"),
-            on_close=lambda: logger.info("🔌 Disconnected from Hume"),
-            on_error=lambda error: logger.error(f"❌ Connection error: {error}"),
-            on_message=on_message,
-        ) as socket:
-            await socket.send_session_settings(
-                SessionSettings(
-                    type="session_settings",
-                    system_prompt=None,
-                    audio=AudioConfiguration(
-                        encoding="linear16",
-                        sample_rate=16000,
-                        channels=1,
-                    ),
-                )
-            )
-            # Send audio and wait for stop signal
-            await send_audio(socket, wav_path, measurement)
+        await hume_client.connect()
+        # Send audio and wait for stop signal
+        await send_audio(hume_client, wav_path, measurement)
 
-            # Wait for first audio response or timeout
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("⏱️  Timeout waiting for response")
+        # Wait for first audio response or timeout
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("⏱️  Timeout waiting for response")
 
     except KeyboardInterrupt:
         logger.info("⚠️  Test interrupted by user")

@@ -151,14 +151,14 @@ class HumeSTSService(LLMService):
                 if self._debug_wav_file:
                     self._debug_wav_file.writeframes(resampled_audio)
 
-                encoded_audio = base64.b64encode(resampled_audio).decode("utf-8")
-                input = AudioInput(data=encoded_audio)
+                # encoded_audio = base64.b64encode(resampled_audio).decode("utf-8")
+                # input = AudioInput(data=encoded_audio)
 
                 while True:
                     try:
-                        logger.info(f"Sending audio to Hume...{len(resampled_audio)} bytes")
+                        # logger.info(f"Sending audio to Hume...{len(resampled_audio)} bytes")
                         # IMPORTANT! Hume expects 20ms chunks of audio at 16kHz
-                        await self._connection.send_audio_input(input)
+                        await self._connection._send(resampled_audio)
                         break
                     except ConnectionClosed:
                         await self.reset_conversation()

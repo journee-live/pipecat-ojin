@@ -100,7 +100,16 @@ class LatencyMeasurementProcessor(FrameProcessor):
             self.user_transcript = frame.text
             logger.info(f"👤 User: {frame.text}")
 
+        elif isinstance(frame, TTSStoppedFrame):
+            self.first_audio_received_time = None
+            self.avg_volume = 0
+            self.last_volume_ts = 0
+            self.last_input_ts = 0
         elif isinstance(frame, InputAudioRawFrame):
+            if self.first_audio_received_time is not None:
+                await self.push_frame(frame, direction)
+                return
+
             import struct
 
             samples = struct.unpack(f"{len(frame.audio) // 2}h", frame.audio)
@@ -109,7 +118,7 @@ class LatencyMeasurementProcessor(FrameProcessor):
             #     f"Audio input ({len(samples)} bytes) avg_volume:{avg_volume} audio_delta:{time.perf_counter() - self.last_input_ts}s"
             # )
             self.last_input_ts = time.perf_counter()
-            if avg_volume > 100:
+            if avg_volume > 200:
                 self.last_volume_ts = time.perf_counter()
             elif time.perf_counter() - self.last_volume_ts > 0.3 and self.last_volume_ts != 0:
                 self.first_audio_received_time = None
@@ -130,8 +139,8 @@ class LatencyMeasurementProcessor(FrameProcessor):
                 latency = (self.first_audio_received_time - self.last_silent_chunk_time) * 1000
                 logger.success(f"🎵 First audio latency: {latency:.0f}ms")
                 self.print_summary()
-                await self.push_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
-                await self.push_frame(CancelFrame(), FrameDirection.UPSTREAM)
+                # await self.push_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
+                # await self.push_frame(CancelFrame(), FrameDirection.UPSTREAM)
 
             # Calculate audio duration
             samples = len(frame.audio) / 2  # 16-bit audio
@@ -347,7 +356,7 @@ class HumeBotApp:
                 LocalAudioTransportParams(
                     audio_in_enabled=True,
                     audio_out_enabled=True,
-                    audio_in_sample_rate=48000,
+                    audio_in_sample_rate=16000,
                     audio_out_sample_rate=24000,
                 )
             )

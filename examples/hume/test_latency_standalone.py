@@ -116,9 +116,9 @@ async def send_audio(
 
         logger.info(f"Audio chunk size: {len(chunk)} bytes")
         # Encode audio chunk to base64 and send
-        encoded_audio = base64.b64encode(chunk).decode("utf-8")
-        audio_input = AudioInput(data=encoded_audio)
-        await socket.send_audio_input(audio_input)
+        # encoded_audio = base64.b64encode(chunk).decode("utf-8")
+        # audio_input = AudioInput(data=encoded_audio)
+        await socket._send(chunk)
         await asyncio.sleep(0.02)  # Real-time: 20ms delay for 20ms chunks
 
     logger.info("✅ Audio sent, waiting for response...")

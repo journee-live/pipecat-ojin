@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.frames.frames import (
+    CancelFrame,
     EndFrame,
     Frame,
     InputAudioRawFrame,
@@ -57,11 +58,12 @@ class LatencyMeasurementProcessor(FrameProcessor):
         self.last_silent_chunk_time = None
         self.first_audio_received_time = None
         self.first_transcript_received_time = None
-        self.last_volume = 0
+        self.last_volume_ts = 0
         self.user_transcript = None
         self.assistant_transcript = None
         self.audio_chunks_received = 0
         self.total_audio_duration = 0.0
+        self.last_input_ts: float = 0.0
 
     def print_summary(self):
         """Print latency summary."""
@@ -92,7 +94,7 @@ class LatencyMeasurementProcessor(FrameProcessor):
 
         if isinstance(frame, TranscriptionFrame):
             if not self.first_transcript_received_time and self.last_silent_chunk_time:
-                self.first_transcript_received_time = time.time()
+                self.first_transcript_received_time = time.perf_counter()
                 latency = (self.first_transcript_received_time - self.last_silent_chunk_time) * 1000
                 logger.info(f"⏱️  First transcript latency: {latency:.0f}ms")
             self.user_transcript = frame.text
@@ -103,11 +105,16 @@ class LatencyMeasurementProcessor(FrameProcessor):
 
             samples = struct.unpack(f"{len(frame.audio) // 2}h", frame.audio)
             avg_volume = sum(abs(s) for s in samples) / len(samples) if samples else 0
-            if avg_volume > self.last_volume:
-                self.last_volume = avg_volume
+            # logger.info(
+            #     f"Audio input ({len(samples)} bytes) avg_volume:{avg_volume} audio_delta:{time.perf_counter() - self.last_input_ts}s"
+            # )
+            self.last_input_ts = time.perf_counter()
+            if avg_volume > 100:
+                self.last_volume_ts = time.perf_counter()
+            elif time.perf_counter() - self.last_volume_ts > 0.3 and self.last_volume_ts != 0:
                 self.first_audio_received_time = None
                 if not self.last_silent_chunk_time:
-                    self.last_silent_chunk_time = time.time()
+                    self.last_silent_chunk_time = self.last_volume_ts
                     logger.info(
                         f"📍 End of speech detected (transition to silence) at {self.last_silent_chunk_time}"
                     )
@@ -119,11 +126,12 @@ class LatencyMeasurementProcessor(FrameProcessor):
         elif isinstance(frame, TTSAudioRawFrame):
             self.audio_chunks_received += 1
             if not self.first_audio_received_time and self.last_silent_chunk_time:
-                self.first_audio_received_time = time.time()
+                self.first_audio_received_time = time.perf_counter()
                 latency = (self.first_audio_received_time - self.last_silent_chunk_time) * 1000
                 logger.success(f"🎵 First audio latency: {latency:.0f}ms")
-                await self.push_frame(EndFrame())
                 self.print_summary()
+                await self.push_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
+                await self.push_frame(CancelFrame(), FrameDirection.UPSTREAM)
 
             # Calculate audio duration
             samples = len(frame.audio) / 2  # 16-bit audio
@@ -339,7 +347,7 @@ class HumeBotApp:
                 LocalAudioTransportParams(
                     audio_in_enabled=True,
                     audio_out_enabled=True,
-                    audio_in_sample_rate=16000,
+                    audio_in_sample_rate=48000,
                     audio_out_sample_rate=24000,
                 )
             )

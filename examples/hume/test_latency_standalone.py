@@ -89,7 +89,7 @@ async def send_audio(
     logger.info("🚀 Sending audio to Hume...")
 
     # At 16kHz, 20ms = 320 samples = 640 bytes (16-bit PCM)
-    chunk_size = 1280  # 20ms at 16kHz
+    chunk_size = int(640 * 48000 / 16000)  # 20ms at 16kHz
 
     logger.info("🎵 Sending WAV audio...")
 
@@ -114,6 +114,7 @@ async def send_audio(
 
         chunk = await resampler.resample(chunk, 48000, 16000)
 
+        logger.info(f"Audio chunk size: {len(chunk)} bytes")
         # Encode audio chunk to base64 and send
         encoded_audio = base64.b64encode(chunk).decode("utf-8")
         audio_input = AudioInput(data=encoded_audio)

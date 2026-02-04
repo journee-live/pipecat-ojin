@@ -156,6 +156,7 @@ class HumeSTSService(LLMService):
 
                 while True:
                     try:
+                        logger.info(f"Sending audio to Hume...{len(resampled_audio)} bytes")
                         # IMPORTANT! Hume expects 20ms chunks of audio at 16kHz
                         await self._connection.send_audio_input(input)
                         break
@@ -221,11 +222,12 @@ class HumeSTSService(LLMService):
         await self.push_error(ErrorFrame(error=str(error), fatal=True))
 
     async def _on_message(self, message: SubscribeEvent):
-        logger.trace(f"Received message from Hume: {message}")
+        # logger.trace(f"Received message from Hume: {message}")
         msg_type = message.type
         if hasattr(message, "id") and message.id in self.cancelled_conversation_ids:
             return
 
+        logger.debug(f"Received message from Hume: {msg_type}")
         if msg_type == "audio_output":
             self.active_conversation_id = message.id
             if not self.active_conversation:

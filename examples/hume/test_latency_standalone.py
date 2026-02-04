@@ -4,21 +4,19 @@ Uses only the Hume SDK to measure latency from end of speech to first audio resp
 """
 
 import asyncio
-import base64
+import csv
 import os
 import struct
 import sys
 import time
 import wave
+from datetime import datetime
 
-import numpy as np
 from dotenv import load_dotenv
 from hume import AsyncHumeClient
-from hume.empathic_voice import AudioConfiguration, AudioInput, SessionSettings
+from hume.empathic_voice import AudioConfiguration, SessionSettings
 from hume.empathic_voice.chat.socket_client import ChatConnectOptions, ChatWebsocketConnection
 from loguru import logger
-
-from pipecat.audio.utils import create_default_resampler
 
 load_dotenv(override=True)
 
@@ -37,6 +35,8 @@ class LatencyMeasurement:
         self.assistant_transcript = None
         self.audio_chunks_received = 0
         self.total_audio_duration = 0.0
+        self.chat_metadata = None
+        self.first_audio_message_id = None
 
     def print_summary(self):
         """Print latency summary."""
@@ -60,11 +60,76 @@ class LatencyMeasurement:
         if self.assistant_transcript:
             logger.info(f"🤖 Assistant said: '{self.assistant_transcript}'")
 
+        if self.chat_metadata:
+            logger.info(f"📋 Chat metadata: {self.chat_metadata}")
+        if self.first_audio_message_id:
+            logger.info(f"🆔 First audio message ID: {self.first_audio_message_id}")
+
         logger.info("=" * 60)
+
+    def save_to_csv(self, csv_path: str):
+        """Save latency results to CSV file."""
+        timestamp = datetime.now().isoformat()
+
+        time_to_first_audio = None
+        time_to_first_transcript = None
+
+        if self.last_silent_chunk_time and self.first_audio_received_time:
+            time_to_first_audio = (
+                self.first_audio_received_time - self.last_silent_chunk_time
+            ) * 1000
+
+        if self.last_silent_chunk_time and self.first_transcript_received_time:
+            time_to_first_transcript = (
+                self.first_transcript_received_time - self.last_silent_chunk_time
+            ) * 1000
+
+        # Check if file exists and is empty to write header
+        file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+
+        with open(csv_path, "a", newline="") as csvfile:
+            fieldnames = [
+                "timestamp",
+                "time_to_first_audio_ms",
+                "time_to_first_transcript_ms",
+                "audio_chunks_received",
+                "total_audio_duration_s",
+                "user_transcript",
+                "assistant_transcript",
+                "chat_metadata",
+                "first_audio_message_id",
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow(
+                {
+                    "timestamp": timestamp,
+                    "time_to_first_audio_ms": f"{time_to_first_audio:.0f}"
+                    if time_to_first_audio
+                    else "",
+                    "time_to_first_transcript_ms": f"{time_to_first_transcript:.0f}"
+                    if time_to_first_transcript
+                    else "",
+                    "audio_chunks_received": self.audio_chunks_received,
+                    "total_audio_duration_s": f"{self.total_audio_duration:.2f}",
+                    "user_transcript": self.user_transcript or "",
+                    "assistant_transcript": self.assistant_transcript or "",
+                    "chat_metadata": self.chat_metadata or "",
+                    "first_audio_message_id": self.first_audio_message_id or "",
+                }
+            )
+
+        logger.info(f"💾 Results saved to {csv_path}")
 
 
 async def send_audio(
-    socket: ChatWebsocketConnection, wav_path: str, measurement: LatencyMeasurement
+    socket: ChatWebsocketConnection,
+    wav_path: str,
+    measurement: LatencyMeasurement,
+    initialized_event: asyncio.Event,
 ):
     """Send audio from WAV file to Hume."""
     logger.info(f"📂 Reading WAV file: {wav_path}")
@@ -84,18 +149,17 @@ async def send_audio(
     logger.info(f"⏱️  Audio duration: {duration:.2f}s")
 
     # Wait for connection to be ready
-    await asyncio.sleep(5)
+    await initialized_event.wait()
 
     logger.info("🚀 Sending audio to Hume...")
 
     # At 16kHz, 20ms = 320 samples = 640 bytes (16-bit PCM)
-    chunk_size = int(640 * 48000 / 16000)  # 20ms at 16kHz
+    chunk_size = 640  # 20ms at 16kHz
 
     logger.info("🎵 Sending WAV audio...")
 
     prev_volume = None
 
-    resampler = create_default_resampler()
     for i in range(0, len(audio_data), chunk_size):
         chunk = audio_data[i : i + chunk_size]
 
@@ -105,26 +169,21 @@ async def send_audio(
 
         # Track the transition from non-zero to zero volume (end of speech)
         if prev_volume is not None and prev_volume > 0.0 and avg_volume == 0.0:
-            measurement.last_silent_chunk_time = time.time()
+            measurement.last_silent_chunk_time = time.perf_counter()
             logger.success(
                 f"📍 End of speech detected (transition to silence) at {measurement.last_silent_chunk_time}"
             )
 
         prev_volume = avg_volume
 
-        chunk = await resampler.resample(chunk, 48000, 16000)
-
-        logger.info(f"Audio chunk size: {len(chunk)} bytes")
-        # Encode audio chunk to base64 and send
-        # encoded_audio = base64.b64encode(chunk).decode("utf-8")
-        # audio_input = AudioInput(data=encoded_audio)
+        # logger.info(f"Sending audio to hume: {len(chunk)} bytes")
         await socket._send(chunk)
         await asyncio.sleep(0.02)  # Real-time: 20ms delay for 20ms chunks
 
-    logger.info("✅ Audio sent, waiting for response...")
 
-
-def create_message_handler(measurement: LatencyMeasurement, stop_event: asyncio.Event):
+def create_message_handler(
+    measurement: LatencyMeasurement, stop_event: asyncio.Event, initialized_event: asyncio.Event
+):
     """Create message handler callbacks."""
 
     def on_message(message):
@@ -136,29 +195,23 @@ def create_message_handler(measurement: LatencyMeasurement, stop_event: asyncio.
                 not measurement.first_transcript_received_time
                 and measurement.last_silent_chunk_time
             ):
-                measurement.first_transcript_received_time = time.time()
-                latency = (
-                    measurement.first_transcript_received_time - measurement.last_silent_chunk_time
-                ) * 1000
-                logger.info(f"⏱️  First transcript latency: {latency:.0f}ms")
+                measurement.first_transcript_received_time = time.perf_counter()
 
             measurement.user_transcript = message.message.content
-            logger.info(f"👤 User: {message.message.content}")
 
         elif msg_type == "assistant_message":
             measurement.assistant_transcript = message.message.content
-            logger.info(f"🤖 Assistant: {message.message.content}")
 
         elif msg_type == "audio_output":
             measurement.audio_chunks_received += 1
 
             if not measurement.first_audio_received_time and measurement.last_silent_chunk_time:
-                measurement.first_audio_received_time = time.time()
-                latency = (
-                    measurement.first_audio_received_time - measurement.last_silent_chunk_time
-                ) * 1000
-                logger.success(f"🎵 First audio latency: {latency:.0f}ms")
+                measurement.first_audio_received_time = time.perf_counter()
+                # Capture the message ID of the first audio
+                if hasattr(message, "id"):
+                    measurement.first_audio_message_id = message.id
                 # Signal to stop after receiving first audio
+                logger.success(f"First audio received at {measurement.first_audio_received_time}")
                 stop_event.set()
 
             # Calculate audio duration
@@ -175,6 +228,13 @@ def create_message_handler(measurement: LatencyMeasurement, stop_event: asyncio.
 
         elif msg_type == "chat_metadata":
             logger.info(f"📋 Chat metadata: {message}")
+            # Store the full chat metadata as JSON string
+            import json
+
+            measurement.chat_metadata = json.dumps(
+                message.dict() if hasattr(message, "dict") else str(message)
+            )
+            initialized_event.set()
 
     return on_message
 
@@ -182,7 +242,7 @@ def create_message_handler(measurement: LatencyMeasurement, stop_event: asyncio.
 async def main():
     """Main test function."""
     # Check WAV file exists
-    wav_path = "short.wav"
+    wav_path = "short_16k.wav"
     if not os.path.exists(wav_path):
         logger.error(f"❌ WAV file not found: {wav_path}")
         sys.exit(1)
@@ -199,8 +259,10 @@ async def main():
     # Create stop event to signal when to end the test
     stop_event = asyncio.Event()
 
+    initialized_event = asyncio.Event()
+
     # Create message handler
-    on_message = create_message_handler(measurement, stop_event)
+    on_message = create_message_handler(measurement, stop_event, initialized_event)
 
     try:
         # Connect to Hume with callbacks
@@ -223,7 +285,7 @@ async def main():
                 )
             )
             # Send audio and wait for stop signal
-            await send_audio(socket, wav_path, measurement)
+            await send_audio(socket, wav_path, measurement, initialized_event)
 
             # Wait for first audio response or timeout
             try:
@@ -240,6 +302,8 @@ async def main():
         traceback.print_exc()
     finally:
         measurement.print_summary()
+        await asyncio.sleep(1.0)
+        measurement.save_to_csv("latency_history.csv")
 
 
 if __name__ == "__main__":

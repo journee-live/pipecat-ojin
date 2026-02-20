@@ -342,17 +342,6 @@ class OjinVideoService(FrameProcessor):
                     f"Received video frame {frame_idx}, is_final={message.is_final_response}"
                 )
 
-            if self._latency_start_ts is not None and video_frame.frame_idx == 1:
-                self._latency = time.perf_counter() - self._latency_start_ts
-                self._latency_start_ts = None
-                logger.info(
-                    f"First video frame received, ojin latency: {self._latency}, buffer: {len(self._video_frames)}"
-                )
-                await self.push_frame(
-                    OjinLatencyFrame(latency=self._latency), direction=FrameDirection.DOWNSTREAM
-                )
-                self._latency = None
-
         elif isinstance(message, ErrorResponseMessage):
             await self.push_error(
                 error_msg=f"Ojin server error: {message.payload.code}", fatal=True
@@ -423,6 +412,18 @@ class OjinVideoService(FrameProcessor):
                 is_silence = video_frame.is_silence()
                 self._is_speaking = not is_silence
 
+                if not is_silence:
+                    if self._latency_start_ts is not None and video_frame.frame_idx == 1:
+                        self._latency = time.perf_counter() - self._latency_start_ts
+                        self._latency_start_ts = None
+                        logger.info(
+                            f"First video frame received, ojin latency: {self._latency}, buffer: {len(self._video_frames)}"
+                        )
+                        await self.push_frame(
+                            OjinLatencyFrame(latency=self._latency),
+                            direction=FrameDirection.DOWNSTREAM,
+                        )
+                self._latency = None
                 if self._settings.frame_debugging_enabled:
                     if is_silence:
                         logger.debug(

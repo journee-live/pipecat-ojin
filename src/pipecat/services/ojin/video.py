@@ -549,9 +549,9 @@ class OjinVideoService(FrameProcessor):
                 audio_frame.pts = next_push_time
                 await self.push_frame(audio_frame)
 
-                logger.debug(
-                    f"Playing audio frame, duration: {len(audio_frame.audio) / sample_rate / num_channels / bytes_per_sample:.3f}s, buffer left: {len(self._speech_buffer)}"
-                )
+                # logger.debug(
+                #     f"Playing audio frame, duration: {len(audio_frame.audio) / sample_rate / num_channels / bytes_per_sample:.3f}s, buffer left: {len(self._speech_buffer)}"
+                # )
                 next_push_time += chunk_duration_s
 
                 # Sleep for most of the wait time

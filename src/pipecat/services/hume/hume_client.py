@@ -11,9 +11,6 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 import websockets
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +48,13 @@ class SimpleHumeClient:
                 "X-Hume-Api-Key": self.api_key,
             }
 
-            self.ws = await websockets.connect(
-                url, extra_headers=headers, max_size=20 * 1024 * 1024
-            )
+            # websockets 13.x renamed extra_headers to additional_headers
+            ws_kwargs: dict = {"max_size": 20 * 1024 * 1024}
+            if hasattr(websockets, "legacy"):
+                ws_kwargs["additional_headers"] = headers
+            else:
+                ws_kwargs["extra_headers"] = headers
+            self.ws = await websockets.connect(url, **ws_kwargs)
 
             # Receive initial chat metadata
             raw = await self.ws.recv()

@@ -1,11 +1,20 @@
+"""Continuous audio streaming variant of OjinVideoService.
+
+This service sends TTS audio to the inference server on-demand.
+The server maintains a virtual timeline at 25fps and generates silence
+when no client audio is available.
+"""
+
 import asyncio
 import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Type
 
+import cv2
+import numpy as np
 from loguru import logger
 from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.ojin_client import OjinClient
@@ -19,7 +28,7 @@ from ojin.ojin_client_messages import (
 from ojin.profiling_utils import FPSTracker
 from pydantic import BaseModel
 
-from pipecat.audio.utils import create_default_resampler
+from pipecat.audio.utils import create_default_resampler, is_silence
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -30,62 +39,66 @@ from pipecat.frames.frames import (
     StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
 @dataclass
 class OjinVideoInitializedFrame(Frame):
-    """Frame indicating that the persona has been initialized and can now output frames."""
+    """Frame indicating that the service has been initialized."""
 
     session_data: Optional[dict] = None
 
 
+@dataclass
+class OjinLatencyFrame(Frame):
+    """Frame carrying Ojin latency breakdown for a turn."""
+
+    inference_ms: float
+    buffer_ms: float
+    encoding_ms: float
+    total_ms: float
+
+
 class OjinBotStartedSpeakingFrame(Frame):
-    """Frame indicating that the first frame has been played."""
+    """Frame sent after X seconds of receiving TTS audio."""
 
     pass
 
 
 class OjinBotStoppedSpeakingFrame(Frame):
-    """Frame indicating that the last frame has been played."""
+    """Frame sent after Y seconds of running out of TTS audio."""
 
     pass
 
 
 OJIN_PERSONA_SAMPLE_RATE = 16000
-SPEECH_FILTER_AMOUNT = 1000.0
-IDLE_FILTER_AMOUNT = 1000.0
-IDLE_MOUTH_OPENING_SCALE = 0.0
+SPEECH_FILTER_AMOUNT = 5
 SPEECH_MOUTH_OPENING_SCALE = 1.0
-
-
-class OjinVideoServiceState(Enum):
-    """Simplified persona states."""
-
-    INITIALIZING = "initializing"  # Caching idle frames
-    IDLE = "idle"  # Playing idle animation
-    SPEAKING = "speaking"  # Playing speech frames
-    INTERRUPTING = "interrupting"  # Interrupting speech
+BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)
+MAX_FRAMES_BUFFER = 3
+MIN_FRAMES_BUFFER = 0
 
 
 @dataclass
 class VideoFrame:
-    """Represents a video frame with bundled audio from the server.
-
-    The server sends video frames with their corresponding audio already matched,
-    simplifying client-side synchronization.
-    """
+    """Represents a video frame with bundled audio from the server."""
 
     frame_idx: int
     image_bytes: bytes
     audio_bytes: bytes
     is_final: bool
+    volume: int
+    is_first_speech_frame: bool = False
+
+    def is_silence(self) -> bool:
+        return self.frame_idx == 0
 
 
 @dataclass
 class OjinVideoSettings:
-    """Settings for Ojin Video Service service."""
+    """Settings for Ojin Video Continuous Service."""
 
     api_key: str = field(default="")
     ws_url: str = field(default="wss://models.ojin.ai/realtime")
@@ -94,26 +107,23 @@ class OjinVideoSettings:
     config_id: str = field(default="")
     image_size: Tuple[int, int] = field(default=(1280, 720))
     tts_audio_passthrough: bool = field(default=False)
-    extra_frames_lat: int = field(default=15)
+    # Speaking notification delays
+    started_speaking_delay_s: float = field(default=0.5)  # Delay before sending StartedSpeaking
+    stopped_speaking_delay_s: float = field(default=0.5)  # Delay before sending StoppedSpeaking
+    frame_debugging_enabled: bool = field(default=False)
+    start_frame_cls: Type[Frame] = field(default=StartFrame)
 
 
-@dataclass
-class IdleFrame:
-    """Represents a single idle animation frame."""
-
-    frame_idx: int
-    image_bytes: bytes
+OJIN_VIDEO_SERVICE_VERSION = 2
 
 
 class OjinVideoService(FrameProcessor):
-    """Simplified Ojin Video Service integration for Pipecat.
+    """Continuous audio streaming service.
 
-    This service abstracts interaction management - the server handles all complexity
-    of matching audio to video frames. The client simply:
-    1. Sends audio input immediately when received
-    2. Receives video frames with bundled audio
-    3. Plays frames at the correct fps
-    4. Handles interruptions by clearing buffers
+    Sends TTS audio to the server on-demand:
+    - Client sends TTS audio immediately when received
+    - Server maintains virtual timeline at 25fps
+    - Server generates silence when no client audio available
     """
 
     def __init__(
@@ -122,7 +132,9 @@ class OjinVideoService(FrameProcessor):
         client: IOjinClient | None = None,
     ) -> None:
         super().__init__()
-        logger.debug(f"OjinVideoService initialized with settings {settings}")
+        logger.debug(
+            f"OjinVideoService initialized with settings {settings} version: {OJIN_VIDEO_SERVICE_VERSION}"
+        )
 
         self._settings = settings
         if client is None:
@@ -135,40 +147,53 @@ class OjinVideoService(FrameProcessor):
         else:
             self._client = client
 
-        self._state = OjinVideoServiceState.INITIALIZING
+        self._session_data: Optional[dict] = None
 
-        # Idle animation frames (cached during initialization)
-        self._idle_frames: list[IdleFrame] = []
-        self._is_mirrored_loop: bool = True
+        # Video frames queue from server
+        self._video_frames: deque[VideoFrame] = deque()
 
-        # Speech frames queue (video + audio bundled)
-        self._speech_frames: deque[VideoFrame] = deque()
-
-        self._pending_tts_audio: deque[TTSAudioRawFrame] = deque()
+        # Speech audio buffer - raw bytes ready to send (resampled to OJIN_PERSONA_SAMPLE_RATE)
+        self._speech_buffer: bytearray = bytearray()
 
         # Playback state
         self.fps = 25
-        self._num_speech_frames_played = 0
+
+        self._initialized = False
+        self._is_speaking = False
         self._current_frame_idx = -1
         self._played_frame_idx = -1
-        self._last_queued_frame_idx = -1
-        self._last_played_image_bytes: Optional[bytes] = None  # For frame repetition fallback
+        self._last_played_image_bytes: Optional[bytes] = None
 
         # Audio input handling
         self._resampler = create_default_resampler()
 
         # Tasks
         self._receive_msg_task: Optional[asyncio.Task] = None
-        self._send_audio_task: Optional[asyncio.Task] = None
-        self._run_loop_task: Optional[asyncio.Task] = None
+        self._video_playback_task: Optional[asyncio.Task] = None
 
         # Server tracking
         self._server_fps_tracker = FPSTracker("OjinVideoService")
 
-        # Debugging: Track time from TTSStartedFrame to first video frame
-        self._tts_started_timestamp: Optional[float] = None
-        self._first_frame_received_timestamp: Optional[float] = None
-        self._time_to_first_frame_measurements: list[float] = []
+        # Frame timing
+        self._frame_duration = 0.04
+
+        # Speaking state tracking
+        self._first_tts_received_at: Optional[float] = None
+        self._turn = 0
+        self._last_frame_idx = -1
+        self._waiting_for_first_real_speech_frame = False
+        self._latency_start_ts: Optional[float] = None
+        self._latency: Optional[float] = None
+        self._tts_empty_since: Optional[float] = None
+        self._bot_speaking = False
+        self._discarded_speech_frames = 0
+        self._audio_playback_task: Optional[asyncio.Task] = None
+        self._interrupting = False
+        self._pending_latency_report: Optional[tuple[float, float]] = None
+
+    def can_generate_metrics(self) -> bool:
+        """Enable TTFB metrics reporting via the standard pipecat metrics system."""
+        return True
 
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
@@ -192,205 +217,153 @@ class OjinVideoService(FrameProcessor):
                     logger.info(f"Retrying in {self._settings.client_reconnect_delay} seconds...")
                     await asyncio.sleep(self._settings.client_reconnect_delay)
 
-        logger.error(
-            f"Failed to connect after {self._settings.client_connect_max_retries} attempts. Last error: {last_error}"
+        await self.push_error(
+            error_msg=f"Failed to connect after {self._settings.client_connect_max_retries} attempts. error: {last_error}",
+            fatal=True,
         )
-        await self.push_frame(EndFrame(), FrameDirection.UPSTREAM)
-        await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+        await self._stop()
         return False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames from the pipeline."""
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, StartFrame):
-            logger.debug("StartFrame")
+        if isinstance(frame, self._settings.start_frame_cls):
+            logger.debug(f"{self._settings.start_frame_cls.__name__} received")
             await self.push_frame(frame, direction)
             await self._start()
+
         elif isinstance(frame, TTSStartedFrame):
-            logger.debug("StartInterruptionFrame")
-
-            if self._state != OjinVideoServiceState.INTERRUPTING:
-                # Clear speech frames buffer
-                # Track timestamp for debugging time to first video frame
-                self._tts_started_timestamp = time.perf_counter()
-                self._first_frame_received_timestamp = None
-                self._first_frame_played_timestamp = None
-                await self.set_state(OjinVideoServiceState.IDLE)
-
+            logger.warning("TTSStartedFrame received")
+            self._interrupting = False
+            if self._latency_start_ts is None:
+                self._latency_start_ts = time.perf_counter()
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
-            if self._state == OjinVideoServiceState.INTERRUPTING:
-                self._pending_tts_audio.append(frame)
-                logger.debug("TTSAudioRawFrame while interrupting speech - enqueued")
+            if self._interrupting:
+                logger.debug("Interrupting, dropping TTS audio")
                 return
-            await self._receive_tts(frame)
+            await self._send_tts_audio(frame)
 
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._stop()
             await self.push_frame(frame, direction)
-
-        elif isinstance(frame, StartInterruptionFrame):
-            logger.debug("StartInterruptionFrame")
-            self._pending_tts_audio.clear()
-            if self._state != OjinVideoServiceState.INITIALIZING:
-                await self._interrupt()
-
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            if not self._interrupting and self._is_speaking:
+                self._interrupting = True
+                await self._client.send_message(OjinCancelInteractionMessage())
+                await self._stop_audio_playback()
             await self.push_frame(frame, direction)
-
         else:
-            # Pass through any other frames
             await self.push_frame(frame, direction)
 
-    async def _process_pending_tts_audio(self):
-        logger.debug(f"Processing pending TTS audio: {len(self._pending_tts_audio)} frames")
-        self._speech_frames.clear()
-        self._tts_started_timestamp = time.perf_counter()
-        self._first_frame_received_timestamp = None
-        self._first_frame_played_timestamp = None
-        while self._pending_tts_audio:
-            frame = self._pending_tts_audio.popleft()
-            await self._receive_tts(frame)
+    async def _send_tts_audio(self, frame: TTSAudioRawFrame):
+        """Send TTS audio to the server immediately.
 
-    async def _receive_tts(self, frame: TTSAudioRawFrame):
-        logger.debug("TTSAudioRawFrame - sending audio immediately")
-        # Resample and buffer audio - will be sent immediately by send_audio_task
+        The server maintains a virtual timeline and will generate silence
+        when no client audio is available.
+        """
+        # Resample audio to target sample rate
         resampled_audio = await self._resampler.resample(
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
+        self._speech_buffer.extend(resampled_audio)
+
+        # Track first TTS audio for started speaking notification
+        if self._first_tts_received_at is None:
+            self._first_tts_received_at = time.perf_counter()
+            await self.start_ttfb_metrics()
+
+        # Reset empty timer since we have audio
+        self._tts_empty_since = None
+
+        # Send audio to server immediately
+        # logger.debug(f"Sending TTS audio to server, size: {len(resampled_audio)} bytes")
         await self._client.send_message(
             OjinAudioInputMessage(
                 audio_int16_bytes=resampled_audio,
                 params={
-                    "client_frame_index": self._compute_frame_index_for_server(),
                     "filter_amount": SPEECH_FILTER_AMOUNT,
                     "mouth_opening_scale": SPEECH_MOUTH_OPENING_SCALE,
                 },
             )
         )
-        await self.set_state(OjinVideoServiceState.SPEAKING)
+
         if self._settings.tts_audio_passthrough:
-            await self.push_frame(frame, direction)
+            await self.push_frame(frame, FrameDirection.DOWNSTREAM)
 
     async def _handle_ojin_message(self, message: BaseModel):
         """Process incoming messages from the server."""
         if isinstance(message, OjinSessionReadyMessage):
             if message.parameters is not None:
-                self._is_mirrored_loop = message.parameters.get("is_mirrored_loop", True)
                 self._session_data = message.parameters
 
-            logger.info(f"Received Session Ready session data: {message}")
+            logger.info(f"Received Session Ready: {message}")
             if self._session_data and self._session_data.get("server_id"):
                 logger.info(f"Connected to server: {self._session_data.get('server_id')}")
 
             self._server_fps_tracker.start()
 
-            logger.info("Requesting idle frames")
-            # Request idle frames from server
-            await self._client.start_interaction()
-            await self._client.send_message(
-                OjinAudioInputMessage(
-                    audio_int16_bytes=bytes(),
-                    params={
-                        "filter_amount": IDLE_FILTER_AMOUNT,
-                        "mouth_opening_scale": IDLE_MOUTH_OPENING_SCALE,
-                        "generate_idle_frames": True,
-                    },
+            # Start the playback loop
+            if self._video_playback_task is None:
+                self._video_playback_task = self.create_task(self._video_playback_loop())
+
+            # Notify that we're ready
+            self._initialized = True
+            initialized_frame = OjinVideoInitializedFrame(session_data=self._session_data)
+            await self.push_frame(initialized_frame, direction=FrameDirection.DOWNSTREAM)
+            await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
+
+            await self._send_tts_audio(
+                TTSAudioRawFrame(
+                    audio=b"\x00" * BYTES_PER_FRAME,
+                    sample_rate=OJIN_PERSONA_SAMPLE_RATE,
+                    num_channels=1,
                 )
             )
 
         elif isinstance(message, OjinInteractionResponseMessage):
             frame_idx = message.index
+            samples = [
+                int.from_bytes(message.audio_frame_bytes[i : i + 2], "little", signed=True)
+                for i in range(0, len(message.audio_frame_bytes) - 1, 2)
+            ]
+            volume = (sum(s * s for s in samples) / len(samples)) ** 0.5
+            # Queue video frame with bundled audio
+            video_frame = VideoFrame(
+                frame_idx=frame_idx,
+                image_bytes=message.video_frame_bytes,
+                audio_bytes=message.audio_frame_bytes,
+                is_final=message.is_final_response,
+                volume=volume,
+            )
 
-            if self._state == OjinVideoServiceState.INITIALIZING:
-                # Caching idle frames
-                idle_frame = IdleFrame(
-                    frame_idx=frame_idx,
-                    image_bytes=message.video_frame_bytes,
-                )
-                self._idle_frames.append(idle_frame)
+            if frame_idx != self._last_frame_idx:
+                self._turn += 1
+                self._last_frame_idx = frame_idx
+                if not video_frame.is_silence():
+                    self._waiting_for_first_real_speech_frame = True
 
-                if message.is_final_response:
-                    logger.info(f"Cached {len(self._idle_frames)} idle frames")
-                    await self.set_state(OjinVideoServiceState.IDLE)
-                    self._run_loop_task = self.create_task(self._run_loop())
+            if (
+                self._waiting_for_first_real_speech_frame
+                and not video_frame.is_silence()
+                and video_frame.volume > 0
+            ):
+                self._waiting_for_first_real_speech_frame = False
+                video_frame.is_first_speech_frame = True
 
-                    # Notify that we're ready
-                    initialized_frame = OjinVideoInitializedFrame(session_data=self._session_data)
-                    await self.push_frame(
-                        initialized_frame,
-                        direction=FrameDirection.DOWNSTREAM,
-                    )
-                    await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
-            else:
-                # Avoid getting frames that are not suposed to be part of the speak (remainings of old speech)
-                # TODO this was causing issues sometimes when transitioning to IDLE after new TTS already came
-                if self._state == OjinVideoServiceState.IDLE:
-                    return
-
-                if self._first_frame_received_timestamp is None:
-                    self._first_frame_received_timestamp = time.perf_counter()
-                    self._time_to_first_frame_measurements.append(
-                        self._first_frame_received_timestamp - self._tts_started_timestamp
-                    )
-                    logger.info(
-                        f"Time to first video frame received for interaction id: {message.interaction_id}: {self._time_to_first_frame_measurements[-1] * 1000:.2f}ms"
-                    )
-
-                # Speech frame with bundled audio
-                # NOTE: Server sends audio_bytes along with video frame
-                video_frame = VideoFrame(
-                    frame_idx=frame_idx,
-                    image_bytes=message.video_frame_bytes,
-                    audio_bytes=message.audio_frame_bytes,
-                    is_final=message.is_final_response,
-                )
-
-                self._speech_frames.append(video_frame)
-                self._last_queued_frame_idx = frame_idx
+            self._video_frames.append(video_frame)
+            if self._settings.frame_debugging_enabled:
                 logger.debug(
                     f"Received video frame {frame_idx}, is_final={message.is_final_response}"
                 )
 
         elif isinstance(message, ErrorResponseMessage):
-            is_fatal = False
-            if message.payload.code == "NO_BACKEND_SERVER_AVAILABLE":
-                logger.error("No OJIN servers available. Please try again later.")
-                is_fatal = True
-            elif message.payload.code == "FRAME_SIZE_TOO_BIG":
-                logger.error(
-                    "Frame Size sent to Ojin server was higher than the allowed max limit."
-                )
-            elif message.payload.code == "INVALID_INTERACTION_ID":
-                logger.error("Invalid interaction ID sent to Ojin server")
-            elif message.payload.code == "FAILED_CREATE_MODEL":
-                is_fatal = True
-                logger.error("Ojin couldn't create a model from supplied persona ID.")
-            elif message.payload.code == "INVALID_PERSONA_ID_CONFIGURATION":
-                is_fatal = True
-                logger.error("Ojin couldn't load the configuration from the supplied persona ID.")
-
-            if is_fatal:
-                await self.push_frame(EndFrame(), FrameDirection.UPSTREAM)
-                await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
-
-    async def set_state(self, state: OjinVideoServiceState):
-        """Update the persona state."""
-        if self._state == state:
-            return
-
-        old_state = self._state
-        logger.debug(f"OjinVideoServiceState changed from {old_state} to {state}")
-        match state:
-            case OjinVideoServiceState.IDLE:
-                # Push last frame played if we're coming from SPEAKING state
-                if old_state == OjinVideoServiceState.SPEAKING:
-                    await self.push_frame(OjinBotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
-                    await self.push_frame(OjinBotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-                self._num_speech_frames_played = 0
-                self._last_played_image_bytes = None  # Clear for next speech session
-        self._state = state
+            await self.push_error(
+                error_msg=f"Ojin server error: {message.payload.code}", fatal=True
+            )
+            await self._stop()
 
     async def _receive_ojin_messages(self):
         """Continuously receive and process messages from the server."""
@@ -400,190 +373,281 @@ class OjinVideoService(FrameProcessor):
             if message is not None:
                 await self._handle_ojin_message(message)
 
-    def _compute_frame_index_for_server(self) -> int:
-        """Compute the frame index to send to server for proper synchronization."""
-        return self._played_frame_idx + self._settings.extra_frames_lat
-
-    def _get_idle_frame_for_index(self, index: int) -> IdleFrame:
-        """Get idle frame for the given index with mirroring support."""
-        mirror_idx = self._mirror_index(
-            index, len(self._idle_frames), 2 if self._is_mirrored_loop else 1
-        )
-        return self._idle_frames[mirror_idx]
-
-    def _mirror_index(self, index: int, size: int, period: int = 2) -> int:
-        """Calculate a mirrored index for ping-pong animation effect."""
-        turn = index // size
-        res = index % size
-        if turn % period == 0:
-            return res
-        else:
-            return size - res - 1
-
-    async def _run_loop(self):
-        """Main playback loop - runs continuously after initialization.
-
-        Handles both idle and speech playback seamlessly.
-        """
+    async def _video_playback_loop(self):
+        """Main playback loop - outputs video frames and audio at fixed fps."""
         logger.info("Starting playback loop")
 
-        # Wait for initialization to complete
-        while self._state == OjinVideoServiceState.INITIALIZING:
-            await asyncio.sleep(0.1)
-
-        silence_duration = 1 / self.fps
-        audio_bytes_length_for_one_frame = 2 * int(silence_duration * OJIN_PERSONA_SAMPLE_RATE)
-        silence_audio_for_one_frame = b"\x00" * audio_bytes_length_for_one_frame
-
         start_ts = time.perf_counter()
-        frame_duration = 1.0 / self.fps
-        next_frame_time = start_ts + frame_duration
-        self._played_frame_idx = -1
+        next_frame_time = start_ts + self._frame_duration
+        initial_buffer_filled = False
+        is_silence = False
+        frame_count = 0
+        # Determine which frame to play
+        image_bytes: Optional[bytes] = None
+        audio_bytes: Optional[bytes] = None
+        silence_bytes_per_frame = b"\x00" * BYTES_PER_FRAME
+        skip_count = 0
 
-        while True:
+        while self._initialized:
+            # Check speaking state notifications
+            await self._check_started_speaking()
+            await self._check_stopped_speaking()
+
             # Sleep for most of the wait time
             now = time.perf_counter()
-            sleep_time = next_frame_time - now - 0.01
+            sleep_time = next_frame_time - now
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-            # Spin lock for precise timing until target time
-            while time.perf_counter() < next_frame_time:
-                pass
+            # # Spin lock for precise timing
+            # while time.perf_counter() < next_frame_time:
+            #     pass
 
-            self._current_frame_idx += 1
-            next_frame_time += frame_duration
+            next_frame_time += self._frame_duration
 
-            # Determine which frame to play
-            image_bytes = None
-            audio_bytes = silence_audio_for_one_frame
+            # if not initial_buffer_filled:
+            #     if len(self._video_frames) >= MAX_FRAMES_BUFFER:
+            #         initial_buffer_filled = True
+            #     else:
+            #         continue
 
-            # Check if we have a ready speech frame
-            if (
-                len(self._speech_frames) > 0
-                and self._speech_frames[0].frame_idx <= self._current_frame_idx
-            ):
-                # Play speech frame
-                video_frame = self._speech_frames.popleft()
+            # Check if we have a ready video frame
+            if len(self._video_frames) > 0:
+                video_frame = self._video_frames.popleft()
+                frame_count += 1
                 image_bytes = video_frame.image_bytes
-                audio_bytes = (
-                    video_frame.audio_bytes
-                    if video_frame.audio_bytes
-                    else silence_audio_for_one_frame
-                )
-                self._played_frame_idx = video_frame.frame_idx
+                audio_bytes = video_frame.audio_bytes
 
-                logger.debug(f"Playing speech frame {video_frame.frame_idx}")
-                self._num_speech_frames_played += 1
-                self._last_played_image_bytes = image_bytes  # Store for fallback
+                self._last_played_image_bytes = image_bytes
+                is_silence = video_frame.is_silence()
+                self._is_speaking = not is_silence
 
-                if self._first_frame_played_timestamp is None:
-                    self._first_frame_played_timestamp = time.perf_counter()
-                    logger.info(
-                        f"Time to first video frame played: {self._first_frame_played_timestamp - self._tts_started_timestamp}s"
-                    )
-                    await self.push_frame(OjinBotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
-                    await self.push_frame(OjinBotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+                if video_frame.is_first_speech_frame:
+                    await self._start_audio_playback()
 
-                # Check if this was the last speech frame
-                if (
-                    video_frame.is_final or self._state == OjinVideoServiceState.INTERRUPTING
-                ) and len(self._speech_frames) == 0:
-                    logger.info("Last speech frame played, transitioning to IDLE")
-                    await self.set_state(OjinVideoServiceState.IDLE)
-                    await self._process_pending_tts_audio()
-
-            else:
-                if self._num_speech_frames_played > 0:
-                    # Frame not ready - repeat last frame to avoid stutter
-                    if self._last_played_image_bytes is not None:
+                if self._settings.frame_debugging_enabled:
+                    if is_silence:
                         logger.debug(
-                            f"frame missed: {self._played_frame_idx + 1}, repeating last frame"
+                            f"[SILENCE] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
                         )
-
-                        # Filling a frame with last frame + silence audio
-                        image_bytes = self._last_played_image_bytes
-                        # Don't increment _played_frame_idx - we're repeating, not advancing
                     else:
                         logger.debug(
-                            f"frame missed: {self._played_frame_idx + 1}, no fallback available"
+                            f"[SPEECH] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
                         )
-                        await asyncio.sleep(0.005)
-                        continue
+                all_silence = (
+                    all(f.is_silence() for f in self._video_frames) and len(self._video_frames) > 0
+                )
+                if all_silence and len(self._video_frames) > MAX_FRAMES_BUFFER:
+                    skip_count += 1
+                    if skip_count % 2 == 0:
+                        self._video_frames.popleft()
+                        logger.debug(
+                            f"Skipping silence frame: {len(self._video_frames)}, target: {MAX_FRAMES_BUFFER}"
+                        )
+                elif all_silence and len(self._video_frames) < MIN_FRAMES_BUFFER:
+                    next_frame_time += self._frame_duration
+                    logger.debug(
+                        f"Slowing down silence frames: {len(self._video_frames)}, target: {MIN_FRAMES_BUFFER}"
+                    )
+
+                encode_start = time.perf_counter()
+                await self.encode_and_send(image_bytes)
+                encode_elapsed = time.perf_counter() - encode_start
+
+                if self._pending_latency_report:
+                    inference_s, buffer_s = self._pending_latency_report
+                    self._pending_latency_report = None
+                    encoding_ms = encode_elapsed * 1000
+                    inference_ms = inference_s * 1000
+                    buffer_ms = buffer_s * 1000
+                    total_ms = inference_ms + buffer_ms + encoding_ms
+                    logger.info(
+                        f"Ojin latency breakdown: inference={inference_ms:.0f}ms "
+                        f"buffer={buffer_ms:.0f}ms encoding={encoding_ms:.0f}ms "
+                        f"total={total_ms:.0f}ms"
+                    )
+                    await self.push_frame(
+                        OjinLatencyFrame(
+                            inference_ms=inference_ms,
+                            buffer_ms=buffer_ms,
+                            encoding_ms=encoding_ms,
+                            total_ms=total_ms,
+                        ),
+                        direction=FrameDirection.DOWNSTREAM,
+                    )
+                    # Report Ojin TTFB via standard pipecat metrics system
+                    await self.stop_ttfb_metrics()
+                    self._first_tts_received_at = None
+
+                # audio_frame = OutputAudioRawFrame(
+                #     audio=audio_bytes,
+                #     sample_rate=OJIN_PERSONA_SAMPLE_RATE,
+                #     num_channels=1,
+                # )
+                # audio_frame.pts = next_frame_time
+                # await self.push_frame(audio_frame)
+
+            elif self._last_played_image_bytes:
+                # Repeat last frame to avoid stutter
+                logger.debug(f"frame miss, repeating frame {frame_count}")
+                continue
+            else:
+                # No frame to show yet - just continue
+                continue
+
+    async def _start_audio_playback(self):
+        await self.stop_ttfb_metrics()
+        if self._audio_playback_task is None:
+            self._audio_playback_task = asyncio.create_task(self._playback_audio())
+
+    async def _stop_audio_playback(self):
+        self._speech_buffer.clear()
+        if self._audio_playback_task is not None:
+            self._audio_playback_task.cancel()
+            try:
+                await self._audio_playback_task
+            except asyncio.CancelledError:
+                pass
+            self._audio_playback_task = None
+
+    async def _playback_audio(self):
+        sample_rate = OJIN_PERSONA_SAMPLE_RATE
+        num_channels = 1
+        chunk_duration_s = 0.1  # 20ms
+        bytes_per_sample = 2  # 16-bit PCM
+        chunk_size = int(sample_rate * chunk_duration_s) * num_channels * bytes_per_sample
+        empty_since: Optional[float] = None
+        drain_timeout_s = 0.5  # auto-stop after 500ms with empty buffer
+
+        next_push_time = time.perf_counter()
+        try:
+            while True:
+                if not self._speech_buffer:
+                    now = time.perf_counter()
+                    if empty_since is None:
+                        empty_since = now
+                    elif now - empty_since > drain_timeout_s:
+                        logger.debug("Audio playback: buffer drained, stopping")
+                        break
+                    await asyncio.sleep(0.005)
+                    continue
+
+                empty_since = None
+                next_push_time = time.perf_counter()
+                if len(self._speech_buffer) < chunk_size:
+                    audio = bytes(self._speech_buffer)
+                    self._speech_buffer.clear()
                 else:
-                    # Play idle frame (only when not in speech mode)
-                    self._played_frame_idx += 1
-                    idle_frame = self._get_idle_frame_for_index(self._played_frame_idx)
-                    image_bytes = idle_frame.image_bytes
-                    # audio_bytes is already set to silence
+                    audio = bytes(self._speech_buffer[:chunk_size])
+                    del self._speech_buffer[:chunk_size]
 
-                    if self._played_frame_idx % 150 == 0:
-                        logger.debug(f"Playing idle frame (%150) {self._played_frame_idx}")
-                # if self._state == OjinVideoServiceState.IDLE:
-                #     if self._played_frame_idx % 25 == 0:
-                #         logger.debug(f"Playing idle frame (%25) {self._played_frame_idx}")
-                # else:
-                #     logger.debug(f"Playing idle frame {self._played_frame_idx}")
+                audio_frame = OutputAudioRawFrame(
+                    audio=audio,
+                    sample_rate=sample_rate,
+                    num_channels=num_channels,
+                )
+                audio_frame.pts = next_push_time
+                await self.push_frame(audio_frame)
 
-            # Output frame and audio with synchronized PTS
-            # PTS in nanoseconds based on frame index and fps
-            frame_pts = int((self._played_frame_idx / self.fps) * 1_000_000_000)
+                logger.debug(
+                    f"Playing audio frame, duration: {len(audio_frame.audio) / sample_rate / num_channels / bytes_per_sample:.3f}s, buffer left: {len(self._speech_buffer)}"
+                )
+                next_push_time += chunk_duration_s
 
-            image_frame = OutputImageRawFrame(
-                image=image_bytes, size=self._settings.image_size, format="RGB"
-            )
-            image_frame.pts = frame_pts
+                # Sleep for most of the wait time
+                now = time.perf_counter()
+                sleep_time = next_push_time - now - 0.005
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
 
-            audio_frame = OutputAudioRawFrame(
-                audio=audio_bytes,
-                sample_rate=OJIN_PERSONA_SAMPLE_RATE,
-                num_channels=1,
-            )
-            audio_frame.pts = frame_pts  # Same PTS ensures sync
-
-            await self.push_frame(image_frame)
-            await self.push_frame(audio_frame)
+                # Spin lock for precise timing
+                while time.perf_counter() < next_push_time:
+                    pass
+        finally:
+            self._audio_playback_task = None
 
     async def _start(self):
-        """Initialize the persona service and start processing."""
+        """Initialize the service and start processing."""
         is_connected = await self.connect_with_retry()
         if not is_connected:
             return
 
+        # Start receiving messages
         self._receive_msg_task = self.create_task(self._receive_ojin_messages())
 
+        # Start an interaction for continuous streaming
+        await self._client.start_interaction()
+
+    async def encode_and_send(self, video: bytes):
+        image_array = np.frombuffer(video, dtype=np.uint8)
+        image_size = self._settings.image_size
+        decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if decoded_image is not None:
+            h, w = decoded_image.shape[:2]
+            target_w, target_h = image_size
+
+            scale = min(target_w / w, target_h / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+
+            scaled_image = cv2.resize(decoded_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            rgb_image = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2RGB)
+            rgb_bytes = rgb_image.tobytes()
+
+            rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(new_w, new_h), format="RGB")
+            rgb_frame.pts = time.monotonic()
+            await self.push_frame(rgb_frame, FrameDirection.DOWNSTREAM)
+        pass
+
     async def _stop(self):
-        """Stop the persona service and clean up resources."""
-        if self._send_audio_task:
-            await self.cancel_task(self._send_audio_task)
-            self._send_audio_task = None
-
-        if self._receive_msg_task:
-            await self.cancel_task(self._receive_msg_task)
-            self._receive_msg_task = None
-
-        if self._run_loop_task:
-            await self.cancel_task(self._run_loop_task)
-            self._run_loop_task = None
-
+        self._initialized = False
+        self._is_speaking = False
         if self._client:
             await self._client.close()
             self._client = None
 
+        """Stop the service and clean up resources."""
+        if self._receive_msg_task:
+            await self.cancel_task(self._receive_msg_task)
+            self._receive_msg_task = None
+
+        if self._video_playback_task:
+            await self.cancel_task(self._video_playback_task)
+            self._video_playback_task = None
+
         logger.debug(f"OjinVideoService {self._settings.config_id} stopped")
 
-    async def _interrupt(self):
-        """Interrupt current speech.
-
-        Server will flag next frame as final and drop remaining frames.
-        Client just needs to clear buffers.
-        """
-        logger.info("Interrupting speech")
-        if self._state != OjinVideoServiceState.SPEAKING:
+    async def _check_started_speaking(self):
+        """Check if we should send StartedSpeaking frame."""
+        if self._bot_speaking:
             return
 
-        # Send cancel to server
-        if self._client is not None:
-            await self._client.send_message(OjinCancelInteractionMessage())
+        if self._first_tts_received_at is None:
+            return
 
-        await self.set_state(OjinVideoServiceState.INTERRUPTING)
+        elapsed = time.perf_counter() - self._first_tts_received_at
+
+        if elapsed >= self._settings.started_speaking_delay_s:
+            self._bot_speaking = True
+            # logger.info(f"Bot started speaking after {elapsed:.3f}s")
+            await self.push_frame(OjinBotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+            await self.push_frame(OjinBotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+
+    async def _check_stopped_speaking(self):
+        """Check if we should send StoppedSpeaking frame."""
+        if not self._bot_speaking:
+            return
+
+        # Start tracking empty time if not already
+        if self._tts_empty_since is None:
+            self._tts_empty_since = time.perf_counter()
+            return
+
+        elapsed = time.perf_counter() - self._tts_empty_since
+        if elapsed >= self._settings.stopped_speaking_delay_s:
+            self._bot_speaking = False
+            self._first_tts_received_at = None  # Reset for next speech
+            self._tts_empty_since = None
+            # logger.info(f"Bot stopped speaking after {elapsed:.3f}s of silence")
+            await self.push_frame(OjinBotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+            await self.push_frame(OjinBotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)

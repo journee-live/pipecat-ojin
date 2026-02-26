@@ -140,7 +140,9 @@ class HumeSTSService(LLMService):
                 # logger.debug(
                 #     f"Sending audio to Hume, size: {len(audio)} bytes, sample rate: {frame.sample_rate} target_rate: 16000"
                 # )
-                await self._connection._send(audio)
+                await self._connection.send_audio_input(
+                    AudioInput(data=base64.b64encode(audio).decode("utf-8"))
+                )
             # else:
             #     logger.debug(f"Not connection with hume but receiving audio input")
             if self._audio_passthrough:
@@ -205,9 +207,7 @@ class HumeSTSService(LLMService):
     async def _on_message(self, message: SubscribeEvent):
         logger.trace(f"Received message from Hume: {message}")
         msg_type = message.type
-        if hasattr(message, "id") and (
-            message.id in self.cancelled_conversation_ids and self.active_conversation
-        ):
+        if hasattr(message, "id") and message.id in self.cancelled_conversation_ids:
             logger.info(f"Skipping message from cancelled conversation {message.id}")
             return
 

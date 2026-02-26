@@ -172,7 +172,7 @@ class HumeSTSService(LLMService):
         msg_type = data.get("type")
         msg_id = data.get("id")
 
-        if msg_id and msg_id in self.cancelled_conversation_ids and self.active_conversation:
+        if msg_id and msg_id in self.cancelled_conversation_ids:
             logger.debug(f"Skipping message from cancelled conversation {msg_id}")
             return
 
@@ -235,9 +235,8 @@ class HumeSTSService(LLMService):
         if not wav_b64:
             return
 
-        wav_bytes = base64.b64decode(wav_b64)
-
         try:
+            wav_bytes = base64.b64decode(wav_b64)
             with io.BytesIO(wav_bytes) as wav_file:
                 with wave.open(wav_file, "rb") as wav_reader:
                     sample_rate = wav_reader.getframerate()

@@ -102,7 +102,7 @@ class OjinVideoSettings:
     start_frame_cls: Type[Frame] = field(default=StartFrame)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 3
+OJIN_VIDEO_SERVICE_VERSION = 4
 
 
 class OjinVideoService(FrameProcessor):
@@ -338,10 +338,6 @@ class OjinVideoService(FrameProcessor):
                 video_frame.is_first_speech_frame = True
 
             self._video_frames.append(video_frame)
-            if self._settings.frame_debugging_enabled:
-                logger.debug(
-                    f"Received video frame {frame_idx}, is_final={message.is_final_response}"
-                )
 
         elif isinstance(message, ErrorResponseMessage):
             await self.push_error(
@@ -428,6 +424,7 @@ class OjinVideoService(FrameProcessor):
             elif self._last_played_image_bytes:
                 # Repeat last frame to avoid stutter
                 logger.debug(f"frame miss, repeating frame {frame_count}")
+                await self.encode_and_send(self._last_played_image_bytes, is_first=False)
                 continue
             else:
                 # No frame to show yet - just continue

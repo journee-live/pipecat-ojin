@@ -102,7 +102,7 @@ class OjinVideoSettings:
     start_frame_cls: Type[Frame] = field(default=StartFrame)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 5
+OJIN_VIDEO_SERVICE_VERSION = 6
 
 
 class OjinVideoService(FrameProcessor):

@@ -10,7 +10,6 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Optional, Tuple, Type
 
 import cv2
@@ -28,7 +27,7 @@ from ojin.ojin_client_messages import (
 from ojin.profiling_utils import FPSTracker
 from pydantic import BaseModel
 
-from pipecat.audio.utils import create_default_resampler, is_silence
+from pipecat.audio.utils import create_default_resampler
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -36,7 +35,6 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     OutputImageRawFrame,
     StartFrame,
-    StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     UserStartedSpeakingFrame,
@@ -172,7 +170,6 @@ class OjinVideoService(FrameProcessor):
         self._waiting_to_play_silence_frame = False
         self._bot_speaking = False
         self._discarded_speech_frames = 0
-        self._audio_playback_task: Optional[asyncio.Task] = None
         self._interrupting = False
         self._pending_latency_report: Optional[tuple[float, float]] = None
 
@@ -354,17 +351,28 @@ class OjinVideoService(FrameProcessor):
                 await self._handle_ojin_message(message)
 
     async def _video_playback_loop(self):
-        """Main playback loop - outputs video frames and audio at fixed fps."""
+        """Main playback loop - interleaves audio and video at fixed fps.
+
+        Audio-as-clock approach: audio always plays smoothly, video skips
+        frames to catch up to audio position when behind.
+        """
         logger.info("Starting playback loop")
 
         start_ts = time.perf_counter()
         next_frame_time = start_ts + self._frame_duration
-        is_silence = False
         frame_count = 0
-        # Determine which frame to play
-        image_bytes: Optional[bytes] = None
-        skip_count = 0
         initial_buffer = 6
+
+        # Audio-video sync counters (reset each speech turn)
+        audio_frames_released = 0
+        video_frames_sent = 0
+
+        # Audio playback constants
+        sample_rate = OJIN_PERSONA_SAMPLE_RATE
+        num_channels = 1
+        bytes_per_sample = 2
+        chunk_size = int(sample_rate * self._frame_duration) * num_channels * bytes_per_sample
+        is_first_audio_frame = True
 
         while self._initialized:
             # Sleep for most of the wait time
@@ -378,104 +386,24 @@ class OjinVideoService(FrameProcessor):
                 pass
 
             next_frame_time += self._frame_duration
-            # Check if we have a ready video frame
-            if len(self._video_frames) > 0:
-                if initial_buffer > 0:
-                    initial_buffer -= 1
-                    continue
 
-                video_frame = self._video_frames.popleft()
-                frame_count += 1
-                image_bytes = video_frame.image_bytes
+            # Wait for initial buffer to fill
+            if len(self._video_frames) > 0 and initial_buffer > 0:
+                initial_buffer -= 1
+                continue
 
-                self._last_played_image_bytes = image_bytes
-                is_silence = video_frame.is_silence()
-
-                if self._waiting_to_play_silence_frame and is_silence:
-                    await self._stop_audio_playback()
-                    self._waiting_to_play_silence_frame = False
-
-                if video_frame.is_first_speech_frame:
+            # Pre-check: detect speech transition before releasing audio
+            # so first audio chunk pairs with first speech video frame
+            if not self._is_speaking and self._video_frames:
+                next_frame = self._video_frames[0]
+                if next_frame.is_first_speech_frame:
+                    audio_frames_released = -1
+                    video_frames_sent = 0
+                    is_first_audio_frame = True
                     await self._start_audio_playback()
 
-                if self._settings.frame_debugging_enabled:
-                    if is_silence:
-                        logger.debug(
-                            f"[SILENCE] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
-                        )
-                    else:
-                        logger.debug(
-                            f"[SPEECH] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
-                        )
-                all_silence = (
-                    all(f.is_silence() for f in self._video_frames) and len(self._video_frames) > 0
-                )
-                if all_silence and len(self._video_frames) > MAX_FRAMES_BUFFER:
-                    skip_count += 1
-                    if skip_count % 2 == 0:
-                        self._video_frames.popleft()
-                        logger.debug(
-                            f"Skipping silence frame: {len(self._video_frames)}, target: {MAX_FRAMES_BUFFER}"
-                        )
-                elif all_silence and len(self._video_frames) < MIN_FRAMES_BUFFER:
-                    next_frame_time += self._frame_duration
-                    logger.debug(
-                        f"Slowing down silence frames: {len(self._video_frames)}, target: {MIN_FRAMES_BUFFER}"
-                    )
-
-                await self.encode_and_send(image_bytes, video_frame.is_first_speech_frame)
-
-            elif self._last_played_image_bytes:
-                # Repeat last frame to avoid stutter
-                logger.debug(f"frame miss, repeating frame {frame_count}")
-                await self.encode_and_send(self._last_played_image_bytes, is_first=False)
-                continue
-            else:
-                # No frame to show yet - just continue
-                continue
-
-    async def _start_audio_playback(self):
-        logger.warning("Starting audio playback")
-        self._is_speaking = True
-        await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
-        await self.stop_ttfb_metrics()
-        if self._audio_playback_task is not None:
-            self._stop_audio_playback()
-
-        self._audio_playback_task = asyncio.create_task(self._playback_audio())
-
-    async def _stop_audio_playback(self):
-        if not self._is_speaking:
-            return
-
-        self._is_speaking = False
-        await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
-        self._speech_buffer.clear()
-        if self._audio_playback_task is not None:
-            self._audio_playback_task.cancel()
-            try:
-                await self._audio_playback_task
-            except asyncio.CancelledError:
-                pass
-            self._audio_playback_task = None
-
-    async def _playback_audio(self):
-        sample_rate = OJIN_PERSONA_SAMPLE_RATE
-        num_channels = 1
-        chunk_duration_s = 0.04  # 100ms
-        bytes_per_sample = 2  # 16-bit PCM
-        chunk_size = int(sample_rate * chunk_duration_s) * num_channels * bytes_per_sample
-
-        next_push_time = time.perf_counter()
-        is_first_audio_frame = True
-        logger.info("Started audio playback")
-        try:
-            while True:
-                if not self._speech_buffer:
-                    await asyncio.sleep(0.005)
-                    continue
-
-                next_push_time = time.perf_counter()
+            # 1. Release next TTS audio frame (always, if available)
+            if self._is_speaking and self._speech_buffer:
                 if len(self._speech_buffer) < chunk_size:
                     audio = bytes(self._speech_buffer)
                     self._speech_buffer.clear()
@@ -492,25 +420,111 @@ class OjinVideoService(FrameProcessor):
                 if is_first_audio_frame:
                     logger.warning(f"First audio frame played! size: {len(audio_frame.audio)}")
                     is_first_audio_frame = False
-
                 await self.push_frame(audio_frame)
+                audio_frames_released += 1
 
-                # logger.debug(
-                #     f"Playing audio frame, duration: {len(audio_frame.audio) / sample_rate / num_channels / bytes_per_sample:.3f}s, buffer left: {len(self._speech_buffer)}"
-                # )
-                next_push_time += chunk_duration_s
+            # 2. Match video to audio position - skip if behind
+            if not self._video_frames:
+                if self._last_played_image_bytes:
+                    logger.debug(f"frame miss, repeating frame {frame_count}")
+                    await self.encode_and_send(self._last_played_image_bytes, is_first=False)
+                continue
 
-                # Sleep for most of the wait time
-                now = time.perf_counter()
-                sleep_time = next_push_time - now - 0.005
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+            if self._is_speaking:
+                # Speech mode: skip video frames to catch up to audio
+                video_frame = None
 
-                # Spin lock for precise timing
-                while time.perf_counter() < next_push_time:
-                    pass
-        finally:
-            self._audio_playback_task = None
+                # Check for speech -> silence transition before sync guard
+                if (
+                    self._waiting_to_play_silence_frame
+                    and self._video_frames
+                    and self._video_frames[0].is_silence()
+                ):
+                    video_frame = self._video_frames.popleft()
+                    frame_count += 1
+                    await self._stop_audio_playback()
+                    self._waiting_to_play_silence_frame = False
+                else:
+                    while len(self._video_frames) > 0:
+                        if video_frames_sent >= audio_frames_released:
+                            break  # video caught up to audio
+                        candidate = self._video_frames.popleft()
+                        frame_count += 1
+                        if not candidate.is_silence():
+                            # Speech frame - send this one, skip rest to catch up
+                            video_frame = candidate
+                            video_frames_sent += 1
+                            break
+                        # Skip silence frames during catch-up
+                        if self._settings.frame_debugging_enabled:
+                            logger.debug(
+                                f"Skipping silence frame during catch-up, buffer: {len(self._video_frames)}"
+                            )
+
+                if video_frame is not None:
+                    self._last_played_image_bytes = video_frame.image_bytes
+                    if self._settings.frame_debugging_enabled:
+                        logger.debug(
+                            f"[SPEECH] Playing frame {frame_count}, audio_released: {audio_frames_released}, "
+                            f"video_sent: {video_frames_sent}, buffer: {len(self._video_frames)}"
+                        )
+                    await self.encode_and_send(
+                        video_frame.image_bytes, video_frame.is_first_speech_frame
+                    )
+            else:
+                # Idle mode: play video frames at normal rate
+                video_frame = self._video_frames.popleft()
+                frame_count += 1
+
+                if self._waiting_to_play_silence_frame and video_frame.is_silence():
+                    await self._stop_audio_playback()
+                    self._waiting_to_play_silence_frame = False
+
+                self._last_played_image_bytes = video_frame.image_bytes
+                is_silence = video_frame.is_silence()
+
+                if self._settings.frame_debugging_enabled:
+                    if is_silence:
+                        logger.debug(
+                            f"[SILENCE] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[SPEECH] Playing frame {frame_count}, buffer left: {len(self._video_frames)} volume: {video_frame.volume}"
+                        )
+
+                # Buffer management for silence frames
+                all_silence = (
+                    all(f.is_silence() for f in self._video_frames) and len(self._video_frames) > 0
+                )
+                if all_silence and len(self._video_frames) > MAX_FRAMES_BUFFER:
+                    self._video_frames.popleft()
+                    logger.debug(
+                        f"Skipping silence frame: {len(self._video_frames)}, target: {MAX_FRAMES_BUFFER}"
+                    )
+                elif all_silence and len(self._video_frames) < MIN_FRAMES_BUFFER:
+                    next_frame_time += self._frame_duration
+                    logger.debug(
+                        f"Slowing down silence frames: {len(self._video_frames)}, target: {MIN_FRAMES_BUFFER}"
+                    )
+
+                await self.encode_and_send(
+                    video_frame.image_bytes, video_frame.is_first_speech_frame
+                )
+
+    async def _start_audio_playback(self):
+        logger.warning("Starting audio playback")
+        self._is_speaking = True
+        await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
+        await self.stop_ttfb_metrics()
+
+    async def _stop_audio_playback(self):
+        if not self._is_speaking:
+            return
+
+        self._is_speaking = False
+        await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
+        self._speech_buffer.clear()
 
     async def _start(self):
         """Initialize the service and start processing."""

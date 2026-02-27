@@ -312,9 +312,10 @@ class OjinVideoService(FrameProcessor):
             ]
             volume = 0 if len(samples) == 0 else (sum(s * s for s in samples) / len(samples)) ** 0.5
 
-            logger.debug(
-                f"Received video frame {message.index} [{volume}], delta: {time.monotonic() - self.last_frame_time} buffer: {len(self._video_frames)}"
-            )
+            if self._settings.frame_debugging_enabled:
+                logger.debug(
+                    f"Received video frame {message.index} [{volume}], delta: {time.monotonic() - self.last_frame_time} buffer: {len(self._video_frames)}"
+                )
             # Queue video frame with bundled audio
             video_frame = VideoFrame(
                 frame_idx=frame_idx,

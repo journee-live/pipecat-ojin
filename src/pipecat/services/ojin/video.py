@@ -234,6 +234,7 @@ class OjinVideoService(FrameProcessor):
             if not self._interrupting and self._client is not None:
                 self._interrupting = True
                 self._waiting_for_first_tts = False
+                await self._stop_audio_playback()
                 # OjinCancelInteractionMessage will clear any existing tts audio sent to the server. There might be still some frames coming
                 await self._client.send_message(OjinCancelInteractionMessage())
             await self.push_frame(frame, direction)
@@ -423,6 +424,9 @@ class OjinVideoService(FrameProcessor):
             self._audio_playback_task = asyncio.create_task(self._playback_audio())
 
     async def _stop_audio_playback(self):
+        if not self._is_speaking:
+            return
+
         self._is_speaking = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         self._speech_buffer.clear()

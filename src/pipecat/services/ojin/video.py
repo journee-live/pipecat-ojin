@@ -102,7 +102,7 @@ class OjinVideoSettings:
     start_frame_cls: Type[Frame] = field(default=StartFrame)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 4
+OJIN_VIDEO_SERVICE_VERSION = 5
 
 
 class OjinVideoService(FrameProcessor):
@@ -260,7 +260,7 @@ class OjinVideoService(FrameProcessor):
             self._waiting_for_first_tts = False
             await self.start_ttfb_metrics()
         # Send audio to server immediately
-        # logger.debug(f"Sending TTS audio to server, size: {len(resampled_audio)} bytes")
+        logger.debug(f"Sending TTS audio to server, size: {len(resampled_audio)} bytes")
         await self._client.send_message(
             OjinAudioInputMessage(
                 audio_int16_bytes=resampled_audio,
@@ -369,9 +369,13 @@ class OjinVideoService(FrameProcessor):
         while self._initialized:
             # Sleep for most of the wait time
             now = time.perf_counter()
-            sleep_time = next_frame_time - now
+            sleep_time = next_frame_time - now - 0.003
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
+
+            # Spin lock for precise timing
+            while time.perf_counter() < next_frame_time:
+                pass
 
             next_frame_time += self._frame_duration
             # Check if we have a ready video frame

@@ -397,7 +397,7 @@ class OjinVideoService(FrameProcessor):
             if not self._is_speaking and self._video_frames:
                 next_frame = self._video_frames[0]
                 if next_frame.is_first_speech_frame:
-                    audio_frames_released = -1
+                    audio_frames_released = 0
                     video_frames_sent = 0
                     is_first_audio_frame = True
                     await self._start_audio_playback()

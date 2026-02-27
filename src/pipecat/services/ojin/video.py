@@ -462,7 +462,7 @@ class OjinVideoService(FrameProcessor):
     async def _playback_audio(self):
         sample_rate = OJIN_PERSONA_SAMPLE_RATE
         num_channels = 1
-        chunk_duration_s = 0.1  # 100ms
+        chunk_duration_s = 0.04  # 100ms
         bytes_per_sample = 2  # 16-bit PCM
         chunk_size = int(sample_rate * chunk_duration_s) * num_channels * bytes_per_sample
 

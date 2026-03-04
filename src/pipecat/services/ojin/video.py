@@ -552,25 +552,25 @@ class OjinVideoService(FrameProcessor):
         # Smart catch-up: skip one extra frame when video lags >1 behind
         # audio and buffer has enough frames for a smooth skip.
         skipped_speech = 0
-        frames_behind = audio_frames_released - video_frames_sent
-        if frames_behind > 1 and len(self._video_frames) > MIN_FRAMES_BUFFER:
-            front = self._video_frames[0]
-            # Never skip a silence-transition frame
-            if not (self._pending_silence_start and front.is_silence()):
-                skipped = self._video_frames.popleft()
-                if not skipped.is_silence():
-                    skipped_speech = 1
-                    video_frames_sent += 1
-                if self._settings.frame_debugging_enabled:
-                    logger.debug(
-                        f"Skipping frame idx:{skipped.frame_idx} for catch-up, "
-                        f"behind={frames_behind}, buffer={len(self._video_frames)}"
-                    )
-            # Re-check guards after skip
-            if not self._video_frames:
-                return None, skipped_speech
-            if video_frames_sent >= audio_frames_released:
-                return None, skipped_speech
+        # frames_behind = audio_frames_released - video_frames_sent
+        # if frames_behind > 1 and len(self._video_frames) > MIN_FRAMES_BUFFER:
+        #     front = self._video_frames[0]
+        #     # Never skip a silence-transition frame
+        #     if not (self._pending_silence_start and front.is_silence()):
+        #         skipped = self._video_frames.popleft()
+        #         if not skipped.is_silence():
+        #             skipped_speech = 1
+        #             video_frames_sent += 1
+        #         if self._settings.frame_debugging_enabled:
+        #             logger.debug(
+        #                 f"Skipping frame idx:{skipped.frame_idx} for catch-up, "
+        #                 f"behind={frames_behind}, buffer={len(self._video_frames)}"
+        #             )
+        #     # Re-check guards after skip
+        #     if not self._video_frames:
+        #         return None, skipped_speech
+        #     if video_frames_sent >= audio_frames_released:
+        #         return None, skipped_speech
 
         # Consume the frame to play
         if not self._video_frames:

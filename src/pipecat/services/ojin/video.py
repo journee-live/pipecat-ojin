@@ -553,7 +553,7 @@ class OjinVideoService(FrameProcessor):
         # audio and buffer has enough frames for a smooth skip.
         skipped_speech = 0
         frames_behind = audio_frames_released - video_frames_sent
-        if frames_behind > 1 and len(self._video_frames) > MIN_FRAMES_BUFFER:
+        if frames_behind > 0 and len(self._video_frames) > MIN_FRAMES_BUFFER:
             front = self._video_frames[0]
             # Never skip a silence-transition frame
             if not (self._pending_silence_start and front.is_silence()):

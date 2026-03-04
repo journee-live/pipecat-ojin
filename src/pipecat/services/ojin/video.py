@@ -473,7 +473,7 @@ class OjinVideoService(FrameProcessor):
             if (
                 self._is_speaking
                 and not self._speech_buffer
-                and video_frames_sent >= audio_frames_released
+                # and video_frames_sent >= audio_frames_released
                 and self._pending_silence_start
             ):
                 logger.warning(

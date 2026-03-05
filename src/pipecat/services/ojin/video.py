@@ -277,6 +277,10 @@ class OjinVideoService(FrameProcessor):
         The server maintains a virtual timeline and will generate silence
         when no client audio is available.
         """
+        if self._client is None or not self._initialized:
+            logger.warning(f"Discarded TTSAudioRawFrame because client is not ready")
+            return
+
         # Resample audio to target sample rate
         resampled_audio = await self._resampler.resample(
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE

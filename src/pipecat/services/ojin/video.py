@@ -80,7 +80,7 @@ class VideoFrame:
     is_first_speech_frame: bool = False
 
     def is_silence(self) -> bool:
-        return self.frame_idx == 0
+        return self.volume == 0
 
 
 class InterruptStrategy(Enum):
@@ -162,7 +162,7 @@ class OjinVideoService(FrameProcessor):
 
         self._initialized = False
         self.last_frame_time = 0
-        self._is_speaking = False
+        self._is_playing_speech_audio = False
         self._waiting_for_first_tts = False
         self._current_frame_idx = -1
         self._played_frame_idx = -1
@@ -182,7 +182,6 @@ class OjinVideoService(FrameProcessor):
         self._turn = 0
         self._last_frame_idx = -1
         self._pending_speech_start = False
-        self._pending_silence_start = False
 
         # Interruption state
         self._interrupting = False
@@ -248,6 +247,7 @@ class OjinVideoService(FrameProcessor):
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
             if not self._interrupting and self._client is not None:
+                logger.debug("Start interrupting")
                 self._interrupting = True
                 self._waiting_for_first_tts = False
                 strategy = self._settings.interrupt_strategy
@@ -355,16 +355,8 @@ class OjinVideoService(FrameProcessor):
             if frame_idx != self._last_frame_idx:
                 self._turn += 1
                 self._last_frame_idx = frame_idx
-                if not video_frame.is_silence():
-                    self._pending_speech_start = True
-                else:
-                    self._pending_silence_start = True
 
-            if (
-                self._pending_speech_start
-                and not video_frame.is_silence()
-                and video_frame.volume > 0
-            ):
+            if self._pending_speech_start and not video_frame.is_silence():
                 self._pending_speech_start = False
                 video_frame.is_first_speech_frame = True
 
@@ -434,19 +426,38 @@ class OjinVideoService(FrameProcessor):
                 initial_buffer -= 1
                 continue
 
+            num_next_silence_frames = self.get_num_next_silence_frames()
+            should_play_speech_video_frame = (
+                num_next_silence_frames == 0 and len(self._video_frames) > 0
+            )
+            should_start_playing_audio = (
+                should_play_speech_video_frame
+                and not self._interrupting
+                and not self._is_playing_speech_audio
+                and self._speech_buffer
+            )
+            should_stop_playing_audio = self._is_playing_speech_audio and (
+                num_next_silence_frames > 0 or not self._speech_buffer
+            )
             # ── Step 1: Silence→speech pre-check ──
             # Requires BOTH first_speech_frame AND audio available.
-            if not self._is_speaking and self._video_frames:
-                front = self._video_frames[0]
-                if front.is_first_speech_frame and self._speech_buffer:
-                    audio_frames_released = 0
-                    video_frames_sent = 0
-                    is_first_audio_frame = True
-                    self._discard_speech_until_silence = False
-                    await self._start_audio_playback()
+            if should_start_playing_audio:
+                logger.debug("Started playing audio")
+                self._is_playing_speech_audio = True
+                audio_frames_released = 0
+                video_frames_sent = 0
+                is_first_audio_frame = True
+                self._discard_speech_until_silence = False
+                await self._start_audio_playback()
+            elif should_stop_playing_audio:
+                logger.debug(
+                    f"Stopped playing audio num_next_silence_frames: {num_next_silence_frames} speech_buffer_empty: {not self._speech_buffer}"
+                )
+                self._is_playing_speech_audio = False
+                await self._stop_audio_playback()
 
             # ── Step 2: Release audio ──
-            if self._is_speaking and self._speech_buffer:
+            if self._is_playing_speech_audio and self._speech_buffer:
                 if len(self._speech_buffer) < chunk_size:
                     audio = bytes(self._speech_buffer)
                     self._speech_buffer.clear()
@@ -466,25 +477,6 @@ class OjinVideoService(FrameProcessor):
                 await self.push_frame(audio_frame)
                 audio_frames_released += 1
 
-            # ── Step 3: Audio-exhaustion guard ──
-            # Only fires when silence transition is pending (server signaled
-            # end of speech). Breaks the deadlock where sync guard blocks
-            # speech frames queued ahead of silence frames.
-            if (
-                self._is_speaking
-                and not self._speech_buffer
-                # and video_frames_sent >= audio_frames_released
-                and self._pending_silence_start
-            ):
-                logger.warning(
-                    f"Audio exhausted with silence pending "
-                    f"(audio_released={audio_frames_released}, "
-                    f"video_sent={video_frames_sent}, "
-                    f"buffer={len(self._video_frames)}), "
-                    f"transitioning to idle"
-                )
-                await self._stop_audio_playback()
-
             # ── Step 4: Consume video frame ──
             if not self._video_frames:
                 if self._last_played_image_bytes:
@@ -495,7 +487,7 @@ class OjinVideoService(FrameProcessor):
 
             video_frame: Optional[VideoFrame] = None
 
-            if self._is_speaking:
+            if should_play_speech_video_frame:
                 video_frame, skipped_speech = await self._consume_speech_frame(
                     audio_frames_released, video_frames_sent
                 )
@@ -504,13 +496,13 @@ class OjinVideoService(FrameProcessor):
                     if not video_frame.is_silence():
                         video_frames_sent += 1
             else:
-                video_frame = await self._consume_idle_frame()
+                video_frame = await self._consume_idle_frame(num_next_silence_frames)
 
             if video_frame is not None:
                 frame_count += 1
                 self._last_played_image_bytes = video_frame.image_bytes
                 if self._settings.frame_debugging_enabled:
-                    mode = "SPEECH" if self._is_speaking else "SILENCE"
+                    mode = "SPEECH" if self._is_playing_speech_audio else "SILENCE"
                     logger.debug(
                         f"[{mode}] Playing frame {frame_count}, "
                         f"audio_released: {audio_frames_released}, "
@@ -524,69 +516,10 @@ class OjinVideoService(FrameProcessor):
     async def _consume_speech_frame(
         self, audio_frames_released: int, video_frames_sent: int
     ) -> tuple[Optional[VideoFrame], int]:
-        """Consume one video frame in speech mode.
-
-        Returns (frame, skipped_speech_count) — the caller must add
-        skipped_speech_count to video_frames_sent.
-
-        Priority order:
-          1. Speech→silence transition (always handled first).
-          2. Sync guard: video must not run ahead of audio.
-          3. Smart catch-up: when video lags behind audio by >1 frame
-             AND buffer is healthy (> MIN_FRAMES_BUFFER), skip one extra
-             frame per tick. This implements the "skip one frame every
-             second frame" strategy from playback_tips.md — any frame
-             type can be skipped, not just silence.
-        """
-        # Speech→silence transition: silence frame at front
-        if self._pending_silence_start and self._video_frames[0].is_silence():
-            frame = self._video_frames.popleft()
-            await self._stop_audio_playback()
-            self._pending_silence_start = False
-            return frame, 0
-
-        # Sync guard: video must not run ahead of audio
-        if video_frames_sent >= audio_frames_released:
-            return None, 0
-
-        # Smart catch-up: skip one extra frame when video lags >1 behind
-        # audio and buffer has enough frames for a smooth skip.
-        skipped_speech = 0
-        # frames_behind = audio_frames_released - video_frames_sent
-        # if frames_behind > 1 and len(self._video_frames) > MIN_FRAMES_BUFFER:
-        #     front = self._video_frames[0]
-        #     # Never skip a silence-transition frame
-        #     if not (self._pending_silence_start and front.is_silence()):
-        #         skipped = self._video_frames.popleft()
-        #         if not skipped.is_silence():
-        #             skipped_speech = 1
-        #             video_frames_sent += 1
-        #         if self._settings.frame_debugging_enabled:
-        #             logger.debug(
-        #                 f"Skipping frame idx:{skipped.frame_idx} for catch-up, "
-        #                 f"behind={frames_behind}, buffer={len(self._video_frames)}"
-        #             )
-        #     # Re-check guards after skip
-        #     if not self._video_frames:
-        #         return None, skipped_speech
-        #     if video_frames_sent >= audio_frames_released:
-        #         return None, skipped_speech
-
-        # Consume the frame to play
-        if not self._video_frames:
-            return None, skipped_speech
-
-        # Check for silence transition (may have been exposed by skip)
-        if self._pending_silence_start and self._video_frames[0].is_silence():
-            frame = self._video_frames.popleft()
-            await self._stop_audio_playback()
-            self._pending_silence_start = False
-            return frame, skipped_speech
-
         frame = self._video_frames.popleft()
-        return frame, skipped_speech
+        return frame, 0
 
-    async def _consume_idle_frame(self) -> Optional[VideoFrame]:
+    async def _consume_idle_frame(self, num_next_silence_frames: int) -> Optional[VideoFrame]:
         """Consume one video frame in idle (silence) mode.
 
         Plays frames at normal 25fps rate. Handles instant-cut discard logic.
@@ -595,53 +528,52 @@ class OjinVideoService(FrameProcessor):
         if not self._video_frames:
             return None
 
-        # Don't consume first_speech_frame in idle — wait for audio
-        if self._video_frames[0].is_first_speech_frame and not self._discard_speech_until_silence:
-            return None
-
-        # Instant-cut: discard speech frames until first post-interrupt silence
-        if self._discard_speech_until_silence:
-            while self._video_frames:
-                front = self._video_frames[0]
-                if front.is_silence():
-                    self._discard_speech_until_silence = False
-                    break
-                discarded = self._video_frames.popleft()
-                if self._settings.frame_debugging_enabled:
-                    logger.debug(f"Discarding stale speech frame idx:{discarded.frame_idx}")
-            if not self._video_frames:
-                return None
-
         frame = self._video_frames.popleft()
-
-        # Clear pending silence flag
-        if self._pending_silence_start and frame.is_silence():
-            self._pending_silence_start = False
-
+        num_next_silence_frames -= 1
         # Buffer management for silence frames
-        if frame.is_silence() and len(self._video_frames) > 0:
-            all_silence = all(f.is_silence() for f in self._video_frames)
-            if all_silence and len(self._video_frames) > MAX_FRAMES_BUFFER:
-                self._video_frames.popleft()
-                if self._settings.frame_debugging_enabled:
-                    logger.debug(
-                        f"Skipping silence frame: {len(self._video_frames)}, "
-                        f"target: {MAX_FRAMES_BUFFER}"
-                    )
+        if num_next_silence_frames > MAX_FRAMES_BUFFER:
+            self._video_frames.popleft()
+            num_next_silence_frames -= 1
+            if self._settings.frame_debugging_enabled:
+                logger.debug(
+                    f"Skipping silence frame num_next_silence_frames: {num_next_silence_frames}, "
+                    f"target: {MAX_FRAMES_BUFFER}"
+                )
 
+        if self.is_pending_speech_waiting_in_buffer() and num_next_silence_frames:
+            self._video_frames.popleft()
+            num_next_silence_frames -= 1
+            if self._settings.frame_debugging_enabled:
+                logger.debug(
+                    f"Skipping additional silence frame num_next_silence_frames: {num_next_silence_frames}"
+                )
         return frame
+
+    def is_pending_speech_waiting_in_buffer(self) -> bool:
+        """Check if there are any pending speech frames in the buffer."""
+        return any(frame.is_first_speech_frame for frame in self._video_frames)
+
+    def get_num_next_silence_frames(self) -> int:
+        """Count consecutive silence frames from the front of the buffer."""
+        count = 0
+        for frame in self._video_frames:
+            if frame.is_silence():
+                count += 1
+            else:
+                break
+        return count
 
     async def _start_audio_playback(self):
         logger.warning("Starting audio playback")
-        self._is_speaking = True
+        self._is_playing_speech_audio = True
         await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         await self.stop_ttfb_metrics()
 
     async def _stop_audio_playback(self):
-        if not self._is_speaking:
+        if not self._is_playing_speech_audio:
             return
 
-        self._is_speaking = False
+        self._is_playing_speech_audio = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         self._speech_buffer.clear()
 
@@ -682,7 +614,7 @@ class OjinVideoService(FrameProcessor):
 
     async def _stop(self):
         self._initialized = False
-        self._is_speaking = False
+        self._is_playing_speech_audio = False
         if self._client:
             await self._client.close()
             self._client = None

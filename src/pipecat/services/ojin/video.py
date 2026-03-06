@@ -433,7 +433,7 @@ class OjinVideoService(FrameProcessor):
             num_next_silence_frames = self.get_num_next_silence_frames()
             should_play_speech_video_frame = (
                 num_next_silence_frames == 0 and len(self._video_frames) > 0
-            )
+            ) or (num_next_silence_frames == 1 and len(self._video_frames) > 1)
             should_start_playing_audio = (
                 should_play_speech_video_frame
                 and not self._interrupting
@@ -497,8 +497,7 @@ class OjinVideoService(FrameProcessor):
                 )
                 video_frames_sent += skipped_speech
                 if video_frame is not None:
-                    if not video_frame.is_silence():
-                        video_frames_sent += 1
+                    video_frames_sent += 1
             else:
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
 

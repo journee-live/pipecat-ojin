@@ -633,11 +633,3 @@ class OjinVideoService(FrameProcessor):
             self._video_playback_task = None
 
         logger.debug(f"OjinVideoService {self._settings.config_id} stopped")
-
-    def can_generate_metrics(self) -> bool:
-        """Check if this service can generate processing metrics.
-
-        Returns:
-            True, as OjinVideoService supports metrics generation.
-        """
-        return True

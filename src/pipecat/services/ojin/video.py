@@ -80,7 +80,7 @@ class VideoFrame:
     is_first_speech_frame: bool = False
 
     def is_silence(self) -> bool:
-        return self.volume == 0
+        return self.frame_idx == 0
 
 
 class InterruptStrategy(Enum):
@@ -433,7 +433,7 @@ class OjinVideoService(FrameProcessor):
             num_next_silence_frames = self.get_num_next_silence_frames()
             should_play_speech_video_frame = (
                 num_next_silence_frames == 0 and len(self._video_frames) > 0
-            ) or (num_next_silence_frames == 1 and len(self._video_frames) > 1)
+            )
             should_start_playing_audio = (
                 should_play_speech_video_frame
                 and not self._interrupting

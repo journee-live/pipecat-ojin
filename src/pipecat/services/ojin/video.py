@@ -411,7 +411,13 @@ class OjinVideoService(FrameProcessor):
         num_channels = 1
         chunk_size = int(sample_rate * self._frame_duration) * num_channels * 2
         is_first_audio_frame = True
-
+        audio_frame = None
+        silence_frame = TTSAudioRawFrame(
+            audio=b"\x00" * chunk_size,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+        )
+        output_vide_frame = None
         while self._initialized:
             # Sleep for most of the wait time
             now = time.perf_counter()
@@ -460,7 +466,7 @@ class OjinVideoService(FrameProcessor):
                 self._is_playing_speech_audio = False
                 await self._stop_audio_playback()
 
-            # ── Step 2: Release audio ──
+            # ── Step 2: Prepare audio ──
             if self._is_playing_speech_audio and self._speech_buffer:
                 if len(self._speech_buffer) < chunk_size:
                     audio = bytes(self._speech_buffer)
@@ -478,17 +484,11 @@ class OjinVideoService(FrameProcessor):
                 if is_first_audio_frame:
                     logger.warning(f"First audio frame played! size: {len(audio_frame.audio)}")
                     is_first_audio_frame = False
-                await self.push_frame(audio_frame)
                 audio_frames_released += 1
+            else:
+                audio_frame = None
 
             # ── Step 4: Consume video frame ──
-            if not self._video_frames:
-                if self._last_played_image_bytes:
-                    if self._settings.frame_debugging_enabled:
-                        logger.debug(f"frame miss, repeating frame {frame_count}")
-                    await self.encode_and_send(self._last_played_image_bytes, is_first=False)
-                continue
-
             video_frame: Optional[VideoFrame] = None
 
             if should_play_speech_video_frame:
@@ -498,6 +498,11 @@ class OjinVideoService(FrameProcessor):
                 video_frames_sent += skipped_speech
                 if video_frame is not None:
                     video_frames_sent += 1
+                else:
+                    logger.debug(f"frame miss, repeating frame {frame_count}")
+                    video_frame = VideoFrame(
+                        image_bytes=self._last_played_image_bytes, is_first_speech_frame=False
+                    )
             else:
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
 
@@ -512,9 +517,15 @@ class OjinVideoService(FrameProcessor):
                         f"video_sent: {video_frames_sent}, "
                         f"buffer: {len(self._video_frames)}"
                     )
-                await self.encode_and_send(
+                output_vide_frame = await self.prepare_video_frame(
                     video_frame.image_bytes, video_frame.is_first_speech_frame
                 )
+                await self.push_frame(output_vide_frame)
+
+            if audio_frame is not None:
+                await self.push_frame(audio_frame)
+            else:
+                await self.push_frame(silence_frame)
 
     async def _consume_speech_frame(
         self, audio_frames_released: int, video_frames_sent: int
@@ -592,7 +603,9 @@ class OjinVideoService(FrameProcessor):
         # Start an interaction for continuous streaming
         await self._client.start_interaction()
 
-    async def encode_and_send(self, video: bytes, is_first: bool = False):
+    async def prepare_video_frame(
+        self, video: bytes, is_first: bool = False
+    ) -> OutputImageRawFrame:
         image_array = np.frombuffer(video, dtype=np.uint8)
         image_size = self._settings.image_size
         decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -612,8 +625,8 @@ class OjinVideoService(FrameProcessor):
             rgb_frame.pts = int(time.monotonic() * 1_000_000_000)
             if is_first:
                 logger.warning(f"First image frame played!")
-            await self.push_frame(rgb_frame, FrameDirection.DOWNSTREAM)
-        pass
+            return rgb_frame
+        return None
 
     async def _stop(self):
         self._initialized = False

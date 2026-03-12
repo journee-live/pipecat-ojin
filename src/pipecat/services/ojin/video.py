@@ -166,6 +166,7 @@ class OjinVideoService(FrameProcessor):
         self._waiting_for_first_tts = False
         self._current_frame_idx = -1
         self._played_frame_idx = -1
+        self._first_silence_frame: VideoFrame = None
         self._last_played_image_bytes: Optional[bytes] = None
 
         # Audio input handling
@@ -260,6 +261,9 @@ class OjinVideoService(FrameProcessor):
                     self._video_frames.clear()
                     self._speech_buffer.clear()
                     self._discard_speech_until_silence = True
+                    self._video_frames.append(self._first_silence_frame)
+                    self._turn += 1
+                    self._last_frame_idx = 0
                     await self._stop_audio_playback()
                 elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
                     # Stop audio immediately, keep video for smooth transition
@@ -355,6 +359,17 @@ class OjinVideoService(FrameProcessor):
                 is_final=message.is_final_response,
                 volume=volume,
             )
+
+            if self._interrupting and not video_frame.is_silence():
+                logger.debug("Interrupting, dropping non-silence frame")
+                return
+
+            if self._interrupting and video_frame.is_silence():
+                logger.debug("First silence received after end of interruption")
+                self._interrupting = False
+
+            if self._first_silence_frame is None and video_frame.is_silence():
+                self._first_silence_frame = video_frame
 
             if self._last_frame_idx == 0 and not video_frame.is_silence():
                 excess = max(0, len(self._video_frames) - MIN_FRAMES_BUFFER)

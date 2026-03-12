@@ -112,10 +112,10 @@ class OjinVideoSettings:
     stopped_speaking_delay_s: float = field(default=0.5)  # Delay before sending StoppedSpeaking
     frame_debugging_enabled: bool = field(default=False)
     start_frame_cls: Type[Frame] = field(default=StartFrame)
-    interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO)
+    interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 6
+OJIN_VIDEO_SERVICE_VERSION = 20
 
 
 class OjinVideoService(FrameProcessor):
@@ -356,13 +356,19 @@ class OjinVideoService(FrameProcessor):
                 volume=volume,
             )
 
+            if self._last_frame_idx == 0 and not video_frame.is_silence():
+                excess = max(0, len(self._video_frames) - MIN_FRAMES_BUFFER)
+                if excess > 0:
+                    for _ in range(excess):
+                        self._video_frames.popleft()
+                    logger.warning(
+                        f"First speech frame: dropped {excess} frames, buffer now {len(self._video_frames)}"
+                    )
+                video_frame.is_first_speech_frame = True
+
             if frame_idx != self._last_frame_idx:
                 self._turn += 1
                 self._last_frame_idx = frame_idx
-
-            if self._pending_speech_start and not video_frame.is_silence():
-                self._pending_speech_start = False
-                video_frame.is_first_speech_frame = True
 
             self._video_frames.append(video_frame)
 

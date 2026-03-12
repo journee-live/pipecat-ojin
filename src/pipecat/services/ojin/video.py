@@ -28,7 +28,7 @@ from ojin.ojin_client_messages import (
 from ojin.profiling_utils import FPSTracker
 from pydantic import BaseModel
 
-from pipecat.audio.utils import create_default_resampler
+from pipecat.audio.utils import create_default_resampler, is_silence
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -332,9 +332,6 @@ class OjinVideoService(FrameProcessor):
                 self.fps_tracker.start()
             self.fps_tracker.update(1)
 
-            if self.fps_tracker.total_frames % 25 == 0:
-                self.fps_tracker.log()
-
             self.last_frame_time = time.monotonic()
             frame_idx = message.index
             samples = [
@@ -347,6 +344,9 @@ class OjinVideoService(FrameProcessor):
                 logger.debug(
                     f"Received video frame {message.index} [{volume}], delta: {time.monotonic() - self.last_frame_time} buffer: {len(self._video_frames)}"
                 )
+                if self.fps_tracker.total_frames % 25 == 0:
+                    self.fps_tracker.log()
+
             # Queue video frame with bundled audio
             video_frame = VideoFrame(
                 frame_idx=frame_idx,
@@ -417,6 +417,7 @@ class OjinVideoService(FrameProcessor):
             sample_rate=sample_rate,
             num_channels=num_channels,
         )
+        num_silence_frames_played = 0
         output_vide_frame = None
         while self._initialized:
             # Sleep for most of the wait time
@@ -447,7 +448,7 @@ class OjinVideoService(FrameProcessor):
                 and self._speech_buffer
             )
             should_stop_playing_audio = self._is_playing_speech_audio and (
-                num_next_silence_frames > 0 or not self._speech_buffer
+                num_silence_frames_played > 5 or not self._speech_buffer
             )
             # ── Step 1: Silence→speech pre-check ──
             # Requires BOTH first_speech_frame AND audio available.
@@ -507,6 +508,11 @@ class OjinVideoService(FrameProcessor):
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
 
             if video_frame is not None:
+                if video_frame.is_silence():
+                    num_silence_frames_played += 1
+                else:
+                    num_silence_frames_played = 0
+
                 frame_count += 1
                 self._last_played_image_bytes = video_frame.image_bytes
                 if self._settings.frame_debugging_enabled:

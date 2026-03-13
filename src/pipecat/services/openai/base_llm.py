@@ -422,6 +422,7 @@ class BaseOpenAILLMService(LLMService):
                     # Keep iterating through the response to collect all the argument fragments
                     arguments += tool_call.function.arguments
             elif chunk.choices[0].delta.content:
+                logger.info(f"🔍 LLM text chunk: {chunk.choices[0].delta.content!r}")
                 await self.push_frame(LLMTextFrame(chunk.choices[0].delta.content))
 
             # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -475,9 +476,11 @@ class BaseOpenAILLMService(LLMService):
         if isinstance(frame, OpenAILLMContextFrame):
             # Handle OpenAI-specific context frames
             context = frame.context
+            logger.info(f"🔍 LLM received OpenAILLMContextFrame, msg_count={len(context.messages)}")
         elif isinstance(frame, LLMContextFrame):
             # Handle universal (LLM-agnostic) LLM context frames
             context = frame.context
+            logger.info(f"🔍 LLM received LLMContextFrame")
         elif isinstance(frame, LLMMessagesFrame):
             # NOTE: LLMMessagesFrame is deprecated, so we don't support the newer universal
             # LLMContext with it
@@ -489,6 +492,7 @@ class BaseOpenAILLMService(LLMService):
 
         if context:
             try:
+                logger.info(f"🔍 LLM pushing LLMFullResponseStartFrame")
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.start_processing_metrics()
                 await self._process_context(context)
@@ -496,4 +500,5 @@ class BaseOpenAILLMService(LLMService):
                 await self._call_event_handler("on_completion_timeout")
             finally:
                 await self.stop_processing_metrics()
+                logger.info(f"🔍 LLM pushing LLMFullResponseEndFrame")
                 await self.push_frame(LLMFullResponseEndFrame())

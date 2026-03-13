@@ -554,6 +554,9 @@ class TTSService(AIService):
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
             await filter.handle_interruption()
+        # Resume frame processing: the interrupted audio will never trigger
+        # BotStoppedSpeakingFrame, so we must unblock here to prevent deadlock.
+        await self._maybe_resume_frame_processing()
 
     async def _maybe_pause_frame_processing(self):
         if self._processing_text and self._pause_frame_processing:

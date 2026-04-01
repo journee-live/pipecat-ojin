@@ -764,7 +764,18 @@ class FrameProcessor(BaseObject):
         # pushed. Take a look at `push_frame()` to see how we first push the
         # `InterruptionFrame` and then we set the event in order to maintain
         # frame ordering.
-        await self._wait_interruption_event.wait()
+        #
+        # OJIN FIX: Add a timeout to prevent permanent deadlock when rapid
+        # concurrent interruptions cause the InterruptionFrame to be lost or
+        # when two processors call this simultaneously and only one gets
+        # unblocked (the event is set once but two waiters exist).
+        try:
+            await asyncio.wait_for(self._wait_interruption_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{self.name}: interruption wait timed out after 5s — force-resuming "
+                f"to prevent pipeline deadlock"
+            )
 
         # Clean the event.
         self._wait_interruption_event.clear()
@@ -868,6 +879,18 @@ class FrameProcessor(BaseObject):
     async def _start_interruption(self):
         """Start handling an interruption by cancelling current tasks."""
         try:
+            # OJIN FIX: Always clear pause flags on interruption.  The TTS
+            # service pauses frame processing while generating audio
+            # (__should_block_frames=True, __process_event cleared).  If an
+            # interruption arrives during this pause, __reset_process_task()
+            # replaces __process_event with a *new* unset Event while the
+            # process-frame handler is still awaiting the *old* Event —
+            # creating a permanent deadlock.  Clearing the flags here ensures
+            # the handler won't block after the reset, regardless of which
+            # branch below executes.
+            self.__should_block_frames = False
+            self.__should_block_system_frames = False
+
             if self._wait_for_interruption:
                 # If we get here we know the process task was just waiting for
                 # an interruption (push_interruption_task_frame_and_wait()), so
@@ -983,6 +1006,13 @@ class FrameProcessor(BaseObject):
 
         self.__should_block_frames = False
         self.__process_event = asyncio.Event()
+        # OJIN FIX: Set the event immediately so the process-frame handler
+        # does not block on the new Event.  Before this fix, the handler
+        # could be awaiting the *old* Event (replaced above) while the new
+        # Event was left unset — causing a permanent deadlock when an
+        # interruption arrives while frame processing is paused (e.g. TTS
+        # pause_processing_frames).
+        self.__process_event.set()
         self.__reset_process_queue()
 
     def __reset_process_queue(self):

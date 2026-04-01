@@ -30,6 +30,8 @@ from pydantic import BaseModel
 
 from pipecat.audio.utils import create_default_resampler, is_silence
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
@@ -608,6 +610,10 @@ class OjinVideoService(FrameProcessor):
         logger.warning("Starting audio playback")
         self._is_playing_speech_audio = True
         await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
+        # OJIN FIX: Also push standard BotStartedSpeakingFrame upstream so the
+        # input transport tracks _bot_speaking state (used for interruption
+        # gating) and the TTS service knows the bot is speaking.
+        await self.push_frame(BotStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
         await self.stop_ttfb_metrics()
 
     async def _stop_audio_playback(self):
@@ -616,6 +622,13 @@ class OjinVideoService(FrameProcessor):
 
         self._is_playing_speech_audio = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
+        # OJIN FIX: Push standard BotStoppedSpeakingFrame upstream so the TTS
+        # service resumes frame processing.  Without this, TTS pauses after
+        # LLMFullResponseEndFrame and waits for BotStoppedSpeakingFrame to
+        # resume — but the standard output transport never generates it because
+        # the avatar intercepts all audio.  This caused a permanent TTS
+        # deadlock: no subsequent LLM responses could be spoken.
+        await self.push_frame(BotStoppedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
         self._speech_buffer.clear()
 
     async def _start(self):

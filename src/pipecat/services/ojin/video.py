@@ -373,6 +373,20 @@ class OjinVideoService(FrameProcessor):
                 logger.debug("First silence received after end of interruption")
                 self._interrupting = False
 
+            # After INSTANT_CUT the server may still have in-flight speech
+            # frames from the old batch.  TTSStartedFrame for the new
+            # response clears _interrupting, but _discard_speech_until_silence
+            # stays True until the server confirms the cancel by sending
+            # silence.  Drop stale speech so the user never sees the old
+            # animation bleed into the new one.
+            if self._discard_speech_until_silence and not video_frame.is_silence():
+                logger.debug("Discarding stale speech frame (waiting for post-cancel silence)")
+                return
+
+            if self._discard_speech_until_silence and video_frame.is_silence():
+                logger.debug("Post-cancel silence received, resuming frame intake")
+                self._discard_speech_until_silence = False
+
             if self._first_silence_frame is None and video_frame.is_silence():
                 self._first_silence_frame = video_frame
 

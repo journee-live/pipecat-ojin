@@ -482,11 +482,24 @@ class BaseInputTransport(FrameProcessor):
 
             await self.broadcast_frame(UserStartedSpeakingFrame, emulated=emulated)
 
-            # Only push InterruptionFrame if:
-            # 1. No interruption config is set, OR
-            # 2. Interruption config is set but bot is not speaking
+            # Only push InterruptionFrame if the bot is actually speaking.
+            #
+            # OJIN FIX: The original condition
+            #   (not self.interruption_strategies or not self._bot_speaking)
+            # evaluated to True whenever no interruption_strategies were
+            # configured — firing InterruptionFrame on EVERY user speech
+            # event, even when the bot was idle.  Each InterruptionFrame
+            # cancels the STT process task, causing it to drop in-flight
+            # transcriptions.  With rapid user speech this meant the LLM
+            # never received input and the bot appeared dead.
+            #
+            # Fix: gate on self._bot_speaking so we only interrupt when
+            # there is something to interrupt.  When the bot is idle, the
+            # UserStartedSpeakingFrame still propagates normally (broadcast
+            # above) — STT processes the audio undisturbed and the
+            # aggregator handles it.
             should_push_immediate_interruption = (
-                not self.interruption_strategies or not self._bot_speaking
+                self._bot_speaking and not self.interruption_strategies
             )
 
             # Make sure we notify about interruptions quickly out-of-band.

@@ -600,6 +600,10 @@ class OjinVideoService(FrameProcessor):
         """Count consecutive silence frames from the front of the buffer."""
         count = 0
         for frame in self._video_frames:
+            if frame is None:
+                logger.warning("Encountered None frame in buffer")
+                continue
+
             if frame.is_silence() or (frame.volume == 0 and not self._is_playing_speech_audio):
                 count += 1
             else:

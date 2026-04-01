@@ -261,7 +261,12 @@ class OjinVideoService(FrameProcessor):
                     self._video_frames.clear()
                     self._speech_buffer.clear()
                     self._discard_speech_until_silence = True
-                    self._video_frames.append(self._first_silence_frame)
+                    # Guard: _first_silence_frame is None until the server
+                    # sends its first silence.  Appending None crashes the
+                    # playback loop (is_silence() on NoneType) and freezes
+                    # the video permanently.
+                    if self._first_silence_frame is not None:
+                        self._video_frames.append(self._first_silence_frame)
                     self._turn += 1
                     self._last_frame_idx = 0
                     await self._stop_audio_playback()

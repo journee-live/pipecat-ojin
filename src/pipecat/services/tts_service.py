@@ -426,19 +426,28 @@ class TTSService(AIService):
             isinstance(frame, (TextFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame))
             and frame.skip_tts
         ):
+            logger.info(f"🔍 TTS: skip_tts frame {frame.__class__.__name__}, pushing through")
             await self.push_frame(frame, direction)
         elif isinstance(frame, AggregatedTextFrame):
+            logger.info(f"🔍 TTS: AggregatedTextFrame: {frame.text!r}")
             await self._push_tts_frames(frame)
         elif (
             isinstance(frame, TextFrame)
             and not isinstance(frame, InterimTranscriptionFrame)
             and not isinstance(frame, TranscriptionFrame)
         ):
+            logger.info(
+                f"🔍 TTS: TextFrame received: {frame.text!r}, processing_text={self._processing_text}"
+            )
             await self._process_text_frame(frame)
         elif isinstance(frame, InterruptionFrame):
+            logger.info(f"🔍 TTS: InterruptionFrame, processing_text={self._processing_text}")
             await self._handle_interruption(frame, direction)
             await self.push_frame(frame, direction)
         elif isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
+            logger.info(
+                f"🔍 TTS: {frame.__class__.__name__}, processing_text={self._processing_text}, pause_flag={self._pause_frame_processing}"
+            )
             # We pause processing incoming frames if the LLM response included
             # text (it might be that it's only a function calling response). We
             # pause to avoid audio overlapping.
@@ -446,6 +455,8 @@ class TTSService(AIService):
 
             # Flush any remaining text (including text waiting for lookahead)
             remaining = await self._text_aggregator.flush()
+            _rem_text = repr(remaining.text) if remaining else None
+            logger.info(f"🔍 TTS: flushed remaining={_rem_text}")
             if remaining:
                 await self._push_tts_frames(AggregatedTextFrame(remaining.text, remaining.type))
 
@@ -469,6 +480,7 @@ class TTSService(AIService):
         elif isinstance(frame, TTSUpdateSettingsFrame):
             await self._update_settings(frame.settings)
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            logger.info(f"🔍 TTS: BotStoppedSpeakingFrame, will resume processing")
             await self._maybe_resume_frame_processing()
             await self.push_frame(frame, direction)
         else:
@@ -535,18 +547,32 @@ class TTSService(AIService):
             yield frame
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        logger.info(
+            f"🔍 TTS: _handle_interruption called, resetting _processing_text from {self._processing_text} to False"
+        )
         self._processing_text = False
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
             await filter.handle_interruption()
+        # Resume frame processing: the interrupted audio will never trigger
+        # BotStoppedSpeakingFrame, so we must unblock here to prevent deadlock.
+        await self._maybe_resume_frame_processing()
 
     async def _maybe_pause_frame_processing(self):
         if self._processing_text and self._pause_frame_processing:
+            logger.info(f"🔍 TTS: PAUSING frame processing")
             await self.pause_processing_frames()
+        else:
+            logger.info(
+                f"🔍 TTS: NOT pausing (processing_text={self._processing_text}, pause_flag={self._pause_frame_processing})"
+            )
 
     async def _maybe_resume_frame_processing(self):
         if self._pause_frame_processing:
+            logger.info(f"🔍 TTS: RESUMING frame processing")
             await self.resume_processing_frames()
+        else:
+            logger.info(f"🔍 TTS: NOT resuming (pause_flag={self._pause_frame_processing})")
 
     async def _process_text_frame(self, frame: TextFrame):
         text: Optional[str] = None

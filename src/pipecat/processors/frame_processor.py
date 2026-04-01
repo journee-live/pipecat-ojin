@@ -875,13 +875,22 @@ class FrameProcessor(BaseObject):
                 # more things (e.g. pushing a frame after the
                 # interruption). Instead we just drain the queue because this is
                 # an interruption.
+                logger.info(
+                    f"🔍 {self.name}: _start_interruption: wait_for_interruption, resetting process task"
+                )
                 self.__reset_process_task()
             elif isinstance(self.__process_current_frame, UninterruptibleFrame):
                 # We don't want to cancel UninterruptibleFrame, so we simply
                 # cleanup the queue.
+                logger.info(
+                    f"🔍 {self.name}: _start_interruption: uninterruptible frame, resetting queue only (block_frames={self.__should_block_frames})"
+                )
                 self.__reset_process_queue()
             else:
                 # Cancel and re-create the process task.
+                logger.info(
+                    f"🔍 {self.name}: _start_interruption: cancelling+recreating process task (block_frames={self.__should_block_frames})"
+                )
                 await self.__cancel_process_task()
                 self.__create_process_task()
         except Exception as e:

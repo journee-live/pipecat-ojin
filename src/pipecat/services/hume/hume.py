@@ -21,6 +21,7 @@ from hume.empathic_voice.chat.socket_client import (
 from loguru import logger
 from websockets import ConnectionClosed
 
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
     AggregationType,
     CancelFrame,
@@ -80,6 +81,7 @@ class HumeSTSService(LLMService):
         model: str = "evi",
         system_prompt: str | None = None,
         start_frame_cls: type[Frame] | None = None,
+        track_cancelled_conversations: bool = True,
         audio_passthrough: bool = False,
         **kwargs,
     ):
@@ -94,10 +96,12 @@ class HumeSTSService(LLMService):
         self._cm = None
         self.active_conversation: bool = False
         self.active_conversation_id: str | None = None
+        self.track_cancelled_conversations = track_cancelled_conversations
         self.cancelled_conversation_ids: list[str] = []
         self.system_prompt = system_prompt
         self._context: OpenAIRealtimeLLMContext | None = None
         self._hume_context: Context | None = None
+        self._resampler = create_stream_resampler()
         self._time_to_first_audio_list = []
         self._start_frame_cls = start_frame_cls or HumeStartFrame
 
@@ -120,9 +124,11 @@ class HumeSTSService(LLMService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, self._start_frame_cls):
+            logger.info("Starting Hume service")
             await self._connect()
+            await self.push_frame(frame, direction)
         elif isinstance(frame, StartInterruptionFrame):
-            if self.active_conversation_id is not None:
+            if self.active_conversation_id is not None and self.track_cancelled_conversations:
                 self.cancelled_conversation_ids.append(self.active_conversation_id)
             self.active_conversation_id = None
             self.active_conversation = False
@@ -130,14 +136,15 @@ class HumeSTSService(LLMService):
 
         elif isinstance(frame, InputAudioRawFrame):
             if self._connection:
-                encoded_audio = base64.b64encode(frame.audio).decode("utf-8")
-                input = AudioInput(data=encoded_audio)
-                while True:
-                    try:
-                        await self._connection.send_audio_input(input)
-                        break
-                    except ConnectionClosed:
-                        await self.reset_conversation()
+                audio = await self._resampler.resample(frame.audio, frame.sample_rate, 16000)
+                # logger.debug(
+                #     f"Sending audio to Hume, size: {len(audio)} bytes, sample rate: {frame.sample_rate} target_rate: 16000"
+                # )
+                await self._connection.send_audio_input(
+                    AudioInput(data=base64.b64encode(audio).decode("utf-8"))
+                )
+            # else:
+            #     logger.debug(f"Not connection with hume but receiving audio input")
             if self._audio_passthrough:
                 await self.push_frame(frame, direction)
 
@@ -201,6 +208,7 @@ class HumeSTSService(LLMService):
         logger.trace(f"Received message from Hume: {message}")
         msg_type = message.type
         if hasattr(message, "id") and message.id in self.cancelled_conversation_ids:
+            logger.info(f"Skipping message from cancelled conversation {message.id}")
             return
 
         if msg_type == "audio_output":
@@ -235,7 +243,9 @@ class HumeSTSService(LLMService):
             logger.info(message)
             content: str = message.message.content
             await self.push_frame(LLMTextFrame(text=content))
-            await self.push_frame(TTSTextFrame(text=content, aggregated_by=AggregationType.SENTENCE))
+            await self.push_frame(
+                TTSTextFrame(text=content, aggregated_by=AggregationType.SENTENCE)
+            )
         elif msg_type == "user_message":
             content: str = message.message.content
             logger.info(message)

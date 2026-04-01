@@ -421,8 +421,7 @@ class BaseOpenAILLMService(LLMService):
                 if tool_call.function and tool_call.function.arguments:
                     # Keep iterating through the response to collect all the argument fragments
                     arguments += tool_call.function.arguments
-            elif chunk.choices[0].delta.content:
-                logger.info(f"🔍 LLM text chunk: {chunk.choices[0].delta.content!r}")
+            elif chunk.choices[0].delta.content:                
                 await self.push_frame(LLMTextFrame(chunk.choices[0].delta.content))
 
             # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm

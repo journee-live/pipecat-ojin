@@ -559,6 +559,9 @@ class OjinVideoService(FrameProcessor):
     async def _consume_speech_frame(
         self, audio_frames_released: int, video_frames_sent: int
     ) -> tuple[Optional[VideoFrame], int]:
+        frame = None
+        while frame is None:            
+            frame = self._video_frames.popleft()
         frame = self._video_frames.popleft()
         return frame, 0
 
@@ -570,8 +573,9 @@ class OjinVideoService(FrameProcessor):
         """
         if not self._video_frames:
             return None
-
-        frame = self._video_frames.popleft()
+        frame = None
+        while frame is None:            
+            frame = self._video_frames.popleft()
         num_next_silence_frames -= 1
         # Buffer management for silence frames
         if num_next_silence_frames > MAX_FRAMES_BUFFER:

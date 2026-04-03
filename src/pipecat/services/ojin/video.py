@@ -113,6 +113,9 @@ class OjinVideoSettings:
     frame_debugging_enabled: bool = field(default=False)
     start_frame_cls: Type[Frame] = field(default=StartFrame)
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
+    # Silence to prepend before the first TTS audio (ms). Helps absorb
+    # network jitter on the receiving end so the opening words aren't clipped.
+    speech_lead_silence_ms: int = field(default=0)
 
 
 OJIN_VIDEO_SERVICE_VERSION = 20
@@ -167,6 +170,7 @@ class OjinVideoService(FrameProcessor):
         self._current_frame_idx = -1
         self._played_frame_idx = -1
         self._first_silence_frame: VideoFrame = None
+        self._lead_silence_injected: bool = False
         self._last_played_image_bytes: Optional[bytes] = None
 
         # Audio input handling
@@ -294,6 +298,24 @@ class OjinVideoService(FrameProcessor):
         resampled_audio = await self._resampler.resample(
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
+
+        # Prepend lead silence before the very first TTS audio to give the
+        # transport time to stabilise (avoids clipped opening words).
+        if not self._lead_silence_injected and self._settings.speech_lead_silence_ms > 0:
+            self._lead_silence_injected = True
+            num_silence_bytes = (
+                int(OJIN_PERSONA_SAMPLE_RATE * self._settings.speech_lead_silence_ms / 1000) * 2
+            )
+            silence = b"\x00" * num_silence_bytes
+            logger.info(
+                f"Injecting {self._settings.speech_lead_silence_ms}ms lead silence "
+                f"({num_silence_bytes} bytes)"
+            )
+            self._speech_buffer.extend(silence)
+            await self._client.send_message(
+                OjinAudioInputMessage(audio_int16_bytes=silence)
+            )
+
         self._speech_buffer.extend(resampled_audio)
 
         if self._waiting_for_first_tts:

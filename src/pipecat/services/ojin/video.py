@@ -169,6 +169,12 @@ class OjinVideoService(FrameProcessor):
         self._first_silence_frame: VideoFrame = None
         self._last_played_image_bytes: Optional[bytes] = None
 
+        # Playback pause/resume — paused on start so frames buffer until
+        # the client joins the room and calls resume_playback().
+        self._playback_paused = True
+        self._playback_resume_event = asyncio.Event()
+        self._max_buffered_frames = 300
+
         # Audio input handling
         self._resampler = create_default_resampler()
 
@@ -192,6 +198,24 @@ class OjinVideoService(FrameProcessor):
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
         return True
+
+    def pause_playback(self) -> None:
+        """Pause the playback loop. Frames keep being generated and buffered."""
+        if not self._playback_paused:
+            self._playback_paused = True
+            self._playback_resume_event.clear()
+            logger.info("OjinVideoService: playback paused")
+
+    def resume_playback(self) -> None:
+        """Resume the playback loop. Buffered frames will play at normal rate."""
+        if self._playback_paused:
+            self._playback_paused = False
+            self._playback_resume_event.set()
+            logger.info(
+                f"OjinVideoService: playback resumed "
+                f"(buffered: {len(self._video_frames)} video, "
+                f"{len(self._speech_buffer)} audio bytes)"
+            )
 
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
@@ -406,6 +430,17 @@ class OjinVideoService(FrameProcessor):
 
             self._video_frames.append(video_frame)
 
+            # OJIN FIX: Cap the buffer while playback is paused to prevent
+            # unbounded memory growth. Drop oldest frames first.
+            if len(self._video_frames) > self._max_buffered_frames:
+                dropped = len(self._video_frames) - self._max_buffered_frames
+                for _ in range(dropped):
+                    self._video_frames.popleft()
+                logger.warning(
+                    f"Buffer overflow: dropped {dropped} oldest frames "
+                    f"(cap={self._max_buffered_frames})"
+                )
+
         elif isinstance(message, ErrorResponseMessage):
             await self.push_error(
                 error_msg=f"Ojin server error: {message.payload.code}", fatal=True
@@ -460,6 +495,14 @@ class OjinVideoService(FrameProcessor):
         num_silence_frames_played = 0
         output_vide_frame = None
         while self._initialized:
+            # OJIN FIX: Wait while playback is paused (frames keep buffering).
+            # When resumed, reset the frame clock so we don't try to catch up.
+            if self._playback_paused:
+                await self._playback_resume_event.wait()
+                next_frame_time = time.perf_counter() + self._frame_duration
+                initial_buffer = 6
+                continue
+
             # Sleep for most of the wait time
             now = time.perf_counter()
             sleep_time = next_frame_time - now - 0.003

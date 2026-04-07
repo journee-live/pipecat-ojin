@@ -263,6 +263,26 @@ class BaseOpenAILLMService(LLMService):
         params.update(params_from_context)
 
         params.update(self._settings["extra"])
+
+        # OJIN DIAG: Log exactly what we're sending to the LLM API
+        tools_param = params.get("tools")
+        tool_choice_param = params.get("tool_choice")
+        _has_tools = tools_param is not None and tools_param is not NOT_GIVEN and bool(tools_param)
+        if _has_tools:
+            _tool_names = [
+                t.get("function", {}).get("name", "?")
+                for t in tools_param
+                if isinstance(t, dict)
+            ]
+            logger.info(
+                f"🔧 {self}: API request tools={_tool_names}, "
+                f"tool_choice={tool_choice_param}, model={params.get('model')}"
+            )
+        else:
+            logger.info(
+                f"🔧 {self}: API request with NO tools, model={params.get('model')}"
+            )
+
         return params
 
     async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
@@ -430,6 +450,18 @@ class BaseOpenAILLMService(LLMService):
                 "transcript"
             ):
                 await self.push_frame(LLMTextFrame(chunk.choices[0].delta.audio["transcript"]))
+
+        # OJIN DIAG: Log whether the LLM returned native tool_calls or text-only
+        if function_name:
+            logger.info(
+                f"🔧 {self}: API response contains NATIVE tool_calls: "
+                f"{functions_list + [function_name]}, "
+                f"ids={tool_id_list + [tool_call_id]}"
+            )
+        else:
+            logger.info(
+                f"🔧 {self}: API response contains NO native tool_calls (text-only output)"
+            )
 
         # if we got a function name and arguments, check to see if it's a function with
         # a registered handler. If so, run the registered callback, save the result to

@@ -552,7 +552,7 @@ class OjinVideoService(FrameProcessor):
 
             # ── Step 2: Prepare audio ──
             if self._is_playing_speech_audio and self._speech_buffer:
-                if len(self._speech_buffer) < chunk_size:
+                if len(self._speech_buffer) < chunk_size:                    
                     audio = bytes(self._speech_buffer)
                     self._speech_buffer.clear()
                 else:
@@ -569,6 +569,16 @@ class OjinVideoService(FrameProcessor):
                     logger.warning(f"First audio frame played! size: {len(audio_frame.audio)}")
                     is_first_audio_frame = False
                 audio_frames_released += 1
+            elif self._is_playing_speech_audio and not self._speech_buffer:
+                # OJIN FIX: Complete audio starvation — speech mode but no
+                # audio data at all.  This is the primary micro-freeze trigger.
+                logger.warning(
+                    f"[UNDERRUN] speech_buffer: EMPTY during speech playback, "
+                    f"audio_released={audio_frames_released}, "
+                    f"video_sent={video_frames_sent}, "
+                    f"video_buf={len(self._video_frames)}"
+                )
+                audio_frame = None
             else:
                 audio_frame = None
 
@@ -576,6 +586,14 @@ class OjinVideoService(FrameProcessor):
             video_frame: Optional[VideoFrame] = None
 
             if should_play_speech_video_frame:
+                # OJIN FIX: Log video buffer underrun before consuming
+                if len(self._video_frames) == 0:
+                    logger.warning(
+                        f"[UNDERRUN] video_frames: buffer empty during speech, "
+                        f"frame_count={frame_count}, "
+                        f"audio_released={audio_frames_released}, "
+                        f"speech_buf={len(self._speech_buffer)}B"
+                    )
                 video_frame, skipped_speech = await self._consume_speech_frame(
                     audio_frames_released, video_frames_sent
                 )
@@ -583,7 +601,10 @@ class OjinVideoService(FrameProcessor):
                 if video_frame is not None:
                     video_frames_sent += 1
                 else:
-                    logger.debug(f"frame miss, repeating frame {frame_count}")
+                    logger.warning(
+                        f"[UNDERRUN] video_frames: frame miss at {frame_count}, "
+                        f"repeating last frame"
+                    )
                     video_frame = VideoFrame(
                         image_bytes=self._last_played_image_bytes, is_first_speech_frame=False
                     )
@@ -598,6 +619,19 @@ class OjinVideoService(FrameProcessor):
 
                 frame_count += 1
                 self._last_played_image_bytes = video_frame.image_bytes
+
+                # OJIN FIX: Periodic buffer health log (every 50 frames = 2s)
+                if frame_count % 50 == 0 and self.fps_tracker is not None:
+                    mode = "SPEECH" if self._is_playing_speech_audio else "IDLE"
+                    logger.info(
+                        f"[BUFFER] mode={mode} frame={frame_count} "
+                        f"video_buf={len(self._video_frames)} "
+                        f"speech_buf={len(self._speech_buffer)}B "
+                        f"audio_released={audio_frames_released} "
+                        f"video_sent={video_frames_sent} "
+                        f"fps={self.fps_tracker.partial_average_fps:.1f}"
+                    )
+
                 if self._settings.frame_debugging_enabled:
                     mode = "SPEECH" if self._is_playing_speech_audio else "SILENCE"
                     logger.debug(

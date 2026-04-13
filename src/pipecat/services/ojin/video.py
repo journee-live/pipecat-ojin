@@ -458,6 +458,8 @@ class OjinVideoService(FrameProcessor):
                 initial_buffer -= 1
                 continue
 
+            pts = int(time.monotonic() * 1_000_000_000)
+
             num_next_silence_frames = self.get_num_next_silence_frames()
             should_play_speech_video_frame = (
                 num_next_silence_frames == 0 and len(self._video_frames) > 0
@@ -502,7 +504,7 @@ class OjinVideoService(FrameProcessor):
                     sample_rate=sample_rate,
                     num_channels=num_channels,
                 )
-                audio_frame.pts = int(time.monotonic() * 1_000_000_000)
+                audio_frame.pts = pts
                 if is_first_audio_frame:
                     logger.warning(f"First audio frame played! size: {len(audio_frame.audio)}")
                     is_first_audio_frame = False
@@ -545,7 +547,7 @@ class OjinVideoService(FrameProcessor):
                         f"buffer: {len(self._video_frames)}"
                     )
                 output_vide_frame = await self.prepare_video_frame(
-                    video_frame.image_bytes, video_frame.is_first_speech_frame
+                    video_frame.image_bytes, video_frame.is_first_speech_frame, pts
                 )
                 await self.push_frame(output_vide_frame)
 
@@ -631,7 +633,7 @@ class OjinVideoService(FrameProcessor):
         await self._client.start_interaction()
 
     async def prepare_video_frame(
-        self, video: bytes, is_first: bool = False
+        self, video: bytes, is_first: bool = False, pts: int = int(time.monotonic() * 1_000_000_000)
     ) -> OutputImageRawFrame:
         image_array = np.frombuffer(video, dtype=np.uint8)
         image_size = self._settings.image_size
@@ -649,7 +651,7 @@ class OjinVideoService(FrameProcessor):
             rgb_bytes = rgb_image.tobytes()
 
             rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(new_w, new_h), format="RGB")
-            rgb_frame.pts = int(time.monotonic() * 1_000_000_000)
+            rgb_frame.pts = pts
             if is_first:
                 logger.warning(f"First image frame played!")
             return rgb_frame

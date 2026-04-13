@@ -633,8 +633,11 @@ class OjinVideoService(FrameProcessor):
         await self._client.start_interaction()
 
     async def prepare_video_frame(
-        self, video: bytes, is_first: bool = False, pts: int = int(time.monotonic() * 1_000_000_000)
+    async def prepare_video_frame(
+        self, video: bytes, is_first: bool = False, pts: Optional[int] = None
     ) -> OutputImageRawFrame:
+        if pts is None:
+            pts = int(time.monotonic() * 1_000_000_000)
         image_array = np.frombuffer(video, dtype=np.uint8)
         image_size = self._settings.image_size
         decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)

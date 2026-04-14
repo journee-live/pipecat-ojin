@@ -633,7 +633,6 @@ class OjinVideoService(FrameProcessor):
         await self._client.start_interaction()
 
     async def prepare_video_frame(
-    async def prepare_video_frame(
         self, video: bytes, is_first: bool = False, pts: Optional[int] = None
     ) -> OutputImageRawFrame:
         if pts is None:

@@ -709,9 +709,6 @@ class OjinVideoService(FrameProcessor):
         await self.stop_ttfb_metrics()
 
     async def _stop_audio_playback(self):
-        if not self._is_playing_speech_audio:
-            return
-
         self._is_playing_speech_audio = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         self._speech_buffer.clear()

@@ -8,12 +8,14 @@
 import sys
 from unittest.mock import MagicMock
 
-# The 'ojin' package (provided by ojin-client) is required by pipecat's
-# ojin services at import time, but CI does not install it (--extra ojin
-# is intentionally excluded from the workflow's `uv sync` call). Stub the
-# modules we transitively pull in so the test file can import
-# OjinVideoService without the real package present.
+# The 'ojin' package (provided by ojin-client) and cv2 (opencv-python,
+# from --extra webrtc) are imported at module load by
+# pipecat.services.ojin.video, but CI's tests workflow installs neither.
+# Stub them so the test file can import OjinVideoService; the test only
+# exercises _stop_audio_playback, which does not touch any stubbed
+# attribute at runtime.
 for _name in (
+    "cv2",
     "ojin",
     "ojin.entities",
     "ojin.entities.interaction_messages",

@@ -3,12 +3,31 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+"""Regression tests for OjinVideoService._stop_audio_playback."""
 
-import unittest
-from unittest.mock import AsyncMock, MagicMock
+import sys
+from unittest.mock import MagicMock
 
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ojin.video import (
+# The 'ojin' package (provided by ojin-client) is required by pipecat's
+# ojin services at import time, but CI does not install it (--extra ojin
+# is intentionally excluded from the workflow's `uv sync` call). Stub the
+# modules we transitively pull in so the test file can import
+# OjinVideoService without the real package present.
+for _name in (
+    "ojin",
+    "ojin.entities",
+    "ojin.entities.interaction_messages",
+    "ojin.ojin_client",
+    "ojin.ojin_client_messages",
+    "ojin.profiling_utils",
+):
+    sys.modules.setdefault(_name, MagicMock())
+
+import unittest  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+from pipecat.processors.frame_processor import FrameDirection  # noqa: E402
+from pipecat.services.ojin.video import (  # noqa: E402
     OjinBotStoppedSpeakingFrame,
     OjinVideoService,
     OjinVideoSettings,
@@ -56,9 +75,7 @@ class TestStopAudioPlayback(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(service._is_playing_speech_audio)
         self.assertEqual(len(service._speech_buffer), 0)
         service.push_frame.assert_awaited_once()
-        self.assertIsInstance(
-            service.push_frame.call_args.args[0], OjinBotStoppedSpeakingFrame
-        )
+        self.assertIsInstance(service.push_frame.call_args.args[0], OjinBotStoppedSpeakingFrame)
 
     async def test_idempotent_across_repeated_calls(self):
         # Calling twice in a row should remain consistent: the flag stays

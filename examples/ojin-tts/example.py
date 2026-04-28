@@ -20,21 +20,21 @@ from loguru import logger
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, TextFrame, LLMFullResponseEndFrame, TTSSpeakFrame
+from pipecat.frames.frames import Frame, LLMFullResponseEndFrame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.whisper.stt import WhisperSTTService, Model
 from pipecat.services.ojin.tts import OjinTTSService, OjinTTSServiceSettings
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.whisper.stt import Model, WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
 
 class LLMFullResponseAggregator(FrameProcessor):
     """Aggregates LLM text tokens into a complete response before sending to TTS.
-    
+
     This processor buffers all TextFrames until LLMFullResponseEndFrame is received,
     then emits a single TTSSpeakFrame with the complete text. This allows TTS to
     have full context for better prosody and intonation.
@@ -62,6 +62,7 @@ class LLMFullResponseAggregator(FrameProcessor):
             # Pass through other frames
             await self.push_frame(frame, direction)
 
+
 load_dotenv(override=True)
 
 logger.remove(0)
@@ -70,13 +71,13 @@ logger.add(sys.stderr, level="DEBUG")
 
 async def main():
     """Run the speech-to-speech pipeline."""
-    
+
     # Validate environment variables
     openai_api_key = os.getenv("OPENAI_API_KEY")
     ojin_api_key = os.getenv("OJIN_API_KEY")
     ojin_config_id = os.getenv("OJIN_TTS_CONFIG_ID")
     ws_url = os.getenv("OJIN_WS_URL", "wss://models.ojin.ai/realtime")
-    
+
     if not openai_api_key:
         logger.error("OPENAI_API_KEY not set in environment")
         return
@@ -102,7 +103,7 @@ async def main():
     # Speech-to-Text using local Whisper (CPU mode for compatibility)
     stt = WhisperSTTService(
         model=Model.TINY,  # Use tiny model for faster inference
-        device="cpu",      # Force CPU to avoid CUDA dependency
+        device="cpu",  # Force CPU to avoid CUDA dependency
     )
 
     # LLM using OpenAI
@@ -163,14 +164,14 @@ async def main():
     # Audio In -> STT -> User Context -> LLM -> Aggregator -> TTS -> Audio Out -> Assistant Context
     pipeline = Pipeline(
         [
-            audio_transport.input(),       # Microphone input + VAD
-            stt,                           # Speech-to-Text (Whisper)
-            context_aggregator.user(),     # Add user message to context
-            llm,                           # LLM generates response tokens
-            response_aggregator,           # Buffer full response before TTS
-            tts,                           # Ojin TTS converts to audio
-            audio_transport.output(),      # Speaker output
-            context_aggregator.assistant(), # Add assistant response to context
+            audio_transport.input(),  # Microphone input + VAD
+            stt,  # Speech-to-Text (Whisper)
+            context_aggregator.user(),  # Add user message to context
+            llm,  # LLM generates response tokens
+            response_aggregator,  # Buffer full response before TTS
+            tts,  # Ojin TTS converts to audio
+            audio_transport.output(),  # Speaker output
+            context_aggregator.assistant(),  # Add assistant response to context
         ]
     )
 
@@ -186,7 +187,7 @@ async def main():
 
     # Run the pipeline (handle_sigint=False for Windows compatibility)
     runner = PipelineRunner(handle_sigint=False)
-    
+
     logger.info("=" * 50)
     logger.info("Speech-to-Speech Pipeline Started!")
     logger.info("Speak into your microphone to interact.")

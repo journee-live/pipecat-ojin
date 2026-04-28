@@ -80,6 +80,7 @@ class VideoFrame:
     is_first_speech_frame: bool = False
 
     def is_silence(self) -> bool:
+        """Return True if this frame is a silence placeholder (frame_idx == 0)."""
         return self.frame_idx == 0
 
 
@@ -132,6 +133,7 @@ class OjinVideoService(FrameProcessor):
         settings: OjinVideoSettings,
         client: IOjinClient | None = None,
     ) -> None:
+        """Initialize the OjinVideoService with settings and an optional Ojin client."""
         super().__init__(name="ojin")
         logger.debug(
             f"OjinVideoService initialized with settings {settings} version: {OJIN_VIDEO_SERVICE_VERSION}"
@@ -554,7 +556,7 @@ class OjinVideoService(FrameProcessor):
 
             # ── Step 2: Prepare audio ──
             if self._is_playing_speech_audio and self._speech_buffer:
-                if len(self._speech_buffer) < chunk_size:                    
+                if len(self._speech_buffer) < chunk_size:
                     audio = bytes(self._speech_buffer)
                     self._speech_buffer.clear()
                 else:
@@ -728,6 +730,7 @@ class OjinVideoService(FrameProcessor):
     async def prepare_video_frame(
         self, video: bytes, is_first: bool = False, pts: Optional[int] = None
     ) -> OutputImageRawFrame:
+        """Decode raw video bytes and wrap them in an OutputImageRawFrame for the transport."""
         if pts is None:
             pts = int(time.monotonic() * 1_000_000_000)
         image_array = np.frombuffer(video, dtype=np.uint8)

@@ -612,6 +612,16 @@ class OjinVideoService(FrameProcessor):
                     )
             else:
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
+                # OJIN FIX: keep WebRTC video track alive during empty-buffer
+                # stretches by repeating the last played image. Otherwise the
+                # IDLE branch silently skips push_frame() at line 648 and the
+                # video RTP track goes dark; STUN consent freshness (Daily/
+                # mediasoup runs ~5s, fails after 3 misses ≈ 15s) then trips.
+                if video_frame is None and self._last_played_image_bytes is not None:
+                    video_frame = VideoFrame(
+                        image_bytes=self._last_played_image_bytes,
+                        is_first_speech_frame=False,
+                    )
 
             if video_frame is not None:
                 if video_frame.is_silence():

@@ -39,6 +39,7 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStartedFrame,
     UserStartedSpeakingFrame,
+    InterruptionTaskFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -271,7 +272,12 @@ class OjinVideoService(FrameProcessor):
             await self._stop()
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
-            if not self._interrupting and self._client is not None:
+            logger.debug("UserStartedSpeakingFrame received")
+            if (
+                not self._interrupting
+                and self._client is not None
+                and self._is_playing_speech_audio
+            ):
                 logger.debug("Start interrupting")
                 self._interrupting = True
                 self._waiting_for_first_tts = False
@@ -554,7 +560,7 @@ class OjinVideoService(FrameProcessor):
 
             # ── Step 2: Prepare audio ──
             if self._is_playing_speech_audio and self._speech_buffer:
-                if len(self._speech_buffer) < chunk_size:                    
+                if len(self._speech_buffer) < chunk_size:
                     audio = bytes(self._speech_buffer)
                     self._speech_buffer.clear()
                 else:

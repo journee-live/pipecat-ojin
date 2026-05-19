@@ -848,9 +848,16 @@ class LiveKitInputTransport(BaseInputTransport):
         """Push an application message as an input transport frame.
 
         Args:
-            message: The message data to send.
+            message: The message data to send. Raw strings are JSON-parsed
+                so downstream processors receive a dict, matching Daily's
+                behaviour where the SDK pre-parses app messages.
             sender: ID of the message sender.
         """
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                pass
         frame = InputTransportMessageFrame(message=message)
         await self.push_frame(frame)
 

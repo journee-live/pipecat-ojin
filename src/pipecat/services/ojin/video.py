@@ -651,7 +651,8 @@ class OjinVideoService(FrameProcessor):
                 output_vide_frame = await self.prepare_video_frame(
                     video_frame.image_bytes, video_frame.is_first_speech_frame, pts
                 )
-                await self.push_frame(output_vide_frame)
+                if output_vide_frame is not None:
+                    await self.push_frame(output_vide_frame)
 
             if audio_frame is not None:
                 await self.push_frame(audio_frame)

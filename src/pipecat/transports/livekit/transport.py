@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ImageRawFrame,
+    InputTransportMessageFrame,
     OutputAudioRawFrame,
     OutputDTMFFrame,
     OutputDTMFUrgentFrame,
@@ -844,13 +845,20 @@ class LiveKitInputTransport(BaseInputTransport):
         await self._transport.cleanup()
 
     async def push_app_message(self, message: Any, sender: str):
-        """Push an application message as an urgent transport frame.
+        """Push an application message as an input transport frame.
 
         Args:
-            message: The message data to send.
+            message: The message data to send. Raw strings are JSON-parsed
+                so downstream processors receive a dict, matching Daily's
+                behaviour where the SDK pre-parses app messages.
             sender: ID of the message sender.
         """
-        frame = LiveKitOutputTransportMessageUrgentFrame(message=message, participant_id=sender)
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        frame = InputTransportMessageFrame(message=message)
         await self.push_frame(frame)
 
     async def _audio_in_task_handler(self):
@@ -1101,7 +1109,7 @@ class LiveKitOutputTransport(BaseOutputTransport):
         by the LiveKit buffer types we recognise.
         """
         width, height = frame.size
-        buffer_type = _PIPECAT_FORMAT_TO_LIVEKIT_BUFFER.get(frame.format.upper())
+        buffer_type = _PIPECAT_FORMAT_TO_LIVEKIT_BUFFER.get((frame.format or "").upper())
         if buffer_type is None:
             raise ValueError(
                 f"Unsupported OutputImageRawFrame format {frame.format!r}; "

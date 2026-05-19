@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
+"""Ojin TTS service: streams text to the Ojin inference server and yields audio frames."""
 
 import asyncio
 import os
@@ -72,6 +73,7 @@ class OjinTTSService(TTSService):
         client: IOjinClient | None = None,
         **kwargs,
     ) -> None:
+        """Initialize the OjinTTSService with settings and an optional Ojin client."""
         super().__init__(sample_rate=settings.sample_rate, **kwargs)
         logger.debug(f"OjinTTSService initialized with settings {settings}")
 
@@ -93,6 +95,7 @@ class OjinTTSService(TTSService):
         self._audio_queue: asyncio.Queue[OjinInteractionResponseMessage | None] = asyncio.Queue()
 
     def can_generate_metrics(self) -> bool:
+        """Enable TTFB metrics reporting via the standard pipecat metrics system."""
         return True
 
     async def connect_with_retry(self) -> bool:
@@ -324,5 +327,6 @@ class OjinTTSServiceInitializedFrame(Frame):
     """Frame indicating that the TTS service has been initialized."""
 
     def __init__(self, session_data: Optional[Dict[str, Any]] = None):
+        """Initialize the frame with optional session metadata from the Ojin server."""
         super().__init__()
         self.session_data = session_data

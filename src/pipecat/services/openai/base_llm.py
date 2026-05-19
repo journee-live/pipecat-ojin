@@ -270,18 +270,14 @@ class BaseOpenAILLMService(LLMService):
         _has_tools = tools_param is not None and tools_param is not NOT_GIVEN and bool(tools_param)
         if _has_tools:
             _tool_names = [
-                t.get("function", {}).get("name", "?")
-                for t in tools_param
-                if isinstance(t, dict)
+                t.get("function", {}).get("name", "?") for t in tools_param if isinstance(t, dict)
             ]
             logger.info(
                 f"🔧 {self}: API request tools={_tool_names}, "
                 f"tool_choice={tool_choice_param}, model={params.get('model')}"
             )
         else:
-            logger.info(
-                f"🔧 {self}: API request with NO tools, model={params.get('model')}"
-            )
+            logger.info(f"🔧 {self}: API request with NO tools, model={params.get('model')}")
 
         return params
 
@@ -441,7 +437,7 @@ class BaseOpenAILLMService(LLMService):
                 if tool_call.function and tool_call.function.arguments:
                     # Keep iterating through the response to collect all the argument fragments
                     arguments += tool_call.function.arguments
-            elif chunk.choices[0].delta.content:                
+            elif chunk.choices[0].delta.content:
                 await self.push_frame(LLMTextFrame(chunk.choices[0].delta.content))
 
             # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
@@ -459,9 +455,7 @@ class BaseOpenAILLMService(LLMService):
                 f"ids={tool_id_list + [tool_call_id]}"
             )
         else:
-            logger.info(
-                f"🔧 {self}: API response contains NO native tool_calls (text-only output)"
-            )
+            logger.info(f"🔧 {self}: API response contains NO native tool_calls (text-only output)")
 
         # if we got a function name and arguments, check to see if it's a function with
         # a registered handler. If so, run the registered callback, save the result to

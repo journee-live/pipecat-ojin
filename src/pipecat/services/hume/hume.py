@@ -63,6 +63,8 @@ from pipecat.utils.time import time_now_iso8601
 
 @dataclass
 class HumeStartFrame(SystemFrame):
+    """System frame that triggers HumeSTSService to connect to the Hume EVI websocket."""
+
     pass
 
 
@@ -85,6 +87,7 @@ class HumeSTSService(LLMService):
         audio_passthrough: bool = False,
         **kwargs,
     ):
+        """Initialize the HumeSTSService with API credentials and conversation settings."""
         super().__init__(**kwargs)
         logger.debug("Initializing HumeSTSService")
         self._audio_passthrough = audio_passthrough
@@ -106,22 +109,27 @@ class HumeSTSService(LLMService):
         self._start_frame_cls = start_frame_cls or HumeStartFrame
 
     async def start(self, frame: StartFrame):
+        """Start the service in response to a StartFrame."""
         await super().start(frame)
 
     async def stop(self, frame: EndFrame):
+        """Stop the service and disconnect from Hume."""
         await super().stop(frame)
         await self._disconnect()
 
     async def cancel(self, frame: CancelFrame):
+        """Cancel the service and disconnect from Hume."""
         await super().cancel(frame)
         await self._disconnect()
 
     async def reset_conversation(self):
+        """Reconnect to Hume and reset the active-conversation state."""
         await self._disconnect()
         await self._connect()
         self.active_conversation = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Route incoming frames to the Hume websocket and handle interruption/audio frames."""
         await super().process_frame(frame, direction)
         if isinstance(frame, self._start_frame_cls):
             logger.info("Starting Hume service")

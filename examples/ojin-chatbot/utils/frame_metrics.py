@@ -63,7 +63,7 @@ class FrameMetricsProcessor(FrameProcessor):
             elapsed_ns = now_ns - self._last_fps_report_time_ns
             if elapsed_ns >= self._log_interval_ns and elapsed_ns > 0:
                 fps = self._frame_count_since_report / (elapsed_ns / 1e9)
-                logger.info(f"[FrameMetrics] Output FPS: {fps:.2f} over {elapsed_ns/1e9:.2f}s")
+                logger.info(f"[FrameMetrics] Output FPS: {fps:.2f} over {elapsed_ns / 1e9:.2f}s")
                 # Reset window
                 self._last_fps_report_time_ns = now_ns
                 self._frame_count_since_report = 0

@@ -747,15 +747,22 @@ class OjinVideoService(FrameProcessor):
             h, w = decoded_image.shape[:2]
             target_w, target_h = image_size
 
-            scale = min(target_w / w, target_h / h)
+            # Scale to cover: fill target exactly, crop center if needed.
+            # Avoids black bars on silence frames that differ in aspect ratio.
+            scale = max(target_w / w, target_h / h)
             new_w = int(w * scale)
             new_h = int(h * scale)
 
             scaled_image = cv2.resize(decoded_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            rgb_image = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2RGB)
+
+            x_off = (new_w - target_w) // 2
+            y_off = (new_h - target_h) // 2
+            cropped = scaled_image[y_off : y_off + target_h, x_off : x_off + target_w]
+
+            rgb_image = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             rgb_bytes = rgb_image.tobytes()
 
-            rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(new_w, new_h), format="RGB")
+            rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(target_w, target_h), format="RGB")
             rgb_frame.pts = pts
             if is_first:
                 logger.warning(f"First image frame played!")

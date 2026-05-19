@@ -373,6 +373,19 @@ class LiveKitTransportClient:
                         self._video_track, video_options
                     )
 
+                    # Capture a black frame immediately so the widget never
+                    # sees the uninitialized YUV buffer (renders as green).
+                    _w = self._params.video_out_width
+                    _h = self._params.video_out_height
+                    self._video_source.capture_frame(
+                        rtc.VideoFrame(
+                            width=_w,
+                            height=_h,
+                            type=rtc.VideoBufferType.RGB24,
+                            data=bytearray(_w * _h * 3),
+                        )
+                    )
+
                     if self._params.av_sync_enabled:
                         # AVSynchronizer paces video at video_out_framerate and
                         # lets audio flow through immediately; both share the

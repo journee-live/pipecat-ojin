@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ImageRawFrame,
+    InputTransportMessageFrame,
     OutputAudioRawFrame,
     OutputDTMFFrame,
     OutputDTMFUrgentFrame,
@@ -844,13 +845,13 @@ class LiveKitInputTransport(BaseInputTransport):
         await self._transport.cleanup()
 
     async def push_app_message(self, message: Any, sender: str):
-        """Push an application message as an urgent transport frame.
+        """Push an application message as an input transport frame.
 
         Args:
             message: The message data to send.
             sender: ID of the message sender.
         """
-        frame = LiveKitOutputTransportMessageUrgentFrame(message=message, participant_id=sender)
+        frame = InputTransportMessageFrame(message=message)
         await self.push_frame(frame)
 
     async def _audio_in_task_handler(self):

@@ -1109,7 +1109,7 @@ class LiveKitOutputTransport(BaseOutputTransport):
         by the LiveKit buffer types we recognise.
         """
         width, height = frame.size
-        buffer_type = _PIPECAT_FORMAT_TO_LIVEKIT_BUFFER.get(frame.format.upper())
+        buffer_type = _PIPECAT_FORMAT_TO_LIVEKIT_BUFFER.get((frame.format or "").upper())
         if buffer_type is None:
             raise ValueError(
                 f"Unsupported OutputImageRawFrame format {frame.format!r}; "

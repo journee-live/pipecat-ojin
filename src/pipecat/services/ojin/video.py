@@ -228,6 +228,13 @@ class OjinVideoService(FrameProcessor):
         self._fade_active = False
         self._fade_samples_done = 0
         self._post_fade_mute = False
+        # When True, do not send new TTS audio to the inference server.
+        # Flipped on the first FADE_OUT message received (server has
+        # already used the audio it needed for the fade chunk) so the
+        # server stops producing more speech video after the fade.
+        # _speech_buffer still receives TTS audio so the bot-side fade
+        # ramp has data to apply.
+        self._stop_sending_tts_to_server = False
 
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
@@ -302,6 +309,7 @@ class OjinVideoService(FrameProcessor):
             self._fade_active = False
             self._fade_samples_done = 0
             self._post_fade_mute = False
+            self._stop_sending_tts_to_server = False
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -381,13 +389,20 @@ class OjinVideoService(FrameProcessor):
         if self._waiting_for_first_tts:
             self._waiting_for_first_tts = False
             await self.start_ttfb_metrics()
-        # Send audio to server immediately
-        logger.debug(f"Sending TTS audio to server, size: {len(resampled_audio)} bytes")
-        await self._client.send_message(
-            OjinAudioInputMessage(
-                audio_int16_bytes=resampled_audio,
+        if self._stop_sending_tts_to_server:
+            logger.debug(
+                f"FADE_OUT lockout: buffered {len(resampled_audio)} bytes for "
+                f"local ramp, NOT sending to server"
             )
-        )
+        else:
+            logger.debug(
+                f"Sending TTS audio to server, size: {len(resampled_audio)} bytes"
+            )
+            await self._client.send_message(
+                OjinAudioInputMessage(
+                    audio_int16_bytes=resampled_audio,
+                )
+            )
 
         if self._settings.tts_audio_passthrough:
             await self.push_frame(frame, FrameDirection.DOWNSTREAM)
@@ -446,6 +461,15 @@ class OjinVideoService(FrameProcessor):
                 is_final=message.is_final_response,
                 volume=volume,
             )
+
+            # First FADE_OUT message means the server has already used the
+            # audio it needed for the fade chunk. Lock out further TTS sends
+            # so the server doesn't produce more speech video after the fade.
+            if video_frame.is_fade_out() and not self._stop_sending_tts_to_server:
+                self._stop_sending_tts_to_server = True
+                logger.info(
+                    "First FADE_OUT frame received; lock out TTS sends to server"
+                )
 
             if self._interrupting and not video_frame.is_silence():
                 logger.debug("Interrupting, dropping non-silence frame")

@@ -196,6 +196,53 @@ class TestTTSStartedFrameClearsFadeState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(svc._speech_buffer), 0)
 
 
+class TestServerSendLockoutAfterFadeOut(unittest.IsolatedAsyncioTestCase):
+    """After first FADE_OUT message: stop OjinAudioInputMessage, keep buffering."""
+
+    async def test_lockout_armed_on_first_fade_out_message(self) -> None:
+        from ojin.ojin_client_messages import OjinInteractionResponseMessage
+
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._initialized = True
+        self.assertFalse(svc._stop_sending_tts_to_server)
+
+        # Server sends a FADE_OUT (index=2) frame
+        msg = OjinInteractionResponseMessage(
+            interaction_id="test",
+            index=2,
+            video_frame_bytes=b"\xff" * 4,
+            audio_frame_bytes=b"\x00" * 1280,
+            is_final_response=False,
+        )
+        await svc._handle_ojin_message(msg)
+        self.assertTrue(svc._stop_sending_tts_to_server)
+
+    async def test_send_tts_audio_skips_server_when_locked_out(self) -> None:
+        from pipecat.frames.frames import TTSAudioRawFrame
+
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._initialized = True
+        svc._stop_sending_tts_to_server = True
+
+        frame = TTSAudioRawFrame(audio=b"\x01" * 1280, sample_rate=16000, num_channels=1)
+        await svc._send_tts_audio(frame)
+
+        # Speech buffer still populated for local fade ramp
+        self.assertGreater(len(svc._speech_buffer), 0)
+        # No OjinAudioInputMessage sent to the server
+        svc._client.send_message.assert_not_called()
+
+    async def test_lockout_cleared_on_tts_started_frame(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._stop_sending_tts_to_server = True
+
+        await svc.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+        self.assertFalse(svc._stop_sending_tts_to_server)
+
+
 class TestPostFadeMuteDiscardsTtsAudio(unittest.IsolatedAsyncioTestCase):
     """During _post_fade_mute, incoming TTS audio is dropped on the floor."""
 

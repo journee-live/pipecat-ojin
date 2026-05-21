@@ -82,6 +82,15 @@ class VideoFrame:
     def is_silence(self) -> bool:
         return self.frame_idx == 0
 
+    def is_fade_out(self) -> bool:
+        """First frames of the server's post-interrupt fade-out chunk.
+
+        Carried on the same wire field as `is_silence`. The playback loop
+        uses this marker to start its own 200 ms TTS-audio fade ramp,
+        aligned in time with the server's video fade.
+        """
+        return self.frame_idx == 2
+
 
 class InterruptStrategy(Enum):
     """Interruption strategy for the playback loop.
@@ -89,11 +98,22 @@ class InterruptStrategy(Enum):
     SMOOTH: keep playing all buffered frames (video + audio).
     INSTANT_CUT: clear buffer, discard speech frames until first silence.
     SMOOTH_VIDEO_HARD_AUDIO: keep video playing, stop audio immediately.
+    FADE_OUT: keep playing buffered frames; when the server sends a
+        fade-out frame (frame_idx=2), apply a 200 ms linear ramp to the
+        TTS audio at the same playback tick, then mute until the next
+        TTS turn starts.
     """
 
     SMOOTH = "smooth"
     INSTANT_CUT = "instant_cut"
     SMOOTH_VIDEO_HARD_AUDIO = "smooth_video_hard_audio"
+    FADE_OUT = "fade_out"
+
+
+# 200 ms fade at 25 fps = 5 video ticks; at 16 kHz = 3200 audio samples.
+_FADE_FRAMES = 5
+_FADE_SAMPLES_TOTAL = _FADE_FRAMES * int(OJIN_PERSONA_SAMPLE_RATE / 25)
+_FADE_GAIN = np.linspace(1.0, 0.0, _FADE_SAMPLES_TOTAL, dtype=np.float32, endpoint=True)
 
 
 @dataclass
@@ -195,6 +215,20 @@ class OjinVideoService(FrameProcessor):
         self._discard_speech_until_silence = False
         self._pending_latency_report: Optional[tuple[float, float]] = None
 
+        # Graceful fade-out state (only used under InterruptStrategy.FADE_OUT).
+        # _fade_pending  → server interrupt sent, waiting for first FADE_OUT
+        #                  frame to arrive in the playback queue.
+        # _fade_active   → playback loop is applying the 200 ms ramp to TTS
+        #                  audio chunks.
+        # _fade_samples_done → samples processed through the ramp so far.
+        # _post_fade_mute → ramp finished; mute audio (push silence_frame)
+        #                  and discard incoming TTS audio until the next
+        #                  TTSStartedFrame.
+        self._fade_pending = False
+        self._fade_active = False
+        self._fade_samples_done = 0
+        self._post_fade_mute = False
+
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
         return True
@@ -259,11 +293,23 @@ class OjinVideoService(FrameProcessor):
             logger.warning("TTSStartedFrame received")
             self._interrupting = False
             self._waiting_for_first_tts = True
+            if self._post_fade_mute or self._fade_active or self._fade_pending:
+                logger.debug(
+                    "TTSStartedFrame: clearing fade state and stale speech buffer"
+                )
+                self._speech_buffer.clear()
+            self._fade_pending = False
+            self._fade_active = False
+            self._fade_samples_done = 0
+            self._post_fade_mute = False
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
             if self._interrupting:
                 logger.debug("Interrupting, dropping TTS audio")
+                return
+            if self._post_fade_mute:
+                logger.debug("Post-fade mute: discarding TTS audio")
                 return
             await self._send_tts_audio(frame)
 
@@ -271,35 +317,47 @@ class OjinVideoService(FrameProcessor):
             await self._stop()
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
-            if not self._interrupting and self._client is not None:
-                logger.debug("Start interrupting")
-                self._interrupting = True
-                self._waiting_for_first_tts = False
+            if self._client is not None:
                 strategy = self._settings.interrupt_strategy
 
-                if strategy == InterruptStrategy.SMOOTH:
-                    # Keep playing all buffered frames naturally
-                    pass
-                elif strategy == InterruptStrategy.INSTANT_CUT:
-                    # Clear all buffers, discard speech until silence
-                    self._video_frames.clear()
-                    self._speech_buffer.clear()
-                    self._discard_speech_until_silence = True
-                    # Guard: _first_silence_frame is None until the server
-                    # sends its first silence.  Appending None crashes the
-                    # playback loop (is_silence() on NoneType) and freezes
-                    # the video permanently.
-                    if self._first_silence_frame is not None:
-                        self._video_frames.append(self._first_silence_frame)
-                    self._turn += 1
-                    self._last_frame_idx = 0
-                    await self._stop_audio_playback()
-                elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
-                    # Stop audio immediately, keep video for smooth transition
-                    self._speech_buffer.clear()
-                    await self._stop_audio_playback()
+                if strategy == InterruptStrategy.FADE_OUT:
+                    # Do NOT set _interrupting — TTS audio keeps flowing
+                    # into _speech_buffer so the playback loop has data to
+                    # apply the fade ramp to when the server's first FADE_OUT
+                    # frame arrives. Idempotent if already pending.
+                    if not self._fade_pending and not self._fade_active and not self._post_fade_mute:
+                        logger.debug("Start interrupting (FADE_OUT)")
+                        self._fade_pending = True
+                        self._waiting_for_first_tts = False
+                        await self._client.send_message(OjinCancelInteractionMessage())
+                elif not self._interrupting:
+                    logger.debug("Start interrupting")
+                    self._interrupting = True
+                    self._waiting_for_first_tts = False
 
-                await self._client.send_message(OjinCancelInteractionMessage())
+                    if strategy == InterruptStrategy.SMOOTH:
+                        # Keep playing all buffered frames naturally
+                        pass
+                    elif strategy == InterruptStrategy.INSTANT_CUT:
+                        # Clear all buffers, discard speech until silence
+                        self._video_frames.clear()
+                        self._speech_buffer.clear()
+                        self._discard_speech_until_silence = True
+                        # Guard: _first_silence_frame is None until the server
+                        # sends its first silence.  Appending None crashes the
+                        # playback loop (is_silence() on NoneType) and freezes
+                        # the video permanently.
+                        if self._first_silence_frame is not None:
+                            self._video_frames.append(self._first_silence_frame)
+                        self._turn += 1
+                        self._last_frame_idx = 0
+                        await self._stop_audio_playback()
+                    elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
+                        # Stop audio immediately, keep video for smooth transition
+                        self._speech_buffer.clear()
+                        await self._stop_audio_playback()
+
+                    await self._client.send_message(OjinCancelInteractionMessage())
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
@@ -647,10 +705,71 @@ class OjinVideoService(FrameProcessor):
                 )
                 await self.push_frame(output_vide_frame)
 
+            # Arm the fade ramp the moment the playback loop reaches the first
+            # FADE_OUT video frame. The audio chunk prepared above corresponds
+            # to the same playback tick, so the ramp lands on aligned samples.
+            if (
+                video_frame is not None
+                and video_frame.is_fade_out()
+                and not self._fade_active
+                and not self._post_fade_mute
+            ):
+                self._fade_active = True
+                self._fade_samples_done = 0
+                self._fade_pending = False
+                logger.info("Audio fade-out started")
+
+            if self._fade_active and audio_frame is not None:
+                audio_frame = self._apply_fade_ramp(
+                    audio_frame, sample_rate, num_channels, pts
+                )
+                if self._fade_samples_done >= _FADE_SAMPLES_TOTAL:
+                    self._fade_active = False
+                    self._post_fade_mute = True
+                    self._speech_buffer.clear()
+                    logger.info("Audio fade-out complete; muted until next TTS turn")
+
+            if self._post_fade_mute:
+                audio_frame = None
+
             if audio_frame is not None:
                 await self.push_frame(audio_frame)
             else:
                 await self.push_frame(silence_frame)
+
+    def _apply_fade_ramp(
+        self,
+        audio_frame: OutputAudioRawFrame,
+        sample_rate: int,
+        num_channels: int,
+        pts: int,
+    ) -> OutputAudioRawFrame:
+        """Multiply ``audio_frame.audio`` by the precomputed fade gain.
+
+        Walks ``_fade_samples_done`` forward by the chunk's sample count.
+        Samples past ``_FADE_SAMPLES_TOTAL`` are zeroed; the caller flips
+        ``_post_fade_mute`` once the counter reaches the total.
+        """
+        audio_int16 = np.frombuffer(audio_frame.audio, dtype=np.int16)
+        n = len(audio_int16)
+        remaining = max(0, _FADE_SAMPLES_TOTAL - self._fade_samples_done)
+        ramp_n = min(n, remaining)
+        faded = audio_int16.astype(np.float32)
+        if ramp_n > 0:
+            ramp = _FADE_GAIN[
+                self._fade_samples_done : self._fade_samples_done + ramp_n
+            ]
+            faded[:ramp_n] *= ramp
+        if ramp_n < n:
+            faded[ramp_n:] = 0.0
+        out = OutputAudioRawFrame(
+            audio=faded.astype(np.int16).tobytes(),
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+        )
+        out.pts = pts
+        self._fade_samples_done += n
+        return out
 
     async def _consume_speech_frame(
         self, audio_frames_released: int, video_frames_sent: int

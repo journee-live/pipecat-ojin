@@ -122,7 +122,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 22
+OJIN_VIDEO_SERVICE_VERSION = 23
 
 
 class OjinVideoService(FrameProcessor):
@@ -205,6 +205,17 @@ class OjinVideoService(FrameProcessor):
         # FADE_OUT: gates new TTS audio after a fade-out video frame is
         # received from the server; reset on the next TTSStartedFrame.
         self._discard_tts = False
+        # FADE_OUT: byte offset into _speech_buffer marking the OLD/NEW
+        # utterance boundary. Snapshotted at the first TTSStartedFrame
+        # after a FADE_OUT cancel, decremented as the playback loop
+        # drains chunks, trimmed-to at the first fade-out video frame
+        # pop. Lets us preserve new-turn TTS that landed in the buffer
+        # between TTSStartedFrame and the fade-out pop.
+        self._speech_buffer_cut_pos: int = 0
+        # FADE_OUT: one-shot guard. The server emits 5 frame_idx==2
+        # frames, but only the first pop should trim. False between
+        # cancel-send and the first fade-out pop; True otherwise.
+        self._fade_cut_done: bool = True
 
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
@@ -270,6 +281,10 @@ class OjinVideoService(FrameProcessor):
             logger.warning("TTSStartedFrame received")
             self._interrupting = False
             self._discard_tts = False
+            # If a fade-out is in flight, any bytes currently in
+            # _speech_buffer are OLD-turn audio; anything appended after
+            # this point is NEW-turn. Mark the boundary.
+            self._speech_buffer_cut_pos = len(self._speech_buffer)
             self._waiting_for_first_tts = True
             await self.push_frame(frame, direction)
 
@@ -298,6 +313,7 @@ class OjinVideoService(FrameProcessor):
                     # _interrupting=True — that would drop the fade-out
                     # frame (frame_idx=2 is not silence).
                     logger.debug("FADE_OUT: cancel sent, awaiting fade-out frame")
+                    self._fade_cut_done = False
                     await self._client.send_message(OjinCancelInteractionMessage())
                 else:
                     logger.debug("Start interrupting")
@@ -587,6 +603,10 @@ class OjinVideoService(FrameProcessor):
                 else:
                     audio = bytes(self._speech_buffer[:chunk_size])
                     del self._speech_buffer[:chunk_size]
+                # Keep the FADE_OUT cut marker in current buffer coords.
+                self._speech_buffer_cut_pos = max(
+                    0, self._speech_buffer_cut_pos - len(audio)
+                )
 
                 audio_frame = OutputAudioRawFrame(
                     audio=audio,
@@ -640,15 +660,31 @@ class OjinVideoService(FrameProcessor):
             else:
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
 
-            # FADE_OUT pop: cut bot audio at the exact moment the fade-out
-            # video frame is about to play, so audio and video transition
-            # together. The TTS lockout (_discard_tts) stays armed until
-            # the next TTSStartedFrame from upstream.
-            if video_frame is not None and getattr(video_frame, "frame_idx", None) == 2:
-                logger.info("FADE_OUT frame popped — cutting bot audio")
-                self._speech_buffer.clear()
-                self._discard_tts = True
-                await self._stop_audio_playback()
+            # FADE_OUT pop: at the exact moment the fade-out video frame
+            # is about to play, trim only the OLD-turn prefix of
+            # _speech_buffer; preserve NEW-turn TTS that arrived after
+            # TTSStartedFrame. Pushes silence audio for this one tick;
+            # next tick the loop re-engages playback from the preserved
+            # NEW bytes. Guarded as one-shot because the server emits 5
+            # frame_idx==2 frames.
+            if (
+                video_frame is not None
+                and getattr(video_frame, "frame_idx", None) == 2
+                and not self._fade_cut_done
+            ):
+                cut = min(self._speech_buffer_cut_pos, len(self._speech_buffer))
+                preserved = len(self._speech_buffer) - cut
+                logger.info(
+                    f"FADE_OUT frame popped — trimming {cut}B of old TTS, "
+                    f"preserving {preserved}B of new TTS"
+                )
+                del self._speech_buffer[:cut]
+                self._speech_buffer_cut_pos = 0
+                self._fade_cut_done = True
+                # Emit OjinBotStoppedSpeakingFrame downstream (RTVI /
+                # latency tracker need the turn boundary) but DON'T wipe
+                # the trimmed buffer — that's the new utterance's audio.
+                await self._stop_audio_playback(clear_buffer=False)
                 audio_frame = None
 
             if video_frame is not None:
@@ -747,13 +783,14 @@ class OjinVideoService(FrameProcessor):
         await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         await self.stop_ttfb_metrics()
 
-    async def _stop_audio_playback(self):
+    async def _stop_audio_playback(self, clear_buffer: bool = True):
         if not self._is_playing_speech_audio:
             return
 
         self._is_playing_speech_audio = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
-        self._speech_buffer.clear()
+        if clear_buffer:
+            self._speech_buffer.clear()
 
     async def _start(self):
         """Initialize the service and start processing."""

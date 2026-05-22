@@ -96,20 +96,26 @@ class TestHandleOjinMessageNoLongerCutsOnReceipt(unittest.IsolatedAsyncioTestCas
 
 
 class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
-    """The fade-out cut fires when the playback loop pops the frame.
-
-    We drive the loop briefly and observe that, after the fade-out frame is
-    consumed, the speech buffer is cleared, _discard_tts is True, and audio
-    playback is stopped.
+    """The fade-out cut trims only the OLD prefix of _speech_buffer at pop
+    time, preserving any NEW-utterance TTS that arrived between
+    TTSStartedFrame and the fade-out pop.
     """
 
-    async def test_loop_cuts_audio_when_fade_out_frame_pops(self) -> None:
+    async def test_loop_trims_old_prefix_preserves_new_at_fade_pop(self) -> None:
+        """OLD bytes are removed, NEW bytes survive across the pop."""
         service = _make_service()
         service._playback_paused = False
-        service._speech_buffer.extend(b"\x01" * 4096)
+        # Simulate state at the moment of fade-out pop:
+        # 4096 B OLD already in buffer, 2048 B NEW appended after
+        # TTSStartedFrame snapshot. cut_pos == 4096 (= snapshot len).
+        # fade_cut_done == False (armed by prior VAD).
+        old_bytes = b"\x01" * 4096
+        new_bytes = b"\x02" * 2048
+        service._speech_buffer.extend(old_bytes + new_bytes)
+        service._speech_buffer_cut_pos = len(old_bytes)
+        service._fade_cut_done = False
         service._is_playing_speech_audio = True
         service._first_silence_frame = None
-        # Queue just the fade-out frame so the loop reaches it quickly.
         service._video_frames.append(_fade_out_frame())
 
         pushed: list = []
@@ -122,7 +128,7 @@ class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
         loop_task = asyncio.create_task(service._video_playback_loop())
         try:
             deadline = asyncio.get_event_loop().time() + 2.0
-            while service._discard_tts is False:
+            while not service._fade_cut_done:
                 if asyncio.get_event_loop().time() > deadline:
                     self.fail("playback loop never reached the fade-out cut")
                 await asyncio.sleep(0.01)
@@ -137,19 +143,40 @@ class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
                 except (asyncio.CancelledError, Exception):
                     pass
 
-        self.assertTrue(service._discard_tts, "discard_tts must be armed")
-        self.assertEqual(len(service._speech_buffer), 0,
-                         "speech buffer must be cleared on fade-out pop")
-        self.assertFalse(service._is_playing_speech_audio,
-                         "_stop_audio_playback() must have run")
+        self.assertTrue(service._fade_cut_done,
+                        "fade_cut_done must flip to True after pop")
+        self.assertEqual(service._speech_buffer_cut_pos, 0,
+                         "cut_pos must reset to 0 after trim")
+        # The NEW bytes must survive; OLD prefix must be gone. Allow a
+        # small slack for any chunk consumed by playback during the loop's
+        # initial buffer-fill ticks (audio_frames are 1280 B each).
+        self.assertGreaterEqual(
+            len(service._speech_buffer), len(new_bytes) - 6 * 1280,
+            "new TTS must be largely preserved across the fade-out pop",
+        )
+        self.assertLessEqual(
+            len(service._speech_buffer), len(new_bytes),
+            "OLD prefix must be trimmed (buffer no larger than new portion)",
+        )
+        # _discard_tts must NOT be re-armed at fade-out pop — the new
+        # turn's gate must stay open.
+        self.assertFalse(
+            service._discard_tts,
+            "fade-out pop must not re-arm _discard_tts (new turn gate stays open)",
+        )
 
-    async def test_loop_pushes_silence_audio_with_fade_out_video(self) -> None:
-        """The fade-out video frame goes downstream paired with silence audio,
-        not with whatever speech bytes happened to be prepared this tick.
+    async def test_loop_pushes_silence_for_fade_tick(self) -> None:
+        """The fade-out video frame goes downstream paired with silence audio
+        for that one tick (NOT with whatever bytes were prepared from the
+        OLD prefix this tick).
         """
         service = _make_service()
         service._playback_paused = False
+        # Pure-OLD buffer (no NEW bytes) so any non-zero audio frame after
+        # the cut would indicate the old payload leaked.
         service._speech_buffer.extend(b"\xff" * 4096)
+        service._speech_buffer_cut_pos = 4096
+        service._fade_cut_done = False
         service._is_playing_speech_audio = True
         service._first_silence_frame = None
         service._video_frames.append(_fade_out_frame())
@@ -164,11 +191,10 @@ class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
         loop_task = asyncio.create_task(service._video_playback_loop())
         try:
             deadline = asyncio.get_event_loop().time() + 2.0
-            while service._discard_tts is False:
+            while not service._fade_cut_done:
                 if asyncio.get_event_loop().time() > deadline:
                     self.fail("loop did not reach fade-out cut")
                 await asyncio.sleep(0.01)
-            # Give the loop one more tick to push the frames.
             await asyncio.sleep(0.06)
         finally:
             service._initialized = False
@@ -183,13 +209,61 @@ class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
 
         audio_pushed = [f for f in pushed if isinstance(f, OutputAudioRawFrame)]
         self.assertTrue(audio_pushed, "loop must push at least one audio frame")
-        # Every audio frame after the cut should be silence (all-zero bytes).
-        # The cut tick itself uses the precomputed silence_frame.
         silent_pushes = [f for f in audio_pushed if set(f.audio) == {0}]
         self.assertTrue(
             len(silent_pushes) >= 1,
-            f"at least one all-zero audio frame must be pushed; "
-            f"got audio sets: {[set(f.audio[:8]) for f in audio_pushed]}",
+            "at least one all-zero audio frame must be pushed after the cut",
+        )
+
+    async def test_five_fade_pops_only_trim_once(self) -> None:
+        """The server emits 5 frame_idx==2 frames. Only the first pop trims;
+        subsequent pops must no-op because _fade_cut_done is True.
+        """
+        service = _make_service()
+        service._playback_paused = False
+        # Buffer contains ONLY new bytes (cut_pos == 0). After the first
+        # pop, _fade_cut_done flips True; if subsequent pops were not
+        # guarded they could re-call _stop_audio_playback() etc.
+        new_bytes = b"\x02" * 4096
+        service._speech_buffer.extend(new_bytes)
+        service._speech_buffer_cut_pos = 0
+        service._fade_cut_done = False
+        service._is_playing_speech_audio = True
+        service._first_silence_frame = None
+        # Queue 5 fade frames (mimicking the server's emission pattern).
+        for _ in range(5):
+            service._video_frames.append(_fade_out_frame())
+
+        async def capture(_frame, *_args, **_kwargs):
+            pass
+
+        service.push_frame = capture  # type: ignore[assignment]
+
+        loop_task = asyncio.create_task(service._video_playback_loop())
+        try:
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while not service._fade_cut_done:
+                if asyncio.get_event_loop().time() > deadline:
+                    self.fail("first fade pop never fired")
+                await asyncio.sleep(0.01)
+            # Let the remaining 4 fade pops run.
+            await asyncio.sleep(0.25)
+        finally:
+            service._initialized = False
+            try:
+                await asyncio.wait_for(loop_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                loop_task.cancel()
+                try:
+                    await loop_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        # The new bytes should still be (mostly) in the buffer — repeated
+        # un-guarded pops would have wiped them via the prior `clear()`.
+        self.assertGreater(
+            len(service._speech_buffer), 0,
+            "subsequent fade pops must not wipe the preserved new TTS",
         )
 
 

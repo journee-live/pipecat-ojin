@@ -21,6 +21,7 @@ import numpy as np
 
 from pipecat.frames.frames import (
     OutputAudioRawFrame,
+    TTSAudioRawFrame,
     TTSStartedFrame,
     UserStartedSpeakingFrame,
 )
@@ -36,9 +37,16 @@ from pipecat.services.ojin.video import (
 )
 
 
-def _make_service(strategy: InterruptStrategy) -> OjinVideoService:
+def _make_service(
+    strategy: InterruptStrategy, tts_audio_passthrough: bool = False
+) -> OjinVideoService:
     """Construct a service with a mocked client to avoid real WebSocket setup."""
-    settings = OjinVideoSettings(interrupt_strategy=strategy, api_key="x", config_id="x")
+    settings = OjinVideoSettings(
+        interrupt_strategy=strategy,
+        api_key="x",
+        config_id="x",
+        tts_audio_passthrough=tts_audio_passthrough,
+    )
     client = MagicMock()
     client.send_message = AsyncMock()
     svc = OjinVideoService(settings=settings, client=client)
@@ -143,6 +151,7 @@ class TestUserStartedSpeakingFrameFadeOutBranch(unittest.IsolatedAsyncioTestCase
         await svc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
         self.assertTrue(svc._fade_pending)
+        self.assertTrue(svc._stop_sending_tts_to_server)
         self.assertFalse(svc._interrupting)
         self.assertFalse(svc._discard_speech_until_silence)
         self.assertEqual(len(svc._speech_buffer), 1280)
@@ -167,6 +176,7 @@ class TestUserStartedSpeakingFrameFadeOutBranch(unittest.IsolatedAsyncioTestCase
     async def test_double_interrupt_under_fade_out_is_idempotent(self) -> None:
         svc = _make_service(InterruptStrategy.FADE_OUT)
         svc.push_frame = AsyncMock()
+        svc._video_frames.append(_make_video_frame(1))
 
         await svc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         self.assertTrue(svc._fade_pending)
@@ -175,6 +185,32 @@ class TestUserStartedSpeakingFrameFadeOutBranch(unittest.IsolatedAsyncioTestCase
         # Second VAD trigger while still pending: don't re-send cancel.
         await svc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         self.assertEqual(svc._client.send_message.await_count, first_call_count)
+
+    async def test_second_interrupt_drops_deferred_tts_from_superseded_turn(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._fade_pending = True
+        svc._defer_tts_until_fade_complete = True
+        svc._stop_sending_tts_to_server = True
+        svc._deferred_tts_audio.extend(b"\x01" * 1280)
+
+        await svc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        self.assertTrue(svc._fade_pending)
+        self.assertTrue(svc._defer_tts_until_fade_complete)
+        self.assertTrue(svc._stop_sending_tts_to_server)
+        self.assertEqual(len(svc._deferred_tts_audio), 0)
+        svc._client.send_message.assert_not_called()
+
+    async def test_fade_out_strategy_does_not_lock_out_when_idle(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+
+        await svc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        self.assertFalse(svc._fade_pending)
+        self.assertFalse(svc._stop_sending_tts_to_server)
+        svc._client.send_message.assert_awaited_once()
 
 
 class TestTTSStartedFrameClearsFadeState(unittest.IsolatedAsyncioTestCase):
@@ -192,8 +228,40 @@ class TestTTSStartedFrameClearsFadeState(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(svc._post_fade_mute)
         self.assertFalse(svc._fade_active)
         self.assertFalse(svc._fade_pending)
+        self.assertFalse(svc._stop_sending_tts_to_server)
+        self.assertFalse(svc._defer_tts_until_fade_complete)
         self.assertEqual(svc._fade_samples_done, 0)
         self.assertEqual(len(svc._speech_buffer), 0)
+
+    async def test_tts_started_during_pending_fade_preserves_old_audio(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._fade_pending = True
+        svc._stop_sending_tts_to_server = True
+        svc._is_playing_speech_audio = True
+        svc._speech_buffer.extend(b"\xff" * 1280)
+
+        await svc.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+        self.assertTrue(svc._fade_pending)
+        self.assertTrue(svc._stop_sending_tts_to_server)
+        self.assertTrue(svc._defer_tts_until_fade_complete)
+        self.assertEqual(len(svc._speech_buffer), 1280)
+
+    async def test_tts_started_during_pending_fade_replaces_deferred_audio(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc.push_frame = AsyncMock()
+        svc._fade_pending = True
+        svc._defer_tts_until_fade_complete = True
+        svc._stop_sending_tts_to_server = True
+        svc._deferred_tts_audio.extend(b"\x01" * 1280)
+
+        await svc.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+        self.assertTrue(svc._fade_pending)
+        self.assertTrue(svc._defer_tts_until_fade_complete)
+        self.assertTrue(svc._stop_sending_tts_to_server)
+        self.assertEqual(len(svc._deferred_tts_audio), 0)
 
 
 class TestServerSendLockoutAfterFadeOut(unittest.IsolatedAsyncioTestCase):
@@ -219,8 +287,6 @@ class TestServerSendLockoutAfterFadeOut(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(svc._stop_sending_tts_to_server)
 
     async def test_send_tts_audio_skips_server_when_locked_out(self) -> None:
-        from pipecat.frames.frames import TTSAudioRawFrame
-
         svc = _make_service(InterruptStrategy.FADE_OUT)
         svc.push_frame = AsyncMock()
         svc._initialized = True
@@ -233,6 +299,40 @@ class TestServerSendLockoutAfterFadeOut(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(svc._speech_buffer), 0)
         # No OjinAudioInputMessage sent to the server
         svc._client.send_message.assert_not_called()
+
+    async def test_deferred_tts_audio_is_not_sent_or_played_before_fade(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT, tts_audio_passthrough=True)
+        svc.push_frame = AsyncMock()
+        svc._initialized = True
+        svc._defer_tts_until_fade_complete = True
+        svc._stop_sending_tts_to_server = True
+
+        frame = TTSAudioRawFrame(audio=b"\x01" * 1280, sample_rate=16000, num_channels=1)
+        await svc._send_tts_audio(frame)
+
+        self.assertEqual(len(svc._speech_buffer), 0)
+        self.assertGreater(len(svc._deferred_tts_audio), 0)
+        svc._client.send_message.assert_not_called()
+        svc.push_frame.assert_not_called()
+
+    async def test_flush_deferred_tts_after_fade_sends_once_and_releases_audio(self) -> None:
+        svc = _make_service(InterruptStrategy.FADE_OUT)
+        svc._initialized = True
+        svc._fade_pending = True
+        svc._stop_sending_tts_to_server = True
+        svc._defer_tts_until_fade_complete = True
+        svc._is_playing_speech_audio = True
+        svc._deferred_tts_audio.extend(b"\x01" * 1280)
+
+        await svc._flush_deferred_tts_after_fade()
+
+        self.assertFalse(svc._fade_pending)
+        self.assertFalse(svc._stop_sending_tts_to_server)
+        self.assertFalse(svc._defer_tts_until_fade_complete)
+        self.assertFalse(svc._is_playing_speech_audio)
+        self.assertEqual(len(svc._deferred_tts_audio), 0)
+        self.assertEqual(len(svc._speech_buffer), 1280)
+        svc._client.send_message.assert_awaited_once()
 
     async def test_lockout_cleared_on_tts_started_frame(self) -> None:
         svc = _make_service(InterruptStrategy.FADE_OUT)
@@ -251,8 +351,6 @@ class TestPostFadeMuteDiscardsTtsAudio(unittest.IsolatedAsyncioTestCase):
         svc.push_frame = AsyncMock()
         svc._initialized = True
         svc._post_fade_mute = True
-
-        from pipecat.frames.frames import TTSAudioRawFrame
 
         before_len = len(svc._speech_buffer)
         await svc.process_frame(

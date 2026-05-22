@@ -135,7 +135,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 20
+OJIN_VIDEO_SERVICE_VERSION = 22
 
 
 class OjinVideoService(FrameProcessor):
@@ -229,12 +229,16 @@ class OjinVideoService(FrameProcessor):
         self._fade_samples_done = 0
         self._post_fade_mute = False
         # When True, do not send new TTS audio to the inference server.
-        # Flipped on the first FADE_OUT message received (server has
-        # already used the audio it needed for the fade chunk) so the
-        # server stops producing more speech video after the fade.
+        # Flipped as soon as FADE_OUT interrupt is requested so new TTS
+        # cannot race ahead of the server's delayed fade chunk.
         # _speech_buffer still receives TTS audio so the bot-side fade
         # ramp has data to apply.
         self._stop_sending_tts_to_server = False
+        # A new TTS turn can start before the delayed FADE_OUT frames reach
+        # playback. Hold that next-turn audio here, then flush it after the
+        # old turn has faded so speech video/audio stay aligned.
+        self._defer_tts_until_fade_complete = False
+        self._deferred_tts_audio: bytearray = bytearray()
 
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
@@ -257,6 +261,12 @@ class OjinVideoService(FrameProcessor):
                 f"(buffered: {len(self._video_frames)} video, "
                 f"{len(self._speech_buffer)} audio bytes)"
             )
+
+    def _has_fadeable_speech_in_flight(self) -> bool:
+        """Whether a graceful fade has speech/video to fade right now."""
+        return self._is_playing_speech_audio or any(
+            not frame.is_silence() for frame in self._video_frames
+        )
 
     async def connect_with_retry(self) -> bool:
         """Attempt to connect with configurable retry mechanism."""
@@ -300,16 +310,39 @@ class OjinVideoService(FrameProcessor):
             logger.warning("TTSStartedFrame received")
             self._interrupting = False
             self._waiting_for_first_tts = True
-            if self._post_fade_mute or self._fade_active or self._fade_pending:
+
+            if self._post_fade_mute:
                 logger.debug(
-                    "TTSStartedFrame: clearing fade state and stale speech buffer"
+                    "TTSStartedFrame: clearing completed fade state and stale speech buffer"
                 )
                 self._speech_buffer.clear()
-            self._fade_pending = False
-            self._fade_active = False
-            self._fade_samples_done = 0
-            self._post_fade_mute = False
-            self._stop_sending_tts_to_server = False
+                self._fade_pending = False
+                self._fade_active = False
+                self._fade_samples_done = 0
+                self._post_fade_mute = False
+                self._stop_sending_tts_to_server = False
+                self._defer_tts_until_fade_complete = False
+                self._deferred_tts_audio.clear()
+            elif self._fade_pending or self._fade_active:
+                if self._deferred_tts_audio:
+                    logger.debug(
+                        f"TTSStartedFrame: replacing "
+                        f"{len(self._deferred_tts_audio)}B deferred TTS audio"
+                    )
+                    self._deferred_tts_audio.clear()
+                logger.debug(
+                    "TTSStartedFrame: fade still pending; deferring next-turn TTS audio"
+                )
+                self._defer_tts_until_fade_complete = True
+                self._stop_sending_tts_to_server = True
+            else:
+                self._fade_pending = False
+                self._fade_active = False
+                self._fade_samples_done = 0
+                self._post_fade_mute = False
+                self._stop_sending_tts_to_server = False
+                self._defer_tts_until_fade_complete = False
+                self._deferred_tts_audio.clear()
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -334,10 +367,27 @@ class OjinVideoService(FrameProcessor):
                     # apply the fade ramp to when the server's first FADE_OUT
                     # frame arrives. Idempotent if already pending.
                     if not self._fade_pending and not self._fade_active and not self._post_fade_mute:
-                        logger.debug("Start interrupting (FADE_OUT)")
-                        self._fade_pending = True
+                        if self._has_fadeable_speech_in_flight():
+                            logger.debug("Start interrupting (FADE_OUT)")
+                            self._fade_pending = True
+                            self._stop_sending_tts_to_server = True
+                        else:
+                            logger.debug(
+                                "Start interrupting (FADE_OUT): no speech in flight"
+                            )
                         self._waiting_for_first_tts = False
                         await self._client.send_message(OjinCancelInteractionMessage())
+                    else:
+                        if self._deferred_tts_audio:
+                            logger.debug(
+                                f"FADE_OUT superseded: dropping "
+                                f"{len(self._deferred_tts_audio)}B deferred TTS audio"
+                            )
+                            self._deferred_tts_audio.clear()
+                        if self._fade_pending or self._fade_active:
+                            self._defer_tts_until_fade_complete = True
+                            self._stop_sending_tts_to_server = True
+                            self._waiting_for_first_tts = False
                 elif not self._interrupting:
                     logger.debug("Start interrupting")
                     self._interrupting = True
@@ -384,11 +434,21 @@ class OjinVideoService(FrameProcessor):
         resampled_audio = await self._resampler.resample(
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
-        self._speech_buffer.extend(resampled_audio)
 
         if self._waiting_for_first_tts:
             self._waiting_for_first_tts = False
             await self.start_ttfb_metrics()
+
+        if self._defer_tts_until_fade_complete:
+            self._deferred_tts_audio.extend(resampled_audio)
+            logger.debug(
+                f"FADE_OUT pending: deferred {len(resampled_audio)} bytes of "
+                f"next-turn TTS audio (total={len(self._deferred_tts_audio)}B)"
+            )
+            return
+
+        self._speech_buffer.extend(resampled_audio)
+
         if self._stop_sending_tts_to_server:
             logger.debug(
                 f"FADE_OUT lockout: buffered {len(resampled_audio)} bytes for "
@@ -404,7 +464,7 @@ class OjinVideoService(FrameProcessor):
                 )
             )
 
-        if self._settings.tts_audio_passthrough:
+        if self._settings.tts_audio_passthrough and not self._stop_sending_tts_to_server:
             await self.push_frame(frame, FrameDirection.DOWNSTREAM)
 
     async def _handle_ojin_message(self, message: BaseModel):
@@ -749,9 +809,12 @@ class OjinVideoService(FrameProcessor):
                 )
                 if self._fade_samples_done >= _FADE_SAMPLES_TOTAL:
                     self._fade_active = False
-                    self._post_fade_mute = True
                     self._speech_buffer.clear()
-                    logger.info("Audio fade-out complete; muted until next TTS turn")
+                    if self._deferred_tts_audio:
+                        await self._flush_deferred_tts_after_fade()
+                    else:
+                        self._post_fade_mute = True
+                        logger.info("Audio fade-out complete; muted until next TTS turn")
 
             if self._post_fade_mute:
                 audio_frame = None
@@ -794,6 +857,35 @@ class OjinVideoService(FrameProcessor):
         out.pts = pts
         self._fade_samples_done += n
         return out
+
+    async def _flush_deferred_tts_after_fade(self) -> None:
+        """Release next-turn TTS that arrived while old speech was fading."""
+        if not self._deferred_tts_audio:
+            self._defer_tts_until_fade_complete = False
+            return
+
+        audio = bytes(self._deferred_tts_audio)
+        self._deferred_tts_audio.clear()
+        self._defer_tts_until_fade_complete = False
+        self._stop_sending_tts_to_server = False
+        self._post_fade_mute = False
+        self._fade_pending = False
+        self._fade_samples_done = 0
+        self._is_playing_speech_audio = False
+        self._speech_buffer.extend(audio)
+
+        if self._client is not None and self._initialized:
+            await self._client.send_message(
+                OjinAudioInputMessage(audio_int16_bytes=audio)
+            )
+            logger.info(
+                f"Audio fade-out complete; flushed {len(audio)}B deferred TTS audio"
+            )
+        else:
+            logger.warning(
+                f"Audio fade-out complete; dropped {len(audio)}B deferred TTS audio "
+                "because client is not ready"
+            )
 
     async def _consume_speech_frame(
         self, audio_frames_released: int, video_frames_sent: int
@@ -901,6 +993,8 @@ class OjinVideoService(FrameProcessor):
     async def _stop(self):
         self._initialized = False
         self._is_playing_speech_audio = False
+        self._defer_tts_until_fade_complete = False
+        self._deferred_tts_audio.clear()
         if self._client:
             await self._client.close()
             self._client = None

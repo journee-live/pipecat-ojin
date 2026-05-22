@@ -122,7 +122,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 21
+OJIN_VIDEO_SERVICE_VERSION = 22
 
 
 class OjinVideoService(FrameProcessor):
@@ -416,18 +416,6 @@ class OjinVideoService(FrameProcessor):
                 volume=volume,
             )
 
-            # FADE_OUT signal from server: cut bot audio immediately and
-            # lock out further TTS until the next TTSStartedFrame. The
-            # fade-out video frame still plays so the visual transition
-            # is smooth; only the TTS audio is hard-cut.
-            if video_frame.is_fade_out():
-                logger.info("FADE_OUT frame received — cutting bot audio")
-                self._speech_buffer.clear()
-                self._discard_tts = True
-                await self._stop_audio_playback()
-                self._video_frames.append(video_frame)
-                return
-
             if self._interrupting and not video_frame.is_silence():
                 logger.debug("Interrupting, dropping non-silence frame")
                 return
@@ -651,6 +639,17 @@ class OjinVideoService(FrameProcessor):
                     )
             else:
                 video_frame = await self._consume_idle_frame(num_next_silence_frames)
+
+            # FADE_OUT pop: cut bot audio at the exact moment the fade-out
+            # video frame is about to play, so audio and video transition
+            # together. The TTS lockout (_discard_tts) stays armed until
+            # the next TTSStartedFrame from upstream.
+            if video_frame is not None and getattr(video_frame, "frame_idx", None) == 2:
+                logger.info("FADE_OUT frame popped — cutting bot audio")
+                self._speech_buffer.clear()
+                self._discard_tts = True
+                await self._stop_audio_playback()
+                audio_frame = None
 
             if video_frame is not None:
                 if video_frame.is_silence():

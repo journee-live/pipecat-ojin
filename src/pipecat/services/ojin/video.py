@@ -83,6 +83,9 @@ class VideoFrame:
     def is_silence(self) -> bool:
         return self.frame_idx == 0
 
+    def is_fade_out(self) -> bool:
+        return self.frame_idx == 2
+
 
 class InterruptStrategy(Enum):
     """Interruption strategy for the playback loop.
@@ -90,11 +93,14 @@ class InterruptStrategy(Enum):
     SMOOTH: keep playing all buffered frames (video + audio).
     INSTANT_CUT: clear buffer, discard speech frames until first silence.
     SMOOTH_VIDEO_HARD_AUDIO: keep video playing, stop audio immediately.
+    FADE_OUT: server emits a fade-out video frame (frame_idx=2); bot cuts
+              audio + clears TTS buffer the moment that frame is received.
     """
 
     SMOOTH = "smooth"
     INSTANT_CUT = "instant_cut"
     SMOOTH_VIDEO_HARD_AUDIO = "smooth_video_hard_audio"
+    FADE_OUT = "fade_out"
 
 
 @dataclass
@@ -116,7 +122,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 20
+OJIN_VIDEO_SERVICE_VERSION = 21
 
 
 class OjinVideoService(FrameProcessor):
@@ -196,6 +202,10 @@ class OjinVideoService(FrameProcessor):
         self._discard_speech_until_silence = False
         self._pending_latency_report: Optional[tuple[float, float]] = None
 
+        # FADE_OUT: gates new TTS audio after a fade-out video frame is
+        # received from the server; reset on the next TTSStartedFrame.
+        self._discard_tts = False
+
     def can_generate_metrics(self) -> bool:
         """Enable TTFB metrics reporting via the standard pipecat metrics system."""
         return True
@@ -259,12 +269,13 @@ class OjinVideoService(FrameProcessor):
         elif isinstance(frame, TTSStartedFrame):
             logger.warning("TTSStartedFrame received")
             self._interrupting = False
+            self._discard_tts = False
             self._waiting_for_first_tts = True
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
-            if self._interrupting:
-                logger.debug("Interrupting, dropping TTS audio")
+            if self._interrupting or self._discard_tts:
+                logger.debug("Dropping TTS audio (interrupting or post-fade)")
                 return
             await self._send_tts_audio(frame)
 
@@ -278,34 +289,44 @@ class OjinVideoService(FrameProcessor):
                 and self._client is not None
                 and self._is_playing_speech_audio
             ):
-                logger.debug("Start interrupting")
-                self._interrupting = True
-                self._waiting_for_first_tts = False
                 strategy = self._settings.interrupt_strategy
 
-                if strategy == InterruptStrategy.SMOOTH:
-                    # Keep playing all buffered frames naturally
-                    pass
-                elif strategy == InterruptStrategy.INSTANT_CUT:
-                    # Clear all buffers, discard speech until silence
-                    self._video_frames.clear()
-                    self._speech_buffer.clear()
-                    self._discard_speech_until_silence = True
-                    # Guard: _first_silence_frame is None until the server
-                    # sends its first silence.  Appending None crashes the
-                    # playback loop (is_silence() on NoneType) and freezes
-                    # the video permanently.
-                    if self._first_silence_frame is not None:
-                        self._video_frames.append(self._first_silence_frame)
-                    self._turn += 1
-                    self._last_frame_idx = 0
-                    await self._stop_audio_playback()
-                elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
-                    # Stop audio immediately, keep video for smooth transition
-                    self._speech_buffer.clear()
-                    await self._stop_audio_playback()
+                if strategy == InterruptStrategy.FADE_OUT:
+                    # Server owns the cut: send cancel, keep playing
+                    # normally until the fade-out video frame arrives
+                    # (handled in _handle_ojin_message). Don't set
+                    # _interrupting=True — that would drop the fade-out
+                    # frame (frame_idx=2 is not silence).
+                    logger.debug("FADE_OUT: cancel sent, awaiting fade-out frame")
+                    await self._client.send_message(OjinCancelInteractionMessage())
+                else:
+                    logger.debug("Start interrupting")
+                    self._interrupting = True
+                    self._waiting_for_first_tts = False
 
-                await self._client.send_message(OjinCancelInteractionMessage())
+                    if strategy == InterruptStrategy.SMOOTH:
+                        # Keep playing all buffered frames naturally
+                        pass
+                    elif strategy == InterruptStrategy.INSTANT_CUT:
+                        # Clear all buffers, discard speech until silence
+                        self._video_frames.clear()
+                        self._speech_buffer.clear()
+                        self._discard_speech_until_silence = True
+                        # Guard: _first_silence_frame is None until the server
+                        # sends its first silence.  Appending None crashes the
+                        # playback loop (is_silence() on NoneType) and freezes
+                        # the video permanently.
+                        if self._first_silence_frame is not None:
+                            self._video_frames.append(self._first_silence_frame)
+                        self._turn += 1
+                        self._last_frame_idx = 0
+                        await self._stop_audio_playback()
+                    elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
+                        # Stop audio immediately, keep video for smooth transition
+                        self._speech_buffer.clear()
+                        await self._stop_audio_playback()
+
+                    await self._client.send_message(OjinCancelInteractionMessage())
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
@@ -394,6 +415,18 @@ class OjinVideoService(FrameProcessor):
                 is_final=message.is_final_response,
                 volume=volume,
             )
+
+            # FADE_OUT signal from server: cut bot audio immediately and
+            # lock out further TTS until the next TTSStartedFrame. The
+            # fade-out video frame still plays so the visual transition
+            # is smooth; only the TTS audio is hard-cut.
+            if video_frame.is_fade_out():
+                logger.info("FADE_OUT frame received — cutting bot audio")
+                self._speech_buffer.clear()
+                self._discard_tts = True
+                await self._stop_audio_playback()
+                self._video_frames.append(video_frame)
+                return
 
             if self._interrupting and not video_frame.is_silence():
                 logger.debug("Interrupting, dropping non-silence frame")

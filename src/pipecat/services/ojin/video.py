@@ -135,7 +135,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 22
+OJIN_VIDEO_SERVICE_VERSION = 23
 
 
 class OjinVideoService(FrameProcessor):

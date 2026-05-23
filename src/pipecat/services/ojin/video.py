@@ -122,7 +122,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 25
+OJIN_VIDEO_SERVICE_VERSION = 26
 
 
 class OjinVideoService(FrameProcessor):
@@ -299,10 +299,18 @@ class OjinVideoService(FrameProcessor):
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
             logger.debug("UserStartedSpeakingFrame received")
+            # NOTE: deliberately NOT guarded on `_is_playing_speech_audio`.
+            # The bot's local playback flag flips False during natural
+            # silence streaks, but the server may still be inferring a
+            # huge backlog of speech for the in-flight turn. If we skip
+            # the cancel here the server keeps generating frames and the
+            # bot keeps queueing TTS — net effect: the next playback
+            # starts with the WRONG (stale) audio. Send cancel on every
+            # VAD; the server's `_last_audio_was_silence` short-circuits
+            # it on the server side if there's truly nothing to fade.
             if (
                 not self._interrupting
                 and self._client is not None
-                and self._is_playing_speech_audio
             ):
                 strategy = self._settings.interrupt_strategy
 
@@ -709,13 +717,20 @@ class OjinVideoService(FrameProcessor):
                 frame_count += 1
                 self._last_played_image_bytes = video_frame.image_bytes
 
-                # OJIN FIX: Periodic buffer health log (every 50 frames = 2s)
-                if frame_count % 50 == 0 and self.fps_tracker is not None:
+                # Periodic buffer health log. Every 25 frames (~1 s) so
+                # we can see backlog build-up. The wire does not carry a
+                # server chunk_idx today, so the best frame identity we
+                # have on the bot side is `frame_count` (local play
+                # counter) and `frame_idx` (wire-type marker 0/1/2).
+                if frame_count % 25 == 0 and self.fps_tracker is not None:
                     mode = "SPEECH" if self._is_playing_speech_audio else "IDLE"
                     logger.info(
-                        f"[BUFFER] mode={mode} frame={frame_count} "
+                        f"[BUF_DEBUG] bot: mode={mode} frame={frame_count} "
                         f"video_buf={len(self._video_frames)} "
                         f"speech_buf={len(self._speech_buffer)}B "
+                        f"speech_buf_s={len(self._speech_buffer)/32000:.2f}s "
+                        f"is_playing_speech={self._is_playing_speech_audio} "
+                        f"discard_tts={self._discard_tts} "
                         f"audio_released={audio_frames_released} "
                         f"video_sent={video_frames_sent} "
                         f"fps={self.fps_tracker.partial_average_fps:.1f}"
@@ -723,11 +738,17 @@ class OjinVideoService(FrameProcessor):
 
                 if self._settings.frame_debugging_enabled:
                     mode = "SPEECH" if self._is_playing_speech_audio else "SILENCE"
-                    logger.debug(
-                        f"[{mode}] Playing frame {frame_count}, "
-                        f"audio_released: {audio_frames_released}, "
-                        f"video_sent: {video_frames_sent}, "
-                        f"buffer: {len(self._video_frames)}"
+                    _fidx = getattr(video_frame, "frame_idx", -1)
+                    _audio_kind = (
+                        "audio" if (audio_frame is not None) else "silence"
+                    )
+                    # INFO (not DEBUG) so this shows in production logs
+                    # when the user has frame_debugging_enabled=True.
+                    logger.info(
+                        f"[FRAME] {mode} play_frame={frame_count} "
+                        f"frame_idx={_fidx} audio={_audio_kind} "
+                        f"video_buf={len(self._video_frames)} "
+                        f"speech_buf={len(self._speech_buffer)}B"
                     )
                 output_vide_frame = await self.prepare_video_frame(
                     video_frame.image_bytes, video_frame.is_first_speech_frame, pts

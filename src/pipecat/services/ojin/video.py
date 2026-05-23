@@ -122,7 +122,7 @@ class OjinVideoSettings:
     interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
 
 
-OJIN_VIDEO_SERVICE_VERSION = 23
+OJIN_VIDEO_SERVICE_VERSION = 25
 
 
 class OjinVideoService(FrameProcessor):
@@ -314,6 +314,19 @@ class OjinVideoService(FrameProcessor):
                     # frame (frame_idx=2 is not silence).
                     logger.debug("FADE_OUT: cancel sent, awaiting fade-out frame")
                     self._fade_cut_done = False
+                    # Snapshot the cut boundary HERE (not at the next
+                    # TTSStartedFrame) because the fade pop can race ahead
+                    # of the LLM/TTS for the new turn. If we waited for
+                    # TTSStartedFrame to snapshot, cut_pos would still be
+                    # 0 at fade-pop and the trim would do nothing — every
+                    # byte already in _speech_buffer is OLD-turn audio
+                    # that the user must not hear again.
+                    self._speech_buffer_cut_pos = len(self._speech_buffer)
+                    # Drop any straggler OLD-turn TTS frames pipecat is
+                    # still delivering from the cancelled TTS task.
+                    # Reset on the new turn's TTSStartedFrame so NEW TTS
+                    # can flow in normally.
+                    self._discard_tts = True
                     await self._client.send_message(OjinCancelInteractionMessage())
                 else:
                     logger.debug("Start interrupting")

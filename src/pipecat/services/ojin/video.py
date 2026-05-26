@@ -299,25 +299,10 @@ class OjinVideoService(FrameProcessor):
             await self.push_frame(frame, direction)
         elif isinstance(frame, UserStartedSpeakingFrame):
             logger.debug("UserStartedSpeakingFrame received")
-            # Composite gate: fire the interrupt when EITHER the bot
-            # is actively emitting speech audio downstream, OR there
-            # is queued TTS that the playback loop hasn't started on
-            # yet. `_is_playing_speech_audio` alone misses the 200-
-            # 500 ms window between TTSAudioRawFrame arrival and
-            # `should_start_playing_audio` going True (TTS bytes are
-            # already in `_speech_buffer` but the video gate hasn't
-            # opened yet). Without the buffer check, real barge-ins
-            # in that window get silently swallowed. NOTE: this
-            # only works correctly because `_stop_audio_playback()`
-            # on the silence-streak stop path properly clears
-            # `_speech_buffer` (see the edit at line ~613).
             if (
                 not self._interrupting
                 and self._client is not None
-                and (
-                    self._is_playing_speech_audio
-                    or len(self._speech_buffer) > 0
-                )
+                and self._is_playing_speech_audio
             ):
                 strategy = self._settings.interrupt_strategy
 
@@ -620,15 +605,7 @@ class OjinVideoService(FrameProcessor):
                 logger.debug(
                     f"Stopped playing audio num_next_silence_frames: {num_next_silence_frames} speech_buffer_empty: {not self._speech_buffer}"
                 )
-                # DO NOT pre-flip `_is_playing_speech_audio = False` here.
-                # `_stop_audio_playback()` guards on that same flag at
-                # line 822 and early-returns when it's already False —
-                # which would skip `_speech_buffer.clear()` on line 828.
-                # The buffer would then accumulate stale TTS across
-                # every silence gap, making the composite guard at line
-                # 314 (`is_playing_speech_audio or len(_speech_buffer) > 0`)
-                # permanently True between turns. Let `_stop_audio_playback`
-                # own the flag flip so the buffer-clear path runs.
+                self._is_playing_speech_audio = False
                 await self._stop_audio_playback()
 
             # ── Step 2: Prepare audio ──

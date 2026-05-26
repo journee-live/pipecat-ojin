@@ -119,7 +119,7 @@ class OjinVideoSettings:
     stopped_speaking_delay_s: float = field(default=0.5)  # Delay before sending StoppedSpeaking
     frame_debugging_enabled: bool = field(default=False)
     start_frame_cls: Type[Frame] = field(default=StartFrame)
-    interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.INSTANT_CUT)
+    interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.FADE_OUT)
 
 
 OJIN_VIDEO_SERVICE_VERSION = 27
@@ -617,9 +617,7 @@ class OjinVideoService(FrameProcessor):
                     audio = bytes(self._speech_buffer[:chunk_size])
                     del self._speech_buffer[:chunk_size]
                 # Keep the FADE_OUT cut marker in current buffer coords.
-                self._speech_buffer_cut_pos = max(
-                    0, self._speech_buffer_cut_pos - len(audio)
-                )
+                self._speech_buffer_cut_pos = max(0, self._speech_buffer_cut_pos - len(audio))
 
                 audio_frame = OutputAudioRawFrame(
                     audio=audio,
@@ -720,7 +718,7 @@ class OjinVideoService(FrameProcessor):
                         f"[BUF_DEBUG] bot: mode={mode} frame={frame_count} "
                         f"video_buf={len(self._video_frames)} "
                         f"speech_buf={len(self._speech_buffer)}B "
-                        f"speech_buf_s={len(self._speech_buffer)/32000:.2f}s "
+                        f"speech_buf_s={len(self._speech_buffer) / 32000:.2f}s "
                         f"is_playing_speech={self._is_playing_speech_audio} "
                         f"discard_tts={self._discard_tts} "
                         f"audio_released={audio_frames_released} "
@@ -731,9 +729,7 @@ class OjinVideoService(FrameProcessor):
                 if self._settings.frame_debugging_enabled:
                     mode = "SPEECH" if self._is_playing_speech_audio else "SILENCE"
                     _fidx = getattr(video_frame, "frame_idx", -1)
-                    _audio_kind = (
-                        "audio" if (audio_frame is not None) else "silence"
-                    )
+                    _audio_kind = "audio" if (audio_frame is not None) else "silence"
                     # INFO (not DEBUG) so this shows in production logs
                     # when the user has frame_debugging_enabled=True.
                     logger.info(
@@ -857,7 +853,9 @@ class OjinVideoService(FrameProcessor):
             rgb_image = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             rgb_bytes = rgb_image.tobytes()
 
-            rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(target_w, target_h), format="RGB")
+            rgb_frame = OutputImageRawFrame(
+                image=rgb_bytes, size=(target_w, target_h), format="RGB"
+            )
             rgb_frame.pts = pts
             if is_first:
                 logger.warning(f"First image frame played!")

@@ -311,6 +311,7 @@ class OjinVideoService(FrameProcessor):
             if (
                 not self._interrupting
                 and self._client is not None
+                and self._is_playing_speech_audio
             ):
                 strategy = self._settings.interrupt_strategy
 

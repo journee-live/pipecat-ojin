@@ -1,16 +1,31 @@
-"""Continuous audio streaming variant of OjinVideoService.
+"""OjinVideoService v2 — simplified fadeout-only interruption.
 
-This service sends TTS audio to the inference server on-demand.
-The server maintains a virtual timeline at 25fps and generates silence
-when no client audio is available.
+Spec: ``demo-modal-agents/docs/ojin_video_service_redesign.md``.
+
+Key differences from the legacy module (``video_legacy.py``):
+
+* Single interruption strategy (fadeout). No ``InterruptStrategy`` enum.
+* Per-TTS audio buffer queue (each ``TTSStartedFrame`` opens a new buffer
+  in a FIFO). The *current* buffer is the head being drained into the
+  output; subsequent buffers wait their turn.
+* Explicit four-state machine (``IDLE``, ``SPEAKING``, ``INTERRUPTING``,
+  ``FADING_OUT``). Transitions are driven by the per-frame pop callback
+  ``_on_video_frame_popped``.
+* Interruption is allowed *only* when the bot is in ``SPEAKING``. User
+  speech during ``IDLE`` does not cancel anything.
+* Fadeout boundary: the server's ``frame_idx == 2`` video frame pops us
+  into ``FADING_OUT``; the first ``frame_idx == 0`` (silence) popped in
+  that state discards the current buffer and returns to ``IDLE``.
 """
+
+from __future__ import annotations
 
 import asyncio
 import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from typing import Optional, Tuple, Type
 
 import cv2
@@ -28,7 +43,7 @@ from ojin.ojin_client_messages import (
 from ojin.profiling_utils import FPSTracker
 from pydantic import BaseModel
 
-from pipecat.audio.utils import create_default_resampler, is_silence
+from pipecat.audio.utils import create_default_resampler
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -39,7 +54,6 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStartedFrame,
     UserStartedSpeakingFrame,
-    InterruptionTaskFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -52,26 +66,25 @@ class OjinVideoInitializedFrame(Frame):
 
 
 class OjinBotStartedSpeakingFrame(Frame):
-    """Frame sent after X seconds of receiving TTS audio."""
+    """Emitted when the service transitions IDLE → SPEAKING."""
 
     pass
 
 
 class OjinBotStoppedSpeakingFrame(Frame):
-    """Frame sent after Y seconds of running out of TTS audio."""
+    """Emitted when the service transitions out of speaking states → IDLE."""
 
     pass
 
 
-OJIN_PERSONA_SAMPLE_RATE = 16000
-BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)
-MAX_FRAMES_BUFFER = 7
-MIN_FRAMES_BUFFER = 2
+OJIN_PERSONA_SAMPLE_RATE = 16_000
+BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)  # 40 ms @ 16 kHz int16
+OJIN_VIDEO_SERVICE_VERSION = 28  # bump for v2
 
 
 @dataclass
 class VideoFrame:
-    """Represents a video frame with bundled audio from the server."""
+    """One video frame from the inference server, with bundled audio."""
 
     frame_idx: int
     image_bytes: bytes
@@ -87,52 +100,77 @@ class VideoFrame:
         return self.frame_idx == 2
 
 
-class InterruptStrategy(Enum):
-    """Interruption strategy for the playback loop.
+class State(Enum):
+    """Playback states for the v2 service.
 
-    SMOOTH: keep playing all buffered frames (video + audio).
-    INSTANT_CUT: clear buffer, discard speech frames until first silence.
-    SMOOTH_VIDEO_HARD_AUDIO: keep video playing, stop audio immediately.
-    FADE_OUT: server emits a fade-out video frame (frame_idx=2); bot cuts
-              audio + clears TTS buffer the moment that frame is received.
+    See ``demo-modal-agents/docs/ojin_video_service_redesign.md`` for the
+    transition table.
     """
 
-    SMOOTH = "smooth"
-    INSTANT_CUT = "instant_cut"
-    SMOOTH_VIDEO_HARD_AUDIO = "smooth_video_hard_audio"
-    FADE_OUT = "fade_out"
+    IDLE = auto()
+    SPEAKING = auto()
+    INTERRUPTING = auto()
+    FADING_OUT = auto()
+
+
+_AUDIO_BUFFER_COUNTER = 0
+
+
+def _next_audio_buffer_id() -> int:
+    global _AUDIO_BUFFER_COUNTER
+    _AUDIO_BUFFER_COUNTER += 1
+    return _AUDIO_BUFFER_COUNTER
+
+
+@dataclass
+class AudioBuffer:
+    """Holds the resampled TTS audio for one logical utterance.
+
+    A buffer is opened by ``TTSStartedFrame`` and extended by subsequent
+    ``TTSAudioRawFrame``s for the same turn. The next ``TTSStartedFrame``
+    opens a new buffer; the previous one stays in the queue until its
+    turn (or is discarded as part of a fadeout).
+
+    ``buffer_id`` is a monotonic identifier across the process. It's
+    used in logs to correlate audio events with the upstream TTS turn
+    that produced them.
+    """
+
+    sample_rate: int = OJIN_PERSONA_SAMPLE_RATE
+    num_channels: int = 1
+    bytes_: bytearray = field(default_factory=bytearray)
+    started_at: float = field(default_factory=time.monotonic)
+    buffer_id: int = field(default_factory=_next_audio_buffer_id)
 
 
 @dataclass
 class OjinVideoSettings:
-    """Settings for Ojin Video Continuous Service."""
+    """Settings for OjinVideoService v2.
 
-    api_key: str = field(default="")
-    ws_url: str = field(default="wss://models.ojin.ai/realtime")
-    client_connect_max_retries: int = field(default=3)
-    client_reconnect_delay: float = field(default=3.0)
-    config_id: str = field(default="")
-    image_size: Tuple[int, int] = field(default=(1280, 720))
-    tts_audio_passthrough: bool = field(default=False)
-    # Speaking notification delays
-    started_speaking_delay_s: float = field(default=0.5)  # Delay before sending StartedSpeaking
-    stopped_speaking_delay_s: float = field(default=0.5)  # Delay before sending StoppedSpeaking
-    frame_debugging_enabled: bool = field(default=False)
-    start_frame_cls: Type[Frame] = field(default=StartFrame)
-    interrupt_strategy: InterruptStrategy = field(default=InterruptStrategy.FADE_OUT)
+    NOTE: the legacy ``interrupt_strategy`` field has been removed —
+    v2 supports fadeout only.
+    """
 
-
-OJIN_VIDEO_SERVICE_VERSION = 27
+    api_key: str = ""
+    ws_url: str = "wss://models.ojin.ai/realtime"
+    client_connect_max_retries: int = 3
+    client_reconnect_delay: float = 3.0
+    config_id: str = ""
+    image_size: Tuple[int, int] = (1280, 720)
+    tts_audio_passthrough: bool = False
+    started_speaking_delay_s: float = 0.5
+    stopped_speaking_delay_s: float = 0.5
+    frame_debugging_enabled: bool = False
+    start_frame_cls: Type[Frame] = StartFrame
+    # Hard cap on FADING_OUT state duration. Prevents stuck state if the
+    # server never emits a post-fade silence frame for some reason.
+    fading_out_timeout_s: float = 2.0
+    # Maximum buffered server video frames before we start dropping oldest.
+    max_buffered_video_frames: int = 700
 
 
 class OjinVideoService(FrameProcessor):
-    """Continuous audio streaming service.
-
-    Sends TTS audio to the server on-demand:
-    - Client sends TTS audio immediately when received
-    - Server maintains virtual timeline at 25fps
-    - Server generates silence when no client audio available
-    """
+    """v2 service — state-machine driven, fadeout-only interruption."""
 
     def __init__(
         self,
@@ -141,7 +179,8 @@ class OjinVideoService(FrameProcessor):
     ) -> None:
         super().__init__(name="ojin")
         logger.debug(
-            f"OjinVideoService initialized with settings {settings} version: {OJIN_VIDEO_SERVICE_VERSION}"
+            f"OjinVideoService v2 initialised, version={OJIN_VIDEO_SERVICE_VERSION}, "
+            f"settings={settings}"
         )
 
         self._settings = settings
@@ -155,95 +194,82 @@ class OjinVideoService(FrameProcessor):
         else:
             self._client = client
 
+        # State.
+        self._state: State = State.IDLE
         self._session_data: Optional[dict] = None
+        self._initialized = False
 
-        # Video frames queue from server
+        # Server frames (incoming, popped by the playback loop).
         self._video_frames: deque[VideoFrame] = deque()
 
-        # Speech audio buffer - raw bytes ready to send (resampled to OJIN_PERSONA_SAMPLE_RATE)
-        self._speech_buffer: bytearray = bytearray()
+        # Audio buffer queue.
+        self._audio_buffers: deque[AudioBuffer] = deque()
+        self._current_buffer: Optional[AudioBuffer] = None
 
-        # Playback state
-        self.fps = 25
-        self.fps_tracker = FPSTracker("Ojin")
-
-        self._initialized = False
-        self.last_frame_time = 0
-        self._is_playing_speech_audio = False
-        self._waiting_for_first_tts = False
-        self._current_frame_idx = -1
-        self._played_frame_idx = -1
-        self._first_silence_frame: VideoFrame = None
-        self._last_played_image_bytes: Optional[bytes] = None
-
-        # Playback pause/resume — paused on start so frames buffer until
-        # the client joins the room and calls resume_playback().
-        self._playback_paused = True
-        self._playback_resume_event = asyncio.Event()
-        self._max_buffered_frames = 300
-
-        # Audio input handling
+        # Resampler for TTS → server sample rate.
         self._resampler = create_default_resampler()
 
-        # Tasks
+        # Playback timing.
+        self.fps = 25
+        self._frame_duration = 1.0 / self.fps  # 40 ms
+        self.fps_tracker = FPSTracker("Ojin")
+        self.last_frame_time = 0.0
+        self._last_played_image_bytes: Optional[bytes] = None
+
+        # Pause/resume. Paused on construction; consumer (widget) calls
+        # ``resume_playback()`` once the room is ready.
+        self._playback_paused = True
+        self._playback_resume_event = asyncio.Event()
+
+        # FADING_OUT safety timeout.
+        self._fading_out_started_at: Optional[float] = None
+
+        # Bot-side counters for logging — incremented every time we push
+        # a frame downstream. The wire protocol does not carry a
+        # sequential frame counter, so these are our best handle for
+        # correlating audio/video position with timeline events. They
+        # don't reset on interruption — they're cumulative for the
+        # process lifetime.
+        self._audio_chunks_emitted: int = 0
+        self._video_frames_emitted: int = 0
+
+        # TTFB metrics — set on TTSStartedFrame, cleared on first chunk.
+        self._waiting_for_first_tts = False
+
+        # Last server frame_idx (used for receive-side first-speech-frame
+        # detection).
+        self._last_received_frame_idx = -1
+
+        # Tasks.
         self._receive_msg_task: Optional[asyncio.Task] = None
         self._video_playback_task: Optional[asyncio.Task] = None
 
-        # Frame timing
-        self._frame_duration = 0.04
-
-        # Turn-boundary detection flags (set on receive, consumed on playback)
-        self._turn = 0
-        self._last_frame_idx = -1
-        self._pending_speech_start = False
-
-        # Interruption state
-        self._interrupting = False
-        self._discard_speech_until_silence = False
-        self._pending_latency_report: Optional[tuple[float, float]] = None
-
-        # FADE_OUT: gates new TTS audio after a fade-out video frame is
-        # received from the server; reset on the next TTSStartedFrame.
-        self._discard_tts = False
-        # FADE_OUT: byte offset into _speech_buffer marking the OLD/NEW
-        # utterance boundary. Snapshotted at the first TTSStartedFrame
-        # after a FADE_OUT cancel, decremented as the playback loop
-        # drains chunks, trimmed-to at the first fade-out video frame
-        # pop. Lets us preserve new-turn TTS that landed in the buffer
-        # between TTSStartedFrame and the fade-out pop.
-        self._speech_buffer_cut_pos: int = 0
-        # FADE_OUT: one-shot guard. The server emits 5 frame_idx==2
-        # frames, but only the first pop should trim. False between
-        # cancel-send and the first fade-out pop; True otherwise.
-        self._fade_cut_done: bool = True
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def can_generate_metrics(self) -> bool:
-        """Enable TTFB metrics reporting via the standard pipecat metrics system."""
         return True
 
     def pause_playback(self) -> None:
-        """Pause the playback loop. Frames keep being generated and buffered."""
         if not self._playback_paused:
             self._playback_paused = True
             self._playback_resume_event.clear()
             logger.info("OjinVideoService: playback paused")
 
     def resume_playback(self) -> None:
-        """Resume the playback loop. Buffered frames will play at normal rate."""
         if self._playback_paused:
             self._playback_paused = False
             self._playback_resume_event.set()
             logger.info(
                 f"OjinVideoService: playback resumed "
-                f"(buffered: {len(self._video_frames)} video, "
-                f"{len(self._speech_buffer)} audio bytes)"
+                f"(video_buf={len(self._video_frames)}, "
+                f"audio_buffers={len(self._audio_buffers)})"
             )
 
     async def connect_with_retry(self) -> bool:
-        """Attempt to connect with configurable retry mechanism."""
         last_error: Optional[Exception] = None
         assert self._client is not None
-
         for attempt in range(self._settings.client_connect_max_retries):
             try:
                 logger.info(
@@ -252,191 +278,168 @@ class OjinVideoService(FrameProcessor):
                 await self._client.connect()
                 logger.info("Successfully connected!")
                 return True
-
             except ConnectionError as e:
                 last_error = e
                 logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
-
                 if attempt < self._settings.client_connect_max_retries - 1:
-                    logger.info(f"Retrying in {self._settings.client_reconnect_delay} seconds...")
                     await asyncio.sleep(self._settings.client_reconnect_delay)
-
         await self.push_error(
-            error_msg=f"Failed to connect after {self._settings.client_connect_max_retries} attempts. error: {last_error}",
+            error_msg=(
+                f"Failed to connect after "
+                f"{self._settings.client_connect_max_retries} attempts: {last_error}"
+            ),
             fatal=True,
         )
         await self._stop()
         return False
 
+    # ------------------------------------------------------------------
+    # Frame processing entry point
+    # ------------------------------------------------------------------
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Process incoming frames from the pipeline."""
         await super().process_frame(frame, direction)
 
         if isinstance(frame, self._settings.start_frame_cls):
-            logger.debug(f"{self._settings.start_frame_cls.__name__} received")
             await self.push_frame(frame, direction)
             await self._start()
 
         elif isinstance(frame, TTSStartedFrame):
-            logger.warning("TTSStartedFrame received")
-            self._interrupting = False
-            self._discard_tts = False
-            # If a fade-out is in flight, any bytes currently in
-            # _speech_buffer are OLD-turn audio; anything appended after
-            # this point is NEW-turn. Mark the boundary.
-            self._speech_buffer_cut_pos = len(self._speech_buffer)
+            # Open a new buffer at the tail of the queue.
+            buf = AudioBuffer()
+            self._audio_buffers.append(buf)
             self._waiting_for_first_tts = True
+            logger.debug(
+                f"TTSStartedFrame: opened buffer #{id(buf) & 0xFFFF} "
+                f"(queue={len(self._audio_buffers)})"
+            )
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
-            if self._interrupting or self._discard_tts:
-                logger.debug("Dropping TTS audio (interrupting or post-fade)")
-                return
-            await self._send_tts_audio(frame)
+            await self._on_tts_audio_frame(frame)
+
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            await self._on_user_started_speaking(frame, direction)
 
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._stop()
             await self.push_frame(frame, direction)
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            logger.debug("UserStartedSpeakingFrame received")
-            if (
-                not self._interrupting
-                and self._client is not None
-                and self._is_playing_speech_audio
-            ):
-                strategy = self._settings.interrupt_strategy
 
-                if strategy == InterruptStrategy.FADE_OUT:
-                    # Server owns the cut: send cancel, keep playing
-                    # normally until the fade-out video frame arrives
-                    # (handled in _handle_ojin_message). Don't set
-                    # _interrupting=True — that would drop the fade-out
-                    # frame (frame_idx=2 is not silence).
-                    logger.debug("FADE_OUT: cancel sent, awaiting fade-out frame")
-                    self._fade_cut_done = False
-                    # Snapshot the cut boundary HERE (not at the next
-                    # TTSStartedFrame) because the fade pop can race ahead
-                    # of the LLM/TTS for the new turn. If we waited for
-                    # TTSStartedFrame to snapshot, cut_pos would still be
-                    # 0 at fade-pop and the trim would do nothing — every
-                    # byte already in _speech_buffer is OLD-turn audio
-                    # that the user must not hear again.
-                    self._speech_buffer_cut_pos = len(self._speech_buffer)
-                    # Drop any straggler OLD-turn TTS frames pipecat is
-                    # still delivering from the cancelled TTS task.
-                    # Reset on the new turn's TTSStartedFrame so NEW TTS
-                    # can flow in normally.
-                    self._discard_tts = True
-                    await self._client.send_message(OjinCancelInteractionMessage())
-                else:
-                    logger.debug("Start interrupting")
-                    self._interrupting = True
-                    self._waiting_for_first_tts = False
-
-                    if strategy == InterruptStrategy.SMOOTH:
-                        # Keep playing all buffered frames naturally
-                        pass
-                    elif strategy == InterruptStrategy.INSTANT_CUT:
-                        # Clear all buffers, discard speech until silence
-                        self._video_frames.clear()
-                        self._speech_buffer.clear()
-                        self._discard_speech_until_silence = True
-                        # Guard: _first_silence_frame is None until the server
-                        # sends its first silence.  Appending None crashes the
-                        # playback loop (is_silence() on NoneType) and freezes
-                        # the video permanently.
-                        if self._first_silence_frame is not None:
-                            self._video_frames.append(self._first_silence_frame)
-                        self._turn += 1
-                        self._last_frame_idx = 0
-                        await self._stop_audio_playback()
-                    elif strategy == InterruptStrategy.SMOOTH_VIDEO_HARD_AUDIO:
-                        # Stop audio immediately, keep video for smooth transition
-                        self._speech_buffer.clear()
-                        await self._stop_audio_playback()
-
-                    await self._client.send_message(OjinCancelInteractionMessage())
-            await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
 
-    async def _send_tts_audio(self, frame: TTSAudioRawFrame):
-        """Send TTS audio to the server immediately.
+    # ------------------------------------------------------------------
+    # TTS audio path
+    # ------------------------------------------------------------------
 
-        The server maintains a virtual timeline and will generate silence
-        when no client audio is available.
-        """
+    async def _on_tts_audio_frame(self, frame: TTSAudioRawFrame) -> None:
         if self._client is None or not self._initialized:
-            logger.warning(f"Discarded TTSAudioRawFrame because client is not ready")
+            logger.warning("TTSAudioRawFrame received before client ready — dropping")
             return
 
-        # Resample audio to target sample rate
-        resampled_audio = await self._resampler.resample(
+        # Pick the buffer this audio belongs to:
+        #   - If the queue has buffers, the tail buffer is the latest
+        #     turn the upstream TTS opened (with TTSStartedFrame). Audio
+        #     extends the tail.
+        #   - Else if we're SPEAKING, the head was already promoted to
+        #     _current_buffer and the upstream TTS is still streaming
+        #     audio for the same turn. Audio extends _current_buffer.
+        #   - During INTERRUPTING / FADING_OUT we drop incoming audio:
+        #     it's straggler audio from the cancelled turn (upstream
+        #     hasn't fully drained yet). Any new turn will start with
+        #     a fresh TTSStartedFrame which opens a queue buffer.
+        #   - In IDLE with no queued buffer, drop: no TTSStartedFrame
+        #     has opened a buffer.
+        target: Optional[AudioBuffer]
+        if self._audio_buffers:
+            target = self._audio_buffers[-1]
+        elif self._state == State.SPEAKING and self._current_buffer is not None:
+            target = self._current_buffer
+        else:
+            target = None
+
+        if target is None:
+            logger.warning(
+                f"TTSAudioRawFrame received with no target buffer "
+                f"(state={self._state.name}) — dropping {len(frame.audio)} bytes"
+            )
+            return
+
+        resampled = await self._resampler.resample(
             frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
-        self._speech_buffer.extend(resampled_audio)
+        target.sample_rate = frame.sample_rate
+        target.num_channels = frame.num_channels
+        target.bytes_.extend(frame.audio)
 
         if self._waiting_for_first_tts:
             self._waiting_for_first_tts = False
             await self.start_ttfb_metrics()
-        # Send audio to server immediately
-        logger.debug(f"Sending TTS audio to server, size: {len(resampled_audio)} bytes")
-        await self._client.send_message(
-            OjinAudioInputMessage(
-                audio_int16_bytes=resampled_audio,
-            )
-        )
+
+        await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=resampled))
 
         if self._settings.tts_audio_passthrough:
             await self.push_frame(frame, FrameDirection.DOWNSTREAM)
 
-    async def _handle_ojin_message(self, message: BaseModel):
-        """Process incoming messages from the server."""
+    # ------------------------------------------------------------------
+    # Interruption entry point
+    # ------------------------------------------------------------------
+
+    async def _on_user_started_speaking(
+        self, frame: UserStartedSpeakingFrame, direction: FrameDirection
+    ) -> None:
+        if self._can_interrupt():
+            logger.info("User started speaking while SPEAKING — sending cancel")
+            self._state = State.INTERRUPTING
+            await self._client.send_message(OjinCancelInteractionMessage())
+        else:
+            logger.debug(
+                f"User started speaking while {self._state.name} — ignoring (no cancel sent)"
+            )
+        await self.push_frame(frame, direction)
+
+    def _can_interrupt(self) -> bool:
+        return self._state == State.SPEAKING and self._current_buffer is not None
+
+    # ------------------------------------------------------------------
+    # Server message handling
+    # ------------------------------------------------------------------
+
+    async def _handle_ojin_message(self, message: BaseModel) -> None:
         if isinstance(message, OjinSessionReadyMessage):
             if message.parameters is not None:
                 self._session_data = message.parameters
-
             logger.info(f"Received Session Ready: {message}")
-            if self._session_data and self._session_data.get("server_id"):
-                logger.info(f"Connected to server: {self._session_data.get('server_id')}")
 
-            # Start the playback loop
             if self._video_playback_task is None:
                 self._video_playback_task = self.create_task(self._video_playback_loop())
 
-            # Notify that we're ready
             self._initialized = True
-            initialized_frame = OjinVideoInitializedFrame(session_data=self._session_data)
-            await self.push_frame(initialized_frame, direction=FrameDirection.DOWNSTREAM)
-            await self.push_frame(initialized_frame, direction=FrameDirection.UPSTREAM)
+            init_frame = OjinVideoInitializedFrame(session_data=self._session_data)
+            await self.push_frame(init_frame, direction=FrameDirection.DOWNSTREAM)
+            await self.push_frame(init_frame, direction=FrameDirection.UPSTREAM)
 
+            # Seed the server's audio timeline with one silent chunk so it
+            # starts emitting silence frames.
             await self._client.send_message(
-                OjinAudioInputMessage(
-                    audio_int16_bytes=b"\x00" * BYTES_PER_FRAME,
-                )
+                OjinAudioInputMessage(audio_int16_bytes=b"\x00" * BYTES_PER_FRAME)
             )
 
         elif isinstance(message, OjinInteractionResponseMessage):
             if not self.fps_tracker.is_running:
                 self.fps_tracker.start()
             self.fps_tracker.update(1)
-
             self.last_frame_time = time.monotonic()
+
             frame_idx = message.index
             samples = [
                 int.from_bytes(message.audio_frame_bytes[i : i + 2], "little", signed=True)
                 for i in range(0, len(message.audio_frame_bytes) - 1, 2)
             ]
-            volume = 0 if len(samples) == 0 else (sum(s * s for s in samples) / len(samples)) ** 0.5
+            volume = (
+                0 if len(samples) == 0 else int((sum(s * s for s in samples) / len(samples)) ** 0.5)
+            )
 
-            if self._settings.frame_debugging_enabled:
-                logger.debug(
-                    f"Received video frame {message.index} [{volume}], delta: {time.monotonic() - self.last_frame_time} buffer: {len(self._video_frames)}"
-                )
-                if self.fps_tracker.total_frames % 25 == 0:
-                    self.fps_tracker.log()
-
-            # Queue video frame with bundled audio
             video_frame = VideoFrame(
                 frame_idx=frame_idx,
                 image_bytes=message.video_frame_bytes,
@@ -445,57 +448,24 @@ class OjinVideoService(FrameProcessor):
                 volume=volume,
             )
 
-            if self._interrupting and not video_frame.is_silence():
-                logger.debug("Interrupting, dropping non-silence frame")
-                return
-
-            if self._interrupting and video_frame.is_silence():
-                logger.debug("First silence received after end of interruption")
-                self._interrupting = False
-
-            # After INSTANT_CUT the server may still have in-flight speech
-            # frames from the old batch.  TTSStartedFrame for the new
-            # response clears _interrupting, but _discard_speech_until_silence
-            # stays True until the server confirms the cancel by sending
-            # silence.  Drop stale speech so the user never sees the old
-            # animation bleed into the new one.
-            if self._discard_speech_until_silence and not video_frame.is_silence():
-                logger.debug("Discarding stale speech frame (waiting for post-cancel silence)")
-                return
-
-            if self._discard_speech_until_silence and video_frame.is_silence():
-                logger.debug("Post-cancel silence received, resuming frame intake")
-                self._discard_speech_until_silence = False
-
-            if self._first_silence_frame is None and video_frame.is_silence():
-                self._first_silence_frame = video_frame
-
-            if self._last_frame_idx == 0 and not video_frame.is_silence():
-                excess = max(0, len(self._video_frames) - MIN_FRAMES_BUFFER)
-                if excess > 0:
-                    for _ in range(excess):
-                        self._video_frames.popleft()
-                    logger.warning(
-                        f"First speech frame: dropped {excess} frames, buffer now {len(self._video_frames)}"
-                    )
+            # Mark first-speech-frame at the silence→speech boundary, server-side.
+            if self._last_received_frame_idx != 1 and frame_idx == 1:
                 video_frame.is_first_speech_frame = True
+                logger.debug(
+                    f"Received first speech frame after {time.time() - self._metrics._start_ttfb_time} seconds"
+                )
 
-            if frame_idx != self._last_frame_idx:
-                self._turn += 1
-                self._last_frame_idx = frame_idx
+            self._last_received_frame_idx = frame_idx
 
             self._video_frames.append(video_frame)
 
-            # OJIN FIX: Cap the buffer while playback is paused to prevent
-            # unbounded memory growth. Drop oldest frames first.
-            if len(self._video_frames) > self._max_buffered_frames:
-                dropped = len(self._video_frames) - self._max_buffered_frames
-                for _ in range(dropped):
+            # Backstop: never let the receive buffer grow unbounded.
+            cap = self._settings.max_buffered_video_frames
+            if len(self._video_frames) > cap:
+                drop = len(self._video_frames) - cap
+                for _ in range(drop):
                     self._video_frames.popleft()
-                logger.warning(
-                    f"Buffer overflow: dropped {dropped} oldest frames "
-                    f"(cap={self._max_buffered_frames})"
-                )
+                logger.warning(f"Receive buffer overflow: dropped {drop} oldest frames")
 
         elif isinstance(message, ErrorResponseMessage):
             await self.push_error(
@@ -503,379 +473,406 @@ class OjinVideoService(FrameProcessor):
             )
             await self._stop()
 
-    async def _receive_ojin_messages(self):
-        """Continuously receive and process messages from the server."""
+    async def _receive_ojin_messages(self) -> None:
         while True:
             assert self._client is not None
             message = await self._client.receive_message()
             if message is not None:
                 await self._handle_ojin_message(message)
 
-    async def _video_playback_loop(self):
-        """Main playback loop — state machine with audio-as-clock sync.
+    # ------------------------------------------------------------------
+    # State machine — runs once per video frame popped
+    # ------------------------------------------------------------------
 
-        State machine:
-          IDLE ──(first speech frame + audio ready)──> SPEAKING
-          SPEAKING ──(silence frame played)──────────> IDLE
-          SPEAKING ──(audio exhausted + silence pending)> IDLE
-          SPEAKING ──(interrupt)─────────────────────> depends on strategy
+    async def _on_video_frame_popped(self, frame: VideoFrame) -> None:
+        """Apply the state machine to one popped video frame.
 
-        Each tick (40ms):
-          1. Detect silence→speech pre-transition
-          2. Release one audio chunk (if speaking and audio available)
-          3. Audio-exhaustion guard (deadlock prevention)
-          4. Consume / sync one video frame
+        Transition table (matches the spec):
+
+            IDLE         + speech (first)  + queue non-empty  → SPEAKING (pop head)
+            SPEAKING     + silence + current buffer empty     → IDLE (drop current)
+            SPEAKING     + UserStartedSpeakingFrame (proc_frame) → INTERRUPTING
+            INTERRUPTING + fade_out                            → FADING_OUT
+            FADING_OUT   + silence                             → IDLE (discard buffer)
         """
-        logger.info("Starting playback loop")
+        if self._state == State.IDLE:
+            if not frame.is_silence() and frame.is_first_speech_frame and self._audio_buffers:
+                await self._promote_next_buffer(first_speech_frame=frame)
 
-        start_ts = time.perf_counter()
-        next_frame_time = start_ts + self._frame_duration
-        frame_count = 0
-        initial_buffer = 6
+        elif self._state == State.SPEAKING:
+            # Natural turn-end: server emits silence frame, our buffer
+            # has nothing left to play. Drop current and return to IDLE.
+            if (
+                frame.is_silence()
+                and self._current_buffer is not None
+                and len(self._current_buffer.bytes_) == 0
+            ):
+                logger.info(f"SPEAKING → IDLE (turn end; queue={len(self._audio_buffers)})")
+                self._current_buffer = None
+                self._state = State.IDLE
+                await self._emit_stopped_speaking()
 
-        # Audio-video sync counters (reset each speech turn)
-        audio_frames_released = 0
-        video_frames_sent = 0
+        elif self._state == State.INTERRUPTING:
+            if frame.is_fade_out():
+                self._state = State.FADING_OUT
+                self._fading_out_started_at = time.monotonic()
+                logger.info("INTERRUPTING → FADING_OUT (current buffer keeps draining)")
+            elif frame.is_silence():
+                # Server skipped the fade_out frame and went straight to
+                # silence. This happens when the server's audio input
+                # queue was already starving at interrupt time — there
+                # was nothing to fade out, so the server emits an
+                # ``unpaired_request`` and transitions to silence. Treat
+                # this silence frame the same way as the FADING_OUT →
+                # IDLE boundary: discard current buffer, return to IDLE.
+                # Without this branch the client gets stuck in
+                # INTERRUPTING and the next ``UserStartedSpeakingFrame``
+                # can't trigger a new cancel.
+                discarded = len(self._current_buffer.bytes_) if self._current_buffer else 0
+                logger.info(
+                    f"INTERRUPTING → IDLE on silence (no fade frame "
+                    f"emitted by server); discarding {discarded} bytes of "
+                    f"current buffer (queue={len(self._audio_buffers)})"
+                )
+                self._current_buffer = None
+                self._state = State.IDLE
+                await self._emit_stopped_speaking()
 
-        # Audio playback constants
+        elif self._state == State.FADING_OUT:
+            if frame.is_silence():
+                discarded = len(self._current_buffer.bytes_) if self._current_buffer else 0
+                logger.info(
+                    f"FADING_OUT → IDLE on silence; discarding {discarded} bytes "
+                    f"of current buffer (queue={len(self._audio_buffers)})"
+                )
+                self._current_buffer = None
+                self._fading_out_started_at = None
+                self._state = State.IDLE
+                await self._emit_stopped_speaking()
+
+        # Safety: if we've been FADING_OUT too long without a silence frame,
+        # force the transition.
+        if (
+            self._state == State.FADING_OUT
+            and self._fading_out_started_at is not None
+            and (time.monotonic() - self._fading_out_started_at)
+            > self._settings.fading_out_timeout_s
+        ):
+            logger.warning(
+                f"FADING_OUT safety timeout "
+                f"({self._settings.fading_out_timeout_s:.2f}s) — forcing → IDLE"
+            )
+            self._current_buffer = None
+            self._fading_out_started_at = None
+            self._state = State.IDLE
+            await self._emit_stopped_speaking()
+
+    async def _promote_next_buffer(self, first_speech_frame: Optional[VideoFrame] = None) -> None:
+        """Pop the head of the audio-buffer queue to become current.
+
+        Skips any empty buffers at the head — these arise when a
+        ``TTSStartedFrame`` was followed by no audio (e.g. user barged in
+        before any TTS audio landed). Empty buffers would otherwise block
+        progress for the next non-empty buffer in the queue.
+
+        If we end up with no non-empty buffer to promote, stay IDLE.
+
+        Lipsync check: when the promoting first-speech video frame is
+        provided, we compare the first chunk of audio we're about to
+        play against the audio bundled with that video frame
+        (``frame.audio_bytes``, which is what the server believes
+        belongs to this video frame). Mismatch indicates a sync drift —
+        we'd be playing audio that doesn't belong to this frame.
+        """
+        while self._audio_buffers:
+            candidate = self._audio_buffers.popleft()
+            if len(candidate.bytes_) == 0:
+                logger.debug(f"Skipping empty audio buffer #{candidate.buffer_id} on promotion")
+                continue
+            self._current_buffer = candidate
+            self._state = State.SPEAKING
+            logger.info(
+                f"IDLE → SPEAKING — buffer #{candidate.buffer_id} promoted "
+                f"({len(candidate.bytes_)} bytes, queue={len(self._audio_buffers)}); "
+                f"cumulative emitted audio_chunks={self._audio_chunks_emitted} "
+                f"video_frames={self._video_frames_emitted}"
+            )
+            if first_speech_frame is not None:
+                await self._check_lipsync_alignment(candidate, first_speech_frame)
+            await self._emit_started_speaking()
+            return
+        # No non-empty buffer found.
+        logger.debug("First-speech frame arrived but no non-empty buffer to promote")
+
+    async def _check_lipsync_alignment(
+        self, buffer: "AudioBuffer", first_speech_frame: VideoFrame
+    ) -> None:
+        """Compare buffer head against first speech frame's bundled audio.
+
+        Log a warning when they disagree — the bot would be visibly out
+        of sync (playing audio that doesn't belong to this video frame).
+
+        The buffer holds audio at the TTS-native sample rate / channel
+        count (whatever the upstream TTS emits). The server's
+        ``audio_bytes`` is always at ``OJIN_PERSONA_SAMPLE_RATE`` mono
+        (the format we sent to the server). To compare meaningfully we
+        resample one 40 ms slice of the buffer head down to the server
+        format, then byte-compare.
+
+        Notes:
+          * We use a *fresh* resampler instance, not ``self._resampler``,
+            because the latter carries streaming state from the TTS path
+            and would treat the fresh slice as a continuation, producing
+            slightly different output bytes.
+          * Stereo buffers can't be byte-compared against mono server
+            audio without downmixing — we log a metadata-only line in
+            that case and skip the compare.
+        """
+        server_audio = first_speech_frame.audio_bytes or b""
+        # Bytes per 40 ms tick on the wire (server is always 16k mono int16).
+        server_chunk_size = int(OJIN_PERSONA_SAMPLE_RATE * self._frame_duration) * 2
+        # Bytes per 40 ms tick at the buffer's native format.
+        buf_chunk_size = int(buffer.sample_rate * self._frame_duration) * buffer.num_channels * 2
+        info_prefix = (
+            f"[LIPSYNC] buffer #{buffer.buffer_id} "
+            f"({buffer.sample_rate}Hz/{buffer.num_channels}ch, "
+            f"buf_chunk={buf_chunk_size}B, head={len(buffer.bytes_)}B) "
+            f"vs server frame ({len(server_audio)}B at "
+            f"{OJIN_PERSONA_SAMPLE_RATE}Hz/1ch)"
+        )
+
+        if len(server_audio) == 0:
+            logger.warning(f"{info_prefix} — first speech frame carried 0 bytes of audio")
+            return
+
+        if buffer.num_channels != 1:
+            # Server audio is mono; comparing against a multi-channel
+            # buffer head requires a downmix we'd rather not implement
+            # for a diagnostic. Just log the alignment metadata.
+            logger.info(f"{info_prefix} — byte-compare skipped (stereo buffer)")
+            return
+
+        if len(buffer.bytes_) < buf_chunk_size:
+            logger.warning(
+                f"{info_prefix} — buffer too short for a 40 ms slice "
+                f"(have {len(buffer.bytes_)}B, need {buf_chunk_size}B)"
+            )
+            return
+
+        buffer_head = bytes(buffer.bytes_[:buf_chunk_size])
+        if buffer.sample_rate == OJIN_PERSONA_SAMPLE_RATE:
+            # Same format as the server. Direct byte compare is meaningful
+            # and avoids a resample.
+            resampled_head = buffer_head
+        else:
+            # Fresh resampler — see docstring note about streaming state.
+            fresh_resampler = create_default_resampler()
+            resampled_head = await fresh_resampler.resample(
+                buffer_head, buffer.sample_rate, OJIN_PERSONA_SAMPLE_RATE
+            )
+
+        cmp_len = min(len(resampled_head), len(server_audio), server_chunk_size)
+        if cmp_len == 0:
+            logger.warning(f"{info_prefix} — nothing to compare after resampling")
+            return
+
+        a = resampled_head[:cmp_len]
+        b = server_audio[:cmp_len]
+        if a == b:
+            logger.info(f"{info_prefix} — byte-level match ({cmp_len}B)")
+        else:
+            diff_at = next(
+                (i for i in range(cmp_len) if a[i] != b[i]),
+                cmp_len,
+            )
+            logger.warning(
+                f"{info_prefix} — MISMATCH at byte {diff_at}/{cmp_len}. Visual lipsync will drift."
+            )
+
+    # ------------------------------------------------------------------
+    # Playback loop
+    # ------------------------------------------------------------------
+
+    async def _video_playback_loop(self) -> None:
+        """Audio-as-clock playback loop.
+
+        Each 40 ms tick:
+          1. If paused, wait for resume.
+          2. Sleep + spin-lock until the next tick boundary.
+          3. Pop one video frame (if any). Run the state machine.
+          4. Drain one chunk from the current buffer if in a speaking state.
+          5. Emit OutputAudioRawFrame (audio or silence) + OutputImageRawFrame.
+        """
+        logger.info("Starting v2 playback loop")
+
         sample_rate = OJIN_PERSONA_SAMPLE_RATE
+        audio_shape_initialized = False
         num_channels = 1
         chunk_size = int(sample_rate * self._frame_duration) * num_channels * 2
-        is_first_audio_frame = True
-        audio_frame = None
-        silence_frame = TTSAudioRawFrame(
-            audio=b"\x00" * chunk_size,
-            sample_rate=sample_rate,
-            num_channels=num_channels,
+        silence_chunk = b"\x00" * chunk_size
+        start_ts = time.perf_counter()
+        next_tick = start_ts + self._frame_duration
+        initial_buffer = 6
+        silence_audio = OutputAudioRawFrame(
+            audio=silence_chunk, sample_rate=OJIN_PERSONA_SAMPLE_RATE, num_channels=1
         )
-        num_silence_frames_played = 0
-        output_vide_frame = None
         while self._initialized:
-            # OJIN FIX: Wait while playback is paused (frames keep buffering).
-            # When resumed, reset the frame clock so we don't try to catch up.
             if self._playback_paused:
                 await self._playback_resume_event.wait()
-                next_frame_time = time.perf_counter() + self._frame_duration
+                next_tick = time.perf_counter() + self._frame_duration
                 initial_buffer = 6
                 continue
 
-            # Sleep for most of the wait time
             now = time.perf_counter()
-            sleep_time = next_frame_time - now - 0.003
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-
-            # Spin lock for precise timing
-            while time.perf_counter() < next_frame_time:
+            sleep_for = next_tick - now - 0.003
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            while time.perf_counter() < next_tick:
                 pass
+            next_tick += self._frame_duration
 
-            next_frame_time += self._frame_duration
-
-            # Wait for initial buffer to fill
-            if len(self._video_frames) > 0 and initial_buffer > 0:
+            # Initial buffer warm-up.
+            if self._video_frames and initial_buffer > 0:
                 initial_buffer -= 1
                 continue
 
             pts = int(time.monotonic() * 1_000_000_000)
 
-            num_next_silence_frames = self.get_num_next_silence_frames()
-            should_play_speech_video_frame = (
-                num_next_silence_frames == 0 and len(self._video_frames) > 0
-            )
-            should_start_playing_audio = (
-                should_play_speech_video_frame
-                and not self._interrupting
-                and not self._is_playing_speech_audio
-                and self._speech_buffer
-            )
-            should_stop_playing_audio = self._is_playing_speech_audio and (
-                num_silence_frames_played > 5 or not self._speech_buffer
-            )
-            # ── Step 1: Silence→speech pre-check ──
-            # Requires BOTH first_speech_frame AND audio available.
-            if should_start_playing_audio:
-                logger.debug("Started playing audio")
-                self._is_playing_speech_audio = True
-                audio_frames_released = 0
-                video_frames_sent = 0
-                is_first_audio_frame = True
-                self._discard_speech_until_silence = False
-                await self._start_audio_playback()
-            elif should_stop_playing_audio:
-                logger.debug(
-                    f"Stopped playing audio num_next_silence_frames: {num_next_silence_frames} speech_buffer_empty: {not self._speech_buffer}"
-                )
-                self._is_playing_speech_audio = False
-                await self._stop_audio_playback()
-
-            # ── Step 2: Prepare audio ──
-            if self._is_playing_speech_audio and self._speech_buffer:
-                if len(self._speech_buffer) < chunk_size:
-                    audio = bytes(self._speech_buffer)
-                    self._speech_buffer.clear()
-                else:
-                    audio = bytes(self._speech_buffer[:chunk_size])
-                    del self._speech_buffer[:chunk_size]
-                # Keep the FADE_OUT cut marker in current buffer coords.
-                self._speech_buffer_cut_pos = max(0, self._speech_buffer_cut_pos - len(audio))
-
-                audio_frame = OutputAudioRawFrame(
-                    audio=audio,
-                    sample_rate=sample_rate,
-                    num_channels=num_channels,
-                )
-                audio_frame.pts = pts
-                if is_first_audio_frame:
-                    logger.warning(f"First audio frame played! size: {len(audio_frame.audio)}")
-                    is_first_audio_frame = False
-                audio_frames_released += 1
-            elif self._is_playing_speech_audio and not self._speech_buffer:
-                # OJIN FIX: Complete audio starvation — speech mode but no
-                # audio data at all.  This is the primary micro-freeze trigger.
-                logger.warning(
-                    f"[UNDERRUN] speech_buffer: EMPTY during speech playback, "
-                    f"audio_released={audio_frames_released}, "
-                    f"video_sent={video_frames_sent}, "
-                    f"video_buf={len(self._video_frames)}"
-                )
-                audio_frame = None
-            else:
-                audio_frame = None
-
-            # ── Step 4: Consume video frame ──
+            # Pop a video frame (if any). Note: we may emit silence audio
+            # and a repeated image when the buffer is empty (server slow).
             video_frame: Optional[VideoFrame] = None
+            if self._video_frames:
+                video_frame = self._video_frames.popleft()
+                await self._on_video_frame_popped(video_frame)
 
-            if should_play_speech_video_frame:
-                # OJIN FIX: Log video buffer underrun before consuming
-                if len(self._video_frames) == 0:
-                    logger.warning(
-                        f"[UNDERRUN] video_frames: buffer empty during speech, "
-                        f"frame_count={frame_count}, "
-                        f"audio_released={audio_frames_released}, "
-                        f"speech_buf={len(self._speech_buffer)}B"
-                    )
-                video_frame, skipped_speech = await self._consume_speech_frame(
-                    audio_frames_released, video_frames_sent
+            # Audio: drain one chunk from current_buffer if speaking.
+            audio_frame: Optional[OutputAudioRawFrame] = None
+            speaking_audio = (
+                self._state
+                in (
+                    State.SPEAKING,
+                    State.INTERRUPTING,
+                    State.FADING_OUT,
                 )
-                video_frames_sent += skipped_speech
-                if video_frame is not None:
-                    video_frames_sent += 1
+                and self._current_buffer is not None
+            )
+
+            if speaking_audio and self._current_buffer:
+                # Initialize audio shape and silence chunk if we haven't yet (e.g. if the first frame(s)
+                if not audio_shape_initialized:
+                    audio_shape_initialized = True
+                    sample_rate = self._current_buffer.sample_rate
+                    num_channels = self._current_buffer.num_channels
+                    chunk_size = int(sample_rate * self._frame_duration) * num_channels * 2
+                    silence_chunk = b"\x00" * chunk_size
+                    silence_audio = OutputAudioRawFrame(
+                        audio=silence_chunk, sample_rate=sample_rate, num_channels=num_channels
+                    )
+                buf = self._current_buffer.bytes_
+                if len(buf) >= chunk_size:
+                    chunk = bytes(buf[:chunk_size])
+                    del buf[:chunk_size]
+                elif len(buf) > 0:
+                    chunk = bytes(buf)
+                    buf.clear()
                 else:
+                    # Underrun.
                     logger.warning(
-                        f"[UNDERRUN] video_frames: frame miss at {frame_count}, "
-                        f"repeating last frame"
+                        f"[UNDERRUN] current buffer empty while "
+                        f"{self._state.name} — emitting silence"
                     )
-                    video_frame = VideoFrame(
-                        image_bytes=self._last_played_image_bytes, is_first_speech_frame=False
+                    chunk = None
+
+                if chunk is not None:
+                    audio_frame = OutputAudioRawFrame(
+                        audio=chunk,
+                        sample_rate=self._current_buffer.sample_rate,
+                        num_channels=self._current_buffer.num_channels,
                     )
-            else:
-                video_frame = await self._consume_idle_frame(num_next_silence_frames)
+                    audio_frame.pts = pts
 
-            # FADE_OUT pop: at the exact moment the fade-out video frame
-            # is about to play, trim only the OLD-turn prefix of
-            # _speech_buffer; preserve NEW-turn TTS that arrived after
-            # TTSStartedFrame. Pushes silence audio for this one tick;
-            # next tick the loop re-engages playback from the preserved
-            # NEW bytes. Guarded as one-shot because the server emits 5
-            # frame_idx==2 frames.
-            if (
-                video_frame is not None
-                and getattr(video_frame, "frame_idx", None) == 2
-                and not self._fade_cut_done
-            ):
-                cut = min(self._speech_buffer_cut_pos, len(self._speech_buffer))
-                preserved = len(self._speech_buffer) - cut
-                logger.info(
-                    f"FADE_OUT frame popped — trimming {cut}B of old TTS, "
-                    f"preserving {preserved}B of new TTS"
-                )
-                del self._speech_buffer[:cut]
-                self._speech_buffer_cut_pos = 0
-                self._fade_cut_done = True
-                # Emit OjinBotStoppedSpeakingFrame downstream (RTVI /
-                # latency tracker need the turn boundary) but DON'T wipe
-                # the trimmed buffer — that's the new utterance's audio.
-                await self._stop_audio_playback(clear_buffer=False)
-                audio_frame = None
-
+            # Push frames downstream.
             if video_frame is not None:
-                if video_frame.is_silence():
-                    num_silence_frames_played += 1
-                else:
-                    num_silence_frames_played = 0
-
-                frame_count += 1
                 self._last_played_image_bytes = video_frame.image_bytes
+                out_image = await self._prepare_video_frame(video_frame.image_bytes, pts)
+                if out_image is not None:
+                    await self.push_frame(out_image)
+                    self._video_frames_emitted += 1
+                # audio_frame = OutputAudioRawFrame(
+                #     audio=video_frame.audio_bytes,
+                #     sample_rate=sample_rate,
+                #     num_channels=num_channels,
+                # )
+            elif self._last_played_image_bytes is not None:
+                # No new frame — repeat the last one to keep the video flowing.
+                out_image = await self._prepare_video_frame(self._last_played_image_bytes, pts)
+                if out_image is not None:
+                    await self.push_frame(out_image)
+                    self._video_frames_emitted += 1
 
-                # Periodic buffer health log. Every 25 frames (~1 s) so
-                # we can see backlog build-up. The wire does not carry a
-                # server chunk_idx today, so the best frame identity we
-                # have on the bot side is `frame_count` (local play
-                # counter) and `frame_idx` (wire-type marker 0/1/2).
-                if frame_count % 25 == 0 and self.fps_tracker is not None:
-                    mode = "SPEECH" if self._is_playing_speech_audio else "IDLE"
-                    logger.info(
-                        f"[BUF_DEBUG] bot: mode={mode} frame={frame_count} "
-                        f"video_buf={len(self._video_frames)} "
-                        f"speech_buf={len(self._speech_buffer)}B "
-                        f"speech_buf_s={len(self._speech_buffer) / 32000:.2f}s "
-                        f"is_playing_speech={self._is_playing_speech_audio} "
-                        f"discard_tts={self._discard_tts} "
-                        f"audio_released={audio_frames_released} "
-                        f"video_sent={video_frames_sent} "
-                        f"fps={self.fps_tracker.partial_average_fps:.1f}"
-                    )
+            await self.push_frame(audio_frame or silence_audio)
+            self._audio_chunks_emitted += 1
 
-                if self._settings.frame_debugging_enabled:
-                    mode = "SPEECH" if self._is_playing_speech_audio else "SILENCE"
-                    _fidx = getattr(video_frame, "frame_idx", -1)
-                    _audio_kind = "audio" if (audio_frame is not None) else "silence"
-                    # INFO (not DEBUG) so this shows in production logs
-                    # when the user has frame_debugging_enabled=True.
-                    logger.info(
-                        f"[FRAME] {mode} play_frame={frame_count} "
-                        f"frame_idx={_fidx} audio={_audio_kind} "
-                        f"video_buf={len(self._video_frames)} "
-                        f"speech_buf={len(self._speech_buffer)}B"
-                    )
-                output_vide_frame = await self.prepare_video_frame(
-                    video_frame.image_bytes, video_frame.is_first_speech_frame, pts
-                )
-                if output_vide_frame is not None:
-                    await self.push_frame(output_vide_frame)
+    # ------------------------------------------------------------------
+    # Started/Stopped speaking signalling
+    # ------------------------------------------------------------------
 
-            if audio_frame is not None:
-                await self.push_frame(audio_frame)
-            else:
-                await self.push_frame(silence_frame)
-
-    async def _consume_speech_frame(
-        self, audio_frames_released: int, video_frames_sent: int
-    ) -> tuple[Optional[VideoFrame], int]:
-        frame = self._video_frames.popleft()
-        return frame, 0
-
-    async def _consume_idle_frame(self, num_next_silence_frames: int) -> Optional[VideoFrame]:
-        """Consume one video frame in idle (silence) mode.
-
-        Plays frames at normal 25fps rate. Handles instant-cut discard logic.
-        Does not consume first_speech_frame — those wait for audio.
-        """
-        if not self._video_frames:
-            return None
-
-        frame = self._video_frames.popleft()
-        num_next_silence_frames -= 1
-        # Buffer management for silence frames
-        if num_next_silence_frames > MAX_FRAMES_BUFFER:
-            self._video_frames.popleft()
-            num_next_silence_frames -= 1
-            if self._settings.frame_debugging_enabled:
-                logger.debug(
-                    f"Skipping silence frame num_next_silence_frames: {num_next_silence_frames}, "
-                    f"target: {MAX_FRAMES_BUFFER}"
-                )
-
-        if self.is_pending_speech_waiting_in_buffer() and num_next_silence_frames:
-            self._video_frames.popleft()
-            num_next_silence_frames -= 1
-            if self._settings.frame_debugging_enabled:
-                logger.debug(
-                    f"Skipping additional silence frame num_next_silence_frames: {num_next_silence_frames}"
-                )
-        return frame
-
-    def is_pending_speech_waiting_in_buffer(self) -> bool:
-        """Check if there are any pending speech frames in the buffer."""
-        return any(frame.is_first_speech_frame for frame in self._video_frames)
-
-    def get_num_next_silence_frames(self) -> int:
-        """Count consecutive silence frames from the front of the buffer."""
-        count = 0
-        for frame in self._video_frames:
-            if frame.is_silence() or (frame.volume == 0 and not self._is_playing_speech_audio):
-                count += 1
-            else:
-                break
-        return count
-
-    async def _start_audio_playback(self):
-        logger.warning("Starting audio playback")
-        self._is_playing_speech_audio = True
-        await self.push_frame(OjinBotStartedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
+    async def _emit_started_speaking(self) -> None:
+        await self.push_frame(OjinBotStartedSpeakingFrame())
         await self.stop_ttfb_metrics()
 
-    async def _stop_audio_playback(self, clear_buffer: bool = True):
-        if not self._is_playing_speech_audio:
+    async def _emit_stopped_speaking(self) -> None:
+        await self.push_frame(OjinBotStoppedSpeakingFrame())
+
+    # ------------------------------------------------------------------
+    # Service lifecycle
+    # ------------------------------------------------------------------
+
+    async def _start(self) -> None:
+        if not await self.connect_with_retry():
             return
-
-        self._is_playing_speech_audio = False
-        await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
-        if clear_buffer:
-            self._speech_buffer.clear()
-
-    async def _start(self):
-        """Initialize the service and start processing."""
-        is_connected = await self.connect_with_retry()
-        if not is_connected:
-            return
-
-        # Start receiving messages
+        assert self._client is not None
         self._receive_msg_task = self.create_task(self._receive_ojin_messages())
-
-        # Start an interaction for continuous streaming
         await self._client.start_interaction()
 
-    async def prepare_video_frame(
-        self, video: bytes, is_first: bool = False, pts: Optional[int] = None
-    ) -> OutputImageRawFrame:
-        if pts is None:
-            pts = int(time.monotonic() * 1_000_000_000)
-        image_array = np.frombuffer(video, dtype=np.uint8)
-        image_size = self._settings.image_size
-        decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-        if decoded_image is not None:
-            h, w = decoded_image.shape[:2]
-            target_w, target_h = image_size
-
-            # Scale to cover: fill target exactly, crop center if needed.
-            # Avoids black bars on silence frames that differ in aspect ratio.
-            scale = max(target_w / w, target_h / h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-
-            scaled_image = cv2.resize(decoded_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-            x_off = (new_w - target_w) // 2
-            y_off = (new_h - target_h) // 2
-            cropped = scaled_image[y_off : y_off + target_h, x_off : x_off + target_w]
-
-            rgb_image = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-            rgb_bytes = rgb_image.tobytes()
-
-            rgb_frame = OutputImageRawFrame(
-                image=rgb_bytes, size=(target_w, target_h), format="RGB"
-            )
-            rgb_frame.pts = pts
-            if is_first:
-                logger.warning(f"First image frame played!")
-            return rgb_frame
-        return None
-
-    async def _stop(self):
+    async def _stop(self) -> None:
         self._initialized = False
-        self._is_playing_speech_audio = False
-        if self._client:
-            await self._client.close()
-            self._client = None
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception as e:
+                logger.warning(f"Error closing client: {e}")
+        for t in (self._receive_msg_task, self._video_playback_task):
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-        """Stop the service and clean up resources."""
-        if self._receive_msg_task:
-            await self.cancel_task(self._receive_msg_task)
-            self._receive_msg_task = None
+    # ------------------------------------------------------------------
+    # Frame preparation (JPEG decode + crop to target aspect)
+    # ------------------------------------------------------------------
 
-        if self._video_playback_task:
-            await self.cancel_task(self._video_playback_task)
-            self._video_playback_task = None
-
-        logger.debug(f"OjinVideoService {self._settings.config_id} stopped")
+    async def _prepare_video_frame(
+        self, video_bytes: bytes, pts: Optional[int] = None
+    ) -> Optional[OutputImageRawFrame]:
+        if not video_bytes:
+            return None
+        arr = np.frombuffer(video_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        target_w, target_h = self._settings.image_size
+        h, w = bgr.shape[:2]
+        scale = max(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        x = (new_w - target_w) // 2
+        y = (new_h - target_h) // 2
+        bgr = bgr[y : y + target_h, x : x + target_w]
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        out = OutputImageRawFrame(image=rgb.tobytes(), size=(target_w, target_h), format="RGB")
+        if pts is not None:
+            out.pts = pts
+        return out

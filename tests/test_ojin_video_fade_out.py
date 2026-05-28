@@ -18,7 +18,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.ojin.video import (
+from pipecat.services.ojin.video_legacy import (
     InterruptStrategy,
     OjinVideoService,
     OjinVideoSettings,

@@ -162,9 +162,6 @@ class OjinVideoSettings:
     stopped_speaking_delay_s: float = 0.5
     frame_debugging_enabled: bool = False
     start_frame_cls: Type[Frame] = StartFrame
-    # Hard cap on FADING_OUT state duration. Prevents stuck state if the
-    # server never emits a post-fade silence frame for some reason.
-    fading_out_timeout_s: float = 2.0
     # Maximum buffered server video frames before we start dropping oldest.
     max_buffered_video_frames: int = 700
 
@@ -221,8 +218,6 @@ class OjinVideoService(FrameProcessor):
         self._playback_paused = True
         self._playback_resume_event = asyncio.Event()
 
-        # FADING_OUT safety timeout.
-        self._fading_out_started_at: Optional[float] = None
 
         # Bot-side counters for logging — incremented every time we push
         # a frame downstream. The wire protocol does not carry a
@@ -474,11 +469,32 @@ class OjinVideoService(FrameProcessor):
             await self._stop()
 
     async def _receive_ojin_messages(self) -> None:
+        """Pull messages off the websocket and dispatch to the handler.
+
+        Wraps each receive + handle in try/except so a malformed message
+        or transient handler exception doesn't silently kill the loop —
+        that would stop ``_video_frames`` from ever getting new entries
+        and leave the playback loop ticking forever with no state input.
+        """
         while True:
             assert self._client is not None
-            message = await self._client.receive_message()
-            if message is not None:
+            try:
+                message = await self._client.receive_message()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error receiving server message — continuing")
+                continue
+            if message is None:
+                continue
+            try:
                 await self._handle_ojin_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Error handling server message {type(message).__name__} — continuing"
+                )
 
     # ------------------------------------------------------------------
     # State machine — runs once per video frame popped
@@ -515,19 +531,11 @@ class OjinVideoService(FrameProcessor):
         elif self._state == State.INTERRUPTING:
             if frame.is_fade_out():
                 self._state = State.FADING_OUT
-                self._fading_out_started_at = time.monotonic()
                 logger.info("INTERRUPTING → FADING_OUT (current buffer keeps draining)")
             elif frame.is_silence():
                 # Server skipped the fade_out frame and went straight to
-                # silence. This happens when the server's audio input
-                # queue was already starving at interrupt time — there
-                # was nothing to fade out, so the server emits an
-                # ``unpaired_request`` and transitions to silence. Treat
-                # this silence frame the same way as the FADING_OUT →
-                # IDLE boundary: discard current buffer, return to IDLE.
-                # Without this branch the client gets stuck in
-                # INTERRUPTING and the next ``UserStartedSpeakingFrame``
-                # can't trigger a new cancel.
+                # silence (``unpaired_request`` on the server side: the
+                # audio queue was already starving at cancel time).
                 discarded = len(self._current_buffer.bytes_) if self._current_buffer else 0
                 logger.info(
                     f"INTERRUPTING → IDLE on silence (no fade frame "
@@ -537,35 +545,41 @@ class OjinVideoService(FrameProcessor):
                 self._current_buffer = None
                 self._state = State.IDLE
                 await self._emit_stopped_speaking()
+            elif frame.is_first_speech_frame and self._audio_buffers:
+                # Server skipped both the fade frame *and* the silence
+                # gap and went straight into the next turn's speech. End
+                # the old turn, promote the queued buffer.
+                logger.info(
+                    "INTERRUPTING → SPEAKING: server emitted first-speech "
+                    "without intermediate fade/silence; discarding "
+                    f"current buffer (queue={len(self._audio_buffers)})"
+                )
+                self._current_buffer = None
+                await self._emit_stopped_speaking()
+                self._state = State.IDLE
+                await self._promote_next_buffer(first_speech_frame=frame)
 
         elif self._state == State.FADING_OUT:
             if frame.is_silence():
                 discarded = len(self._current_buffer.bytes_) if self._current_buffer else 0
                 logger.info(
                     f"FADING_OUT → IDLE on silence; discarding {discarded} bytes "
-                    f"of current buffer (queue={len(self._audio_buffers)})"
+                    f"of current audio buffer (queue={len(self._audio_buffers)})"
                 )
                 self._current_buffer = None
-                self._fading_out_started_at = None
                 self._state = State.IDLE
                 await self._emit_stopped_speaking()
-
-        # Safety: if we've been FADING_OUT too long without a silence frame,
-        # force the transition.
-        if (
-            self._state == State.FADING_OUT
-            and self._fading_out_started_at is not None
-            and (time.monotonic() - self._fading_out_started_at)
-            > self._settings.fading_out_timeout_s
-        ):
-            logger.warning(
-                f"FADING_OUT safety timeout "
-                f"({self._settings.fading_out_timeout_s:.2f}s) — forcing → IDLE"
-            )
-            self._current_buffer = None
-            self._fading_out_started_at = None
-            self._state = State.IDLE
-            await self._emit_stopped_speaking()
+            elif frame.is_first_speech_frame and self._audio_buffers:
+                # Same skip-ahead case as for INTERRUPTING.
+                logger.info(
+                    "FADING_OUT → SPEAKING: server emitted first-speech "
+                    "without intermediate silence; discarding current "
+                    f"buffer (queue={len(self._audio_buffers)})"
+                )
+                self._current_buffer = None
+                await self._emit_stopped_speaking()
+                self._state = State.IDLE
+                await self._promote_next_buffer(first_speech_frame=frame)
 
     async def _promote_next_buffer(self, first_speech_frame: Optional[VideoFrame] = None) -> None:
         """Pop the head of the audio-buffer queue to become current.
@@ -716,6 +730,13 @@ class OjinVideoService(FrameProcessor):
         silence_audio = OutputAudioRawFrame(
             audio=silence_chunk, sample_rate=OJIN_PERSONA_SAMPLE_RATE, num_channels=1
         )
+
+        # Diagnostic: every 25 ticks (1 s) log a one-line state summary.
+        # Without this, a stuck state shows up only as UNDERRUN spam and we
+        # can't tell whether the receive task died, whether frames are
+        # arriving and being no-op'd, or what the queue depths look like.
+        tick_count = 0
+        last_received_frame_idx_seen = -2
         while self._initialized:
             if self._playback_paused:
                 await self._playback_resume_event.wait()
@@ -737,6 +758,7 @@ class OjinVideoService(FrameProcessor):
                 continue
 
             pts = int(time.monotonic() * 1_000_000_000)
+            tick_count += 1
 
             # Pop a video frame (if any). Note: we may emit silence audio
             # and a repeated image when the buffer is empty (server slow).
@@ -744,6 +766,23 @@ class OjinVideoService(FrameProcessor):
             if self._video_frames:
                 video_frame = self._video_frames.popleft()
                 await self._on_video_frame_popped(video_frame)
+                last_received_frame_idx_seen = video_frame.frame_idx
+
+            # Periodic state summary (every 25 ticks = 1 s). Lets us see
+            # in production logs whether frames are arriving but no-op'd,
+            # whether the receive task is dead, and the queue depths.
+            if tick_count % 25 == 0:
+                buf_bytes = len(self._current_buffer.bytes_) if self._current_buffer else 0
+                logger.info(
+                    f"[STATUS] state={self._state.name} "
+                    f"current_buf={buf_bytes}B "
+                    f"queued_buffers={len(self._audio_buffers)} "
+                    f"video_frames_pending={len(self._video_frames)} "
+                    f"last_popped_frame_idx={last_received_frame_idx_seen} "
+                    f"last_received_frame_idx={self._last_received_frame_idx} "
+                    f"emitted_audio={self._audio_chunks_emitted} "
+                    f"emitted_video={self._video_frames_emitted}"
+                )
 
             # Audio: drain one chunk from current_buffer if speaking.
             audio_frame: Optional[OutputAudioRawFrame] = None

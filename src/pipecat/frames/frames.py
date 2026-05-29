@@ -415,7 +415,7 @@ class TTSTextFrame(AggregatedTextFrame):
 
 
 @dataclass
-class TranscriptionFrame(TextFrame):
+class TranscriptionFrame(TextFrame, UninterruptibleFrame):
     """Text frame containing speech transcription data.
 
     A text frame with transcription-specific data. The `result` field
@@ -428,6 +428,15 @@ class TranscriptionFrame(TextFrame):
         result: Raw result from the STT service.
         finalized: Whether this is the final transcription for an utterance.
             Set by STT services that support commit/finalize signals.
+
+    Note:
+        OJIN FIX: Marked UninterruptibleFrame so a final transcription
+        already pushed downstream by the STT service survives the
+        `_start_interruption` cascade triggered by user_turn_started.
+        Without this, the TranscriptionFrame is dropped from
+        LLMUserAggregator's process_queue on reset and the aggregator
+        ends up with empty content, causing the user-turn-stop fallback
+        to fire at 5s with nothing to send to the LLM (bot stuck silent).
     """
 
     user_id: str
@@ -441,7 +450,7 @@ class TranscriptionFrame(TextFrame):
 
 
 @dataclass
-class InterimTranscriptionFrame(TextFrame):
+class InterimTranscriptionFrame(TextFrame, UninterruptibleFrame):
     """Text frame containing partial/interim transcription data.
 
     A text frame with interim transcription-specific data that represents

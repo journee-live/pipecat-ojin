@@ -81,6 +81,19 @@ OJIN_PERSONA_SAMPLE_RATE = 16_000
 BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)  # 40 ms @ 16 kHz int16
 OJIN_VIDEO_SERVICE_VERSION = 28  # bump for v2
 
+# Idle silence-buffer trim thresholds (ported from video_legacy.py).
+# The server emits silence at 25 fps; any clock drift between server and
+# client lets silence frames pile up in _video_frames. Two mechanisms
+# keep the queue small while IDLE:
+#   - MAX_FRAMES_BUFFER: per-tick cap on consecutive silence at the head.
+#     Above this, drop one extra silence frame per tick so the queue can't
+#     grow under drift. ~7 frames ≈ 280 ms of jitter slack.
+#   - MIN_FRAMES_BUFFER: target depth at the silence→speech boundary. When
+#     a first-speech frame arrives from the server we trim accumulated
+#     silence down to this so buffered silence doesn't inflate TTFB.
+MAX_FRAMES_BUFFER = 7
+MIN_FRAMES_BUFFER = 2
+
 
 @dataclass
 class VideoFrame:
@@ -218,13 +231,12 @@ class OjinVideoService(FrameProcessor):
         self._playback_paused = True
         self._playback_resume_event = asyncio.Event()
 
-
         # Bot-side counters for logging — incremented every time we push
         # a frame downstream. The wire protocol does not carry a
         # sequential frame counter, so these are our best handle for
-        # correlating audio/video position with timeline events. They
-        # don't reset on interruption — they're cumulative for the
-        # process lifetime.
+        # correlating audio/video position with timeline events. Reset
+        # at each IDLE → SPEAKING transition so per-turn audio/video
+        # drift is visible without subtracting cumulative offsets.
         self._audio_chunks_emitted: int = 0
         self._video_frames_emitted: int = 0
 
@@ -397,6 +409,24 @@ class OjinVideoService(FrameProcessor):
         return self._state == State.SPEAKING and self._current_buffer is not None
 
     # ------------------------------------------------------------------
+    # Idle-buffer trim helpers (see MAX_/MIN_FRAMES_BUFFER module docs)
+    # ------------------------------------------------------------------
+
+    def _get_num_head_silence_frames(self) -> int:
+        """Count consecutive silence frames at the head of the video queue."""
+        count = 0
+        for f in self._video_frames:
+            if f.is_silence():
+                count += 1
+            else:
+                break
+        return count
+
+    def _has_pending_speech_frame(self) -> bool:
+        """Whether a first-speech frame is queued (behind silence) for playback."""
+        return any(f.is_first_speech_frame for f in self._video_frames)
+
+    # ------------------------------------------------------------------
     # Server message handling
     # ------------------------------------------------------------------
 
@@ -446,6 +476,17 @@ class OjinVideoService(FrameProcessor):
             # Mark first-speech-frame at the silence→speech boundary, server-side.
             if self._last_received_frame_idx != 1 and frame_idx == 1:
                 video_frame.is_first_speech_frame = True
+                # Trim accumulated silence down to MIN_FRAMES_BUFFER so the
+                # first speech frame doesn't have to wait behind buffered
+                # silence (would inflate TTFB by ~40 ms per extra frame).
+                excess = max(0, len(self._video_frames) - MIN_FRAMES_BUFFER)
+                if excess > 0:
+                    for _ in range(excess):
+                        self._video_frames.popleft()
+                    logger.info(
+                        f"First speech frame: trimmed {excess} buffered silence "
+                        f"frames (queue now {len(self._video_frames)})"
+                    )
                 logger.debug(
                     f"Received first speech frame after {time.time() - self._metrics._start_ttfb_time} seconds"
                 )
@@ -608,9 +649,13 @@ class OjinVideoService(FrameProcessor):
             logger.info(
                 f"IDLE → SPEAKING — buffer #{candidate.buffer_id} promoted "
                 f"({len(candidate.bytes_)} bytes, queue={len(self._audio_buffers)}); "
-                f"cumulative emitted audio_chunks={self._audio_chunks_emitted} "
+                f"prev-turn emitted audio_chunks={self._audio_chunks_emitted} "
                 f"video_frames={self._video_frames_emitted}"
             )
+            # Reset per-turn counters so the STATUS log surfaces drift
+            # accumulated within the current speech turn only.
+            self._audio_chunks_emitted = 0
+            self._video_frames_emitted = 0
             if first_speech_frame is not None:
                 await self._check_lipsync_alignment(candidate, first_speech_frame)
             await self._emit_started_speaking()
@@ -768,6 +813,26 @@ class OjinVideoService(FrameProcessor):
                 await self._on_video_frame_popped(video_frame)
                 last_received_frame_idx_seen = video_frame.frame_idx
 
+            # Idle silence-buffer trim: drop one extra silence frame this
+            # tick if the head silence run is above MAX_FRAMES_BUFFER, or
+            # if a first-speech frame is queued behind silence. Skipped
+            # outside IDLE — trimming during a speech state would break
+            # audio↔video chunk alignment.
+            if self._state == State.IDLE and self._video_frames:
+                num_silence = self._get_num_head_silence_frames()
+                if num_silence > MAX_FRAMES_BUFFER:
+                    self._video_frames.popleft()
+                    if self._settings.frame_debugging_enabled:
+                        logger.debug(
+                            f"Idle trim: dropped silence frame (head silence run was {num_silence})"
+                        )
+                elif num_silence > 0 and self._has_pending_speech_frame():
+                    self._video_frames.popleft()
+                    if self._settings.frame_debugging_enabled:
+                        logger.debug(
+                            "Idle trim: dropped silence to expose queued first-speech frame"
+                        )
+
             # Periodic state summary (every 25 ticks = 1 s). Lets us see
             # in production logs whether frames are arriving but no-op'd,
             # whether the receive task is dead, and the queue depths.
@@ -822,7 +887,7 @@ class OjinVideoService(FrameProcessor):
                     )
                     chunk = None
 
-                if chunk is not None:
+                if chunk is not None and self._state == State.SPEAKING:
                     audio_frame = OutputAudioRawFrame(
                         audio=chunk,
                         sample_rate=self._current_buffer.sample_rate,
@@ -837,11 +902,7 @@ class OjinVideoService(FrameProcessor):
                 if out_image is not None:
                     await self.push_frame(out_image)
                     self._video_frames_emitted += 1
-                # audio_frame = OutputAudioRawFrame(
-                #     audio=video_frame.audio_bytes,
-                #     sample_rate=sample_rate,
-                #     num_channels=num_channels,
-                # )
+
             elif self._last_played_image_bytes is not None:
                 # No new frame — repeat the last one to keep the video flowing.
                 out_image = await self._prepare_video_frame(self._last_played_image_bytes, pts)

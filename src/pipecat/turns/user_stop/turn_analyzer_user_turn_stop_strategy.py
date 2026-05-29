@@ -178,5 +178,17 @@ class TurnAnalyzerUserTurnStopStrategy(BaseUserTurnStopStrategy):
                 await self._maybe_trigger_user_turn_stopped()
 
     async def _maybe_trigger_user_turn_stopped(self):
-        if self._text and self._turn_complete:
+        # OJIN FIX: SmartTurn EOT misclassifies short imperative utterances
+        # ("Stop", "Wait", "Hi Mike") as INCOMPLETE, leaving turn_complete=False
+        # even though the user clearly finished. Without this fallback the strategy
+        # would gate forever on turn_complete and only the controller's 5s safety
+        # net would unblock the turn — a 5-second silence after every short reply.
+        #
+        # We trust two signals jointly instead: (1) a final TranscriptionFrame
+        # arrived (text is set), and (2) VAD currently says user is silent.
+        # The mid-sentence-pause regression is prevented by the inner-tick
+        # quiescence (`timeout=0.25s`): if the user resumes within 250ms, VAD
+        # restart flips vad_user_speaking=True before the tick fires.
+        ready = self._turn_complete or not self._vad_user_speaking
+        if self._text and ready:
             await self.trigger_user_turn_stopped()

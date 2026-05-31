@@ -96,9 +96,9 @@ BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)  # 40 ms @ 16 kHz int16
 OJIN_VIDEO_SERVICE_VERSION = 29  # bump for v3
 
 # Swap-time audio alignment (see _align_current_buffer_to_frame).
-_ALIGN_ANCHOR_FRAMES = 6      # how many leading new-turn frames to match on
-_ALIGN_MIN_RMS = 1.0          # below this the anchor is silence — skip aligning
-_ALIGN_REL_TOL = 0.05         # match tolerance as a fraction of the anchor RMS
+_ALIGN_ANCHOR_FRAMES = 6  # how many leading new-turn frames to match on
+_ALIGN_MIN_RMS = 1.0  # below this the anchor is silence — skip aligning
+_ALIGN_REL_TOL = 0.05  # match tolerance as a fraction of the anchor RMS
 
 
 def _rms_int16(audio: bytes) -> Optional[float]:
@@ -191,11 +191,11 @@ class LipsyncTraceEntry:
     """
 
     tick: int
-    frame_idx: int                      # wire marker: 0 silence / 1 speech / 2 fade / 3 new-turn
-    swapped: bool                       # a buffer-swap trigger fired this tick
+    frame_idx: int  # wire marker: 0 silence / 1 speech / 2 fade / 3 new-turn
+    swapped: bool  # a buffer-swap trigger fired this tick
     current_buffer_id: Optional[int]
-    interrupted: bool                   # current buffer was interrupted (audio silenced)
-    frame_audio_bytes: bytes             # popped frame's bundled audio (server input slice)
+    interrupted: bool  # current buffer was interrupted (audio silenced)
+    frame_audio_bytes: bytes  # popped frame's bundled audio (server input slice)
     output_audio_bytes: Optional[bytes]  # audio drained from the current buffer (None on underrun)
 
 
@@ -310,9 +310,9 @@ class OjinVideoService(FrameProcessor):
         # Per-session Perfetto trace (created in _start, written in _stop).
         # All event recording is guarded by ``self._trace is not None``.
         self._trace: Optional[OjinSessionTrace] = None
-        self._tr_session_start: float = 0.0       # session span anchor (µs)
-        self._tr_connect_start: float = 0.0       # connect span anchor (µs)
-        self._tr_speaking_start: Optional[float] = None   # bot_speaking anchor
+        self._tr_session_start: float = 0.0  # session span anchor (µs)
+        self._tr_connect_start: float = 0.0  # connect span anchor (µs)
+        self._tr_speaking_start: Optional[float] = None  # bot_speaking anchor
         self._tr_interrupt_start: Optional[float] = None  # cancel→new_turn anchor
         self._tr_emit_times: deque[float] = deque()  # recent video emits for fps
         self._tr_underruns: int = 0
@@ -388,7 +388,8 @@ class OjinVideoService(FrameProcessor):
             )
             if self._trace is not None:
                 self._trace.instant(
-                    "tts_input", "tts_started",
+                    "tts_input",
+                    "tts_started",
                     args={"buffer_id": buf.buffer_id, "queue_len": len(self._audio_buffers)},
                 )
             await self.push_frame(frame, direction)
@@ -403,8 +404,11 @@ class OjinVideoService(FrameProcessor):
                     f"treating as first TTS frame of a turn for TTFB metrics"
                 )
                 if self._trace is not None:
-                    self._trace.instant("tts_input", "tts_silence_discarded",
-                                        args={"dur_ms": round(duration * 1000, 1)})
+                    self._trace.instant(
+                        "tts_input",
+                        "tts_silence_discarded",
+                        args={"dur_ms": round(duration * 1000, 1)},
+                    )
                 return
             await self._on_tts_audio_frame(frame)
 
@@ -471,7 +475,8 @@ class OjinVideoService(FrameProcessor):
                 len(frame.audio) / (frame.sample_rate * frame.num_channels * 2) * 1000, 1
             )
             self._trace.instant(
-                "tts_input", "tts_audio",
+                "tts_input",
+                "tts_audio",
                 args={
                     "bytes": len(frame.audio),
                     "dur_ms": dur_ms,
@@ -479,8 +484,7 @@ class OjinVideoService(FrameProcessor):
                     "sample_rate": frame.sample_rate,
                 },
             )
-            self._trace.instant("to_server", "audio_sent",
-                                args={"bytes": len(resampled)})
+            self._trace.instant("to_server", "audio_sent", args={"bytes": len(resampled)})
 
         if self._settings.tts_audio_passthrough:
             await self.push_frame(frame, FrameDirection.DOWNSTREAM)
@@ -495,12 +499,12 @@ class OjinVideoService(FrameProcessor):
         can = self._can_interrupt()
         if self._trace is not None:
             self._trace.instant(
-                "interruption", "user_started_speaking",
+                "interruption",
+                "user_started_speaking",
                 args={
                     "can_interrupt": can,
                     "buffer_id": (
-                        self._current_buffer.buffer_id
-                        if self._current_buffer is not None else None
+                        self._current_buffer.buffer_id if self._current_buffer is not None else None
                     ),
                 },
             )
@@ -511,11 +515,36 @@ class OjinVideoService(FrameProcessor):
                 f"sending cancel"
             )
             self._current_buffer.interrupted = True
+            # Discard the queued buffers of the cancelled turn. A long agent
+            # response is split into several TTS groups → several buffers; the
+            # bot forwards every TTS frame to the inference server eagerly
+            # (ahead of playback), so the whole response is already in the
+            # server's input buffer. On cancel the server drains ALL of that
+            # pre-sent audio and renders the genuinely-new turn from audio that
+            # arrives after the drain. If we kept these stale queued buffers,
+            # the next frame_idx==3 would swap playback to one of them and the
+            # avatar would lip-sync the new turn over the cancelled turn's
+            # audio. Dropping them here keeps client and server symmetric:
+            # both discard everything pre-interrupt, so the next frame_idx==3
+            # lands on the new turn's fresh buffer.
+            discarded_buffers = len(self._audio_buffers)
+            self._audio_buffers.clear()
             await self._client.send_message(OjinCancelInteractionMessage())
+            if discarded_buffers:
+                logger.info(
+                    f"Barge-in discarded {discarded_buffers} queued buffer(s) "
+                    f"from the cancelled turn"
+                )
             if self._trace is not None:
                 self._trace.instant("to_server", "cancel_sent")
-                self._trace.instant("interruption", "buffer_interrupted",
-                                    args={"buffer_id": self._current_buffer.buffer_id})
+                self._trace.instant(
+                    "interruption",
+                    "buffer_interrupted",
+                    args={
+                        "buffer_id": self._current_buffer.buffer_id,
+                        "discarded_queued": discarded_buffers,
+                    },
+                )
                 # Anchor the cancel→new-turn round-trip span (closed when the
                 # next frame_idx==3 arrives).
                 self._tr_interrupt_start = self._trace.mark()
@@ -547,9 +576,7 @@ class OjinVideoService(FrameProcessor):
 
             self._initialized = True
             if self._trace is not None:
-                self._trace.span(
-                    "lifecycle", "connect", self._tr_connect_start
-                )
+                self._trace.span("lifecycle", "connect", self._tr_connect_start)
             init_frame = OjinVideoInitializedFrame(session_data=self._session_data)
             await self.push_frame(init_frame, direction=FrameDirection.DOWNSTREAM)
             await self.push_frame(init_frame, direction=FrameDirection.UPSTREAM)
@@ -560,8 +587,7 @@ class OjinVideoService(FrameProcessor):
                 OjinAudioInputMessage(audio_int16_bytes=b"\x00" * BYTES_PER_FRAME)
             )
             if self._trace is not None:
-                self._trace.instant("to_server", "seed_sent",
-                                     args={"bytes": BYTES_PER_FRAME})
+                self._trace.instant("to_server", "seed_sent", args={"bytes": BYTES_PER_FRAME})
 
         elif isinstance(message, OjinInteractionResponseMessage):
             if not self.fps_tracker.is_running:
@@ -585,7 +611,7 @@ class OjinVideoService(FrameProcessor):
                 is_final=message.is_final_response,
                 volume=volume,
             )
-            logger.debug(f"Received frame_idx={frame_idx} (volume={volume})")
+            # logger.debug(f"Received frame_idx={frame_idx} (volume={volume})")
             self._video_frames.append(video_frame)
 
             if self._trace is not None:
@@ -604,9 +630,7 @@ class OjinVideoService(FrameProcessor):
                 # new-turn frame after a barge-in (the client-observed fade
                 # latency — the lip-sync KPI).
                 if frame_idx == 3 and self._tr_interrupt_start is not None:
-                    self._trace.span(
-                        "interruption", "interrupt→new_turn", self._tr_interrupt_start
-                    )
+                    self._trace.span("interruption", "interrupt→new_turn", self._tr_interrupt_start)
                     self._tr_interrupt_start = None
 
             # Backstop: never let the receive buffer grow unbounded.
@@ -617,13 +641,13 @@ class OjinVideoService(FrameProcessor):
                     self._video_frames.popleft()
                 logger.warning(f"Receive buffer overflow: dropped {drop} oldest frames")
                 if self._trace is not None:
-                    self._trace.instant("recv:idle", "recv_overflow_drop",
-                                        args={"dropped": drop})
+                    self._trace.instant("recv:idle", "recv_overflow_drop", args={"dropped": drop})
 
         elif isinstance(message, ErrorResponseMessage):
             if self._trace is not None:
-                self._trace.instant("lifecycle", "server_error",
-                                    args={"code": str(message.payload.code)})
+                self._trace.instant(
+                    "lifecycle", "server_error", args={"code": str(message.payload.code)}
+                )
             await self.push_error(
                 error_msg=f"Ojin server error: {message.payload.code}", fatal=True
             )
@@ -659,9 +683,7 @@ class OjinVideoService(FrameProcessor):
     # Buffer swap on frame_idx == 3
     # ------------------------------------------------------------------
 
-    async def _swap_to_next_buffer(
-        self, align_to_frame: Optional["VideoFrame"] = None
-    ) -> None:
+    async def _swap_to_next_buffer(self, align_to_frame: Optional["VideoFrame"] = None) -> None:
         """Promote the head of the audio buffer queue to current.
 
         Discards whatever bytes remain in ``_current_buffer`` (in-flight
@@ -720,11 +742,14 @@ class OjinVideoService(FrameProcessor):
         )
 
         if self._trace is not None:
-            trigger = "new_turn" if (
-                align_to_frame is not None and align_to_frame.is_new_turn_start()
-            ) else "natural"
+            trigger = (
+                "new_turn"
+                if (align_to_frame is not None and align_to_frame.is_new_turn_start())
+                else "natural"
+            )
             self._trace.instant(
-                "buffers", "swap",
+                "buffers",
+                "swap",
                 args={
                     "prev_id": prev_id,
                     "new_id": new_buffer.buffer_id,
@@ -767,9 +792,7 @@ class OjinVideoService(FrameProcessor):
 
         # Anchor sequence: the swap-triggering frame + the leading new-turn
         # speech frames already buffered. More anchors → a unique match.
-        anchors_src = [align_to_frame] + [
-            f for f in list(self._video_frames) if not f.is_silence()
-        ]
+        anchors_src = [align_to_frame] + [f for f in list(self._video_frames) if not f.is_silence()]
         anchor_rms: list[float] = []
         for f in anchors_src[:_ALIGN_ANCHOR_FRAMES]:
             r = _rms_int16(f.audio_bytes)
@@ -824,7 +847,8 @@ class OjinVideoService(FrameProcessor):
             )
             if self._trace is not None:
                 self._trace.instant(
-                    "lipsync", "swap_align_trim",
+                    "lipsync",
+                    "swap_align_trim",
                     args={
                         "trim_frames": best_d,
                         "trim_ms": round(best_d * self._frame_duration * 1000, 1),
@@ -936,20 +960,6 @@ class OjinVideoService(FrameProcessor):
                     await self._swap_to_next_buffer(align_to_frame=video_frame)
                     swapped = True
 
-            # Periodic state summary (every 25 ticks = 1 s).
-            if tick_count % 25 == 0:
-                buf_bytes = len(self._current_buffer.bytes_) if self._current_buffer else 0
-                interrupted = (
-                    self._current_buffer.interrupted if self._current_buffer is not None else False
-                )
-                logger.info(
-                    f"[STATUS] current_buf={buf_bytes}B interrupted={interrupted} "
-                    f"queued_buffers={len(self._audio_buffers)} "
-                    f"video_frames_pending={len(self._video_frames)} "
-                    f"emitted_audio={self._audio_chunks_emitted} "
-                    f"emitted_video={self._video_frames_emitted}"
-                )
-
             # Audio drain: gated on _current_buffer existence only.
             # Audio is emitted as silence if the buffer is interrupted
             # (fadeout audio-cut). The bytes are still consumed so the
@@ -1037,8 +1047,7 @@ class OjinVideoService(FrameProcessor):
                     tr.instant("play:repeat", "video_repeat")
 
                 interrupted = (
-                    self._current_buffer.interrupted
-                    if self._current_buffer is not None else False
+                    self._current_buffer.interrupted if self._current_buffer is not None else False
                 )
                 if audio_frame is not None:
                     audio_kind = "real"
@@ -1050,7 +1059,9 @@ class OjinVideoService(FrameProcessor):
                 else:
                     audio_kind = "silence"
                 tr.instant(
-                    "play_audio", "audio_emit", cat=audio_kind,
+                    "play_audio",
+                    "audio_emit",
+                    cat=audio_kind,
                     args={"kind": audio_kind, "bytes": len(drained_chunk or b"")},
                 )
 
@@ -1120,11 +1131,14 @@ class OjinVideoService(FrameProcessor):
             self._was_speaking_emitted = False
             if self._trace is not None and self._tr_speaking_start is not None:
                 self._trace.span(
-                    "speaking", "bot_speaking", self._tr_speaking_start,
+                    "speaking",
+                    "bot_speaking",
+                    self._tr_speaking_start,
                     args={
                         "buffer_id": (
                             self._current_buffer.buffer_id
-                            if self._current_buffer is not None else None
+                            if self._current_buffer is not None
+                            else None
                         )
                     },
                 )
@@ -1166,8 +1180,9 @@ class OjinVideoService(FrameProcessor):
             if self._tr_speaking_start is not None:
                 tr.span("speaking", "bot_speaking", self._tr_speaking_start)
                 self._tr_speaking_start = None
-            tr.span("lifecycle", "session", self._tr_session_start,
-                    args={"session_id": tr.session_id})
+            tr.span(
+                "lifecycle", "session", self._tr_session_start, args={"session_id": tr.session_id}
+            )
             path = tr.write()
             logger.info(f"OjinVideoService session trace written: {path}")
         except Exception as e:

@@ -316,6 +316,16 @@ class OjinVideoService(FrameProcessor):
         self._tr_interrupt_start: Optional[float] = None  # cancel→new_turn anchor
         self._tr_emit_times: deque[float] = deque()  # recent video emits for fps
         self._tr_underruns: int = 0
+        # Response-latency anchor: µs mark of the first TTS audio frame of the
+        # current turn (when the bot's speech starts flowing into the avatar).
+        # Closed twice per turn — once when the first speech video frame arrives
+        # from the server (recv: the Ojin inference round-trip) and once when it
+        # is played downstream (played: adds bot-side buffering) — each gated by
+        # its own flag so the measurement fires exactly once. Armed only while
+        # the session trace is active.
+        self._tr_first_tts_audio_at: Optional[float] = None
+        self._awaiting_first_recv_video: bool = False
+        self._awaiting_first_played_video: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -467,6 +477,12 @@ class OjinVideoService(FrameProcessor):
         if self._waiting_for_first_tts:
             self._waiting_for_first_tts = False
             await self.start_ttfb_metrics()
+            # Anchor the per-turn video response latency at the first TTS audio
+            # of the turn, and arm both the recv and played measurements.
+            if self._trace is not None:
+                self._tr_first_tts_audio_at = self._trace.mark()
+                self._awaiting_first_recv_video = True
+                self._awaiting_first_played_video = True
 
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=resampled))
 
@@ -632,6 +648,25 @@ class OjinVideoService(FrameProcessor):
                 if frame_idx == 3 and self._tr_interrupt_start is not None:
                     self._trace.span("interruption", "interrupt→new_turn", self._tr_interrupt_start)
                     self._tr_interrupt_start = None
+
+                # First speech video frame of the turn arriving from the server
+                # — the Ojin inference round-trip (first TTS audio → video out).
+                if (
+                    self._awaiting_first_recv_video
+                    and self._tr_first_tts_audio_at is not None
+                    and not video_frame.is_silence()
+                    and not video_frame.is_fade_out()
+                ):
+                    self._awaiting_first_recv_video = False
+                    latency_ms = self._trace.record_response_latency(
+                        "recv",
+                        self._tr_first_tts_audio_at,
+                        args={"frame_idx": frame_idx},
+                    )
+                    logger.info(
+                        f"📹 First speech video frame received {latency_ms}ms "
+                        f"after first TTS audio (frame_idx={frame_idx})"
+                    )
 
             # Backstop: never let the receive buffer grow unbounded.
             cap = self._settings.max_buffered_video_frames
@@ -1043,6 +1078,25 @@ class OjinVideoService(FrameProcessor):
                     self._tr_emit_times.append(now_us)
                     while self._tr_emit_times and now_us - self._tr_emit_times[0] > 1_000_000:
                         self._tr_emit_times.popleft()
+
+                    # First speech video frame of the turn played downstream —
+                    # the recv latency plus bot-side buffering/playback delay.
+                    if (
+                        self._awaiting_first_played_video
+                        and self._tr_first_tts_audio_at is not None
+                        and not video_frame.is_silence()
+                        and not video_frame.is_fade_out()
+                    ):
+                        self._awaiting_first_played_video = False
+                        latency_ms = tr.record_response_latency(
+                            "played",
+                            self._tr_first_tts_audio_at,
+                            args={"frame_idx": video_frame.frame_idx},
+                        )
+                        logger.info(
+                            f"📹 First speech video frame played {latency_ms}ms "
+                            f"after first TTS audio (frame_idx={video_frame.frame_idx})"
+                        )
                 elif self._last_played_image_bytes is not None:
                     tr.instant("play:repeat", "video_repeat")
 

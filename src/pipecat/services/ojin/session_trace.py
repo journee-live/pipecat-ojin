@@ -30,6 +30,16 @@ post-interruption desync between "what arrived" and "what played" obvious:
     interruption   barge-in + cancel→new-turn round-trip
     speaking       bot speaking spans
     lipsync        swap-time audio alignment corrections
+    response       first TTS audio → first speech video frame (turn latency)
+
+Per-turn video response latency is anchored at the first TTS audio frame of the
+turn (when the bot's speech starts flowing into the avatar) and recorded at two
+endpoints, each a span on the ``response`` lane: ``recv`` (first speech video
+frame arriving from the server — the Ojin inference round-trip) and ``played``
+(that frame reaching the transport downstream — adds bot-side buffering/playback
+delay). Both are summarised under ``otherData.response_latency_ms`` (count / min
+/ max / mean / p50 / last per endpoint), so the avatar's response time and where
+it is spent are readable without opening Perfetto.
 """
 
 from __future__ import annotations
@@ -62,6 +72,7 @@ LANES: Dict[str, int] = {
     "interruption": 15,
     "speaking": 16,
     "lipsync": 17,
+    "response": 18,
 }
 
 # frame_idx wire marker (0/1/2/3) → received-stream lane.
@@ -95,7 +106,7 @@ def new_session_id() -> str:
 class OjinSessionTrace:
     """Accumulates Chrome-Trace events for one OjinVideoService session."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -118,6 +129,15 @@ class OjinSessionTrace:
         self._evicted = 0
         # Lightweight running summary for otherData.
         self._counts: Dict[str, int] = {}
+        # Per-turn video response latencies in ms, anchored at the first TTS
+        # audio frame of the turn. Two series: "recv" = first speech video frame
+        # arriving from the server (Ojin inference round-trip), "played" = that
+        # frame reaching the transport downstream (adds bot-side buffering/
+        # playback delay). Bounded; summarised into otherData at build time.
+        self._response_latencies: Dict[str, deque[float]] = {
+            "recv": deque(maxlen=10_000),
+            "played": deque(maxlen=10_000),
+        }
 
     # -- time -----------------------------------------------------------
 
@@ -193,6 +213,44 @@ class OjinSessionTrace:
             }
         )
 
+    def record_response_latency(
+        self, kind: str, start_us: float, *, args: Optional[dict] = None
+    ) -> float:
+        """Record a first-TTS → first-speech-video span; return its ms value.
+
+        ``start_us`` is the :meth:`mark` captured at the first TTS audio frame
+        of the turn. ``kind`` selects the endpoint being measured: ``"recv"``
+        (the first speech video frame arriving from the server) or ``"played"``
+        (that frame reaching the transport downstream). The duration is drawn as
+        a span on the ``response`` lane and fed into the matching
+        ``response_latency_ms`` summary in :meth:`build`'s ``otherData``.
+        """
+        latency_ms = (self.now_us() - start_us) / 1000.0
+        self.span("response", f"first_tts→first_video_{kind}", start_us, args=args)
+        self._response_latencies[kind].append(latency_ms)
+        return round(latency_ms, 1)
+
+    @staticmethod
+    def _summarise_latencies(vals: list) -> Dict[str, float]:
+        if not vals:
+            return {"count": 0}
+        ordered = sorted(vals)
+        return {
+            "count": len(vals),
+            "min_ms": round(ordered[0], 1),
+            "max_ms": round(ordered[-1], 1),
+            "mean_ms": round(sum(vals) / len(vals), 1),
+            "p50_ms": round(ordered[len(ordered) // 2], 1),
+            "last_ms": round(vals[-1], 1),
+        }
+
+    def _response_latency_summary(self) -> Dict[str, dict]:
+        """Aggregate per-turn response latencies (recv + played) for ``otherData``."""
+        return {
+            kind: self._summarise_latencies(list(series))
+            for kind, series in self._response_latencies.items()
+        }
+
     # -- build + write --------------------------------------------------
 
     def build(self) -> dict:
@@ -221,6 +279,7 @@ class OjinSessionTrace:
                 "event_count": len(self._events),
                 "events_evicted_overflow": self._evicted,
                 "event_counts": dict(self._counts),
+                "response_latency_ms": self._response_latency_summary(),
             },
         }
 

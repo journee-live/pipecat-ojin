@@ -93,7 +93,7 @@ class OjinBotStoppedSpeakingFrame(Frame):
 
 OJIN_PERSONA_SAMPLE_RATE = 16_000
 BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)  # 40 ms @ 16 kHz int16
-OJIN_VIDEO_SERVICE_VERSION = 29  # bump for v3
+OJIN_VIDEO_SERVICE_VERSION = 30  # idle backlog drain (skip silence frames)
 
 # Swap-time audio alignment (see _align_current_buffer_to_frame).
 _ALIGN_ANCHOR_FRAMES = 6  # how many leading new-turn frames to match on
@@ -216,6 +216,18 @@ class OjinVideoSettings:
     start_frame_cls: Type[Frame] = StartFrame
     # Maximum buffered server video frames before we start dropping oldest.
     max_buffered_video_frames: int = 700
+    # Idle backlog drain. The playback loop pops exactly one frame per 40 ms
+    # tick — the same rate the server produces them — so any video backlog that
+    # accrued while playback was paused (frames buffering during client connect)
+    # is otherwise carried for the whole session, adding its depth as constant
+    # latency to every reply. When the pending video buffer exceeds this many
+    # frames AND the upcoming frames are silence, the loop drops the next
+    # silence frame(s) this tick (skip 1-of-2, or 2 while a reply's speech is
+    # already waiting behind the silence) so the buffer shrinks back toward this
+    # target. Only silence frames are ever dropped — speech/fade are never
+    # trimmed and audio sync is untouched. Mirrors the pre-v3
+    # MAX_FRAMES_BUFFER drain. 6 frames == 240 ms lead. 0 disables draining.
+    idle_buffer_target_frames: int = 6
     # When set, the playback loop records a LipsyncTraceEntry per tick (into
     # ``_lipsync_trace``) pairing each displayed frame's bundled audio with the
     # audio chunk played that tick. Off in production; on for verification.
@@ -316,6 +328,7 @@ class OjinVideoService(FrameProcessor):
         self._tr_interrupt_start: Optional[float] = None  # cancel→new_turn anchor
         self._tr_emit_times: deque[float] = deque()  # recent video emits for fps
         self._tr_underruns: int = 0
+        self._tr_idle_skips: int = 0  # silence frames dropped to drain backlog
         # Response-latency anchor: µs mark of the first TTS audio frame of the
         # current turn (when the bot's speech starts flowing into the avatar).
         # Closed twice per turn — once when the first speech video frame arrives
@@ -894,6 +907,52 @@ class OjinVideoService(FrameProcessor):
                 )
 
     # ------------------------------------------------------------------
+    # Idle backlog drain
+    # ------------------------------------------------------------------
+
+    def _drain_idle_backlog(self, popped: Optional["VideoFrame"]) -> int:
+        """Drop extra leading silence frames to shrink an idle video backlog.
+
+        The playback loop pops exactly one frame per 40 ms tick — the same rate
+        the server produces them — so a backlog that built up while playback was
+        paused (frames buffering during client connect) is otherwise carried for
+        the whole session, delaying every reply by its depth. When we're idle
+        (the frame just popped is silence and no speech audio is draining) and
+        the pending buffer is over ``idle_buffer_target_frames``, drop the next
+        silence frame(s) this tick so the buffer shrinks back toward the target.
+
+        Skips one silence frame (1-of-2) normally; two when a reply's speech is
+        already waiting behind the silence, so it reaches the screen sooner. The
+        scan stops at the first non-silence frame, so a reply that has started
+        arriving is never trimmed, and the current audio buffer is never touched
+        (audio stays the clock). Returns the number of frames dropped (0 in the
+        steady state, where there is no backlog to drain).
+        """
+        target = self._settings.idle_buffer_target_frames
+        if target <= 0 or popped is None or not popped.is_silence():
+            return 0
+        if len(self._video_frames) <= target:
+            return 0
+        # Never advance video past audio: only drain while the current buffer is
+        # idle (drained or absent). During a reply it holds bytes and the video
+        # must stay locked to the audio clock.
+        if self._current_buffer is not None and len(self._current_buffer.bytes_) > 0:
+            return 0
+        # A reply already queued behind the silence → drain two frames this tick
+        # so it surfaces sooner; otherwise skip one (matches pre-v3 behaviour).
+        speech_pending = any(not f.is_silence() for f in self._video_frames)
+        max_skip = 2 if speech_pending else 1
+        skipped = 0
+        while (
+            skipped < max_skip
+            and len(self._video_frames) > target
+            and self._video_frames[0].is_silence()
+        ):
+            self._video_frames.popleft()
+            skipped += 1
+        return skipped
+
+    # ------------------------------------------------------------------
     # Playback loop — audio-as-clock, no state machine
     # ------------------------------------------------------------------
 
@@ -994,6 +1053,20 @@ class OjinVideoService(FrameProcessor):
                     )
                     await self._swap_to_next_buffer(align_to_frame=video_frame)
                     swapped = True
+
+            # Drain any idle backlog: when the server is emitting silence and no
+            # speech audio is draining, drop the next silence frame(s) so a
+            # buffer that built up while playback was paused doesn't add constant
+            # latency to every reply. No-op once the buffer is at its target.
+            idle_skipped = self._drain_idle_backlog(video_frame)
+            if idle_skipped:
+                self._tr_idle_skips += idle_skipped
+                if self._trace is not None:
+                    self._trace.instant(
+                        "play:idle",
+                        "idle_backlog_skip",
+                        args={"skipped": idle_skipped, "pending": len(self._video_frames)},
+                    )
 
             # Audio drain: gated on _current_buffer existence only.
             # Audio is emitted as silence if the buffer is interrupted
@@ -1128,6 +1201,7 @@ class OjinVideoService(FrameProcessor):
                 tr.counter("pending_video_frames", len(self._video_frames))
                 tr.counter("playback_fps", len(self._tr_emit_times))
                 tr.counter("audio_underruns_total", self._tr_underruns)
+                tr.counter("idle_backlog_skips_total", self._tr_idle_skips)
                 # Lip-sync envelope — the closest thing to a live offset without
                 # tagged audio: the played-audio RMS should track the shown
                 # frame's bundled-audio RMS. Divergence = drift.

@@ -31,6 +31,7 @@ post-interruption desync between "what arrived" and "what played" obvious:
     speaking       bot speaking spans
     lipsync        swap-time audio alignment corrections
     response       first TTS audio → first speech video frame (turn latency)
+    latency        per-turn end-to-end latency reports from the bot pipeline
 
 Per-turn video response latency is anchored at the first TTS audio frame of the
 turn (when the bot's speech starts flowing into the avatar) and recorded at two
@@ -40,6 +41,14 @@ frame arriving from the server — the Ojin inference round-trip) and ``played``
 delay). Both are summarised under ``otherData.response_latency_ms`` (count / min
 / max / mean / p50 / last per endpoint), so the avatar's response time and where
 it is spent are readable without opening Perfetto.
+
+The bot pipeline's per-turn latency breakdown (STT / LLM / TTS / Ojin TTFB,
+end-to-end and perceived end-to-end, pipeline gap) is fed in via
+:meth:`OjinSessionTrace.record_latency_report`: each completed turn is drawn as
+an instant marker on the ``latency`` lane (full breakdown in its args) with
+counter events for the headline E2E figures, and the raw per-turn list plus a
+per-field summary are written under ``otherData.latency_turns`` /
+``otherData.latency_ms``.
 """
 
 from __future__ import annotations
@@ -73,6 +82,7 @@ LANES: Dict[str, int] = {
     "speaking": 16,
     "lipsync": 17,
     "response": 18,
+    "latency": 19,
 }
 
 # frame_idx wire marker (0/1/2/3) → received-stream lane.
@@ -103,10 +113,40 @@ def new_session_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def session_trace_enabled(default: bool = True) -> bool:
+    """Whether to write the per-session Perfetto trace.
+
+    On for every session by default; ``OJIN_BOT_SESSION_TRACE=0`` (or
+    ``false``/``no``/``off``) is a kill-switch, read at session start so it can
+    be toggled without a code change. ``default=False`` forces it off regardless
+    of the env var.
+    """
+    if not default:
+        return False
+    env = os.getenv("OJIN_BOT_SESSION_TRACE")
+    if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
 class OjinSessionTrace:
     """Accumulates Chrome-Trace events for one OjinVideoService session."""
 
     SCHEMA_VERSION = 2
+
+    # Numeric latency fields recorded per turn (display order). Mirrors the
+    # bot's LatencyReportFrame; a turn may not have every stage measured (e.g.
+    # STS pipelines without a separate LLM), so each is optional.
+    _LATENCY_FIELDS = (
+        "e2e_ms",
+        "perceived_e2e_ms",
+        "stt_ttfb_ms",
+        "llm_ttfb_ms",
+        "tts_ttfb_ms",
+        "ojin_ttfb_ms",
+        "gap_ms",
+        "ojin_total_ms",
+    )
 
     def __init__(
         self,
@@ -138,6 +178,16 @@ class OjinSessionTrace:
             "recv": deque(maxlen=10_000),
             "played": deque(maxlen=10_000),
         }
+        # Per-turn end-to-end latency breakdowns fed from the bot pipeline's
+        # LatencyTracker (same event loop, so plain append — no locking). The
+        # raw list and a per-field summary are written to otherData; each turn
+        # is also drawn on the ``latency`` lane at record time.
+        self._latency_turns: deque[dict] = deque(maxlen=10_000)
+        # Frozen once :meth:`write` has flushed to disk. Producers may keep a
+        # reference (e.g. the bot's LatencyTracker holds its own), so further
+        # records after the flush are dropped rather than appended to a doc that
+        # will never be written again.
+        self._written = False
 
     # -- time -----------------------------------------------------------
 
@@ -152,6 +202,8 @@ class OjinSessionTrace:
     # -- recording (all O(1); single event loop, no locking) ------------
 
     def _append(self, ev: dict) -> None:
+        if self._written:
+            return
         if len(self._events) == self._events.maxlen:
             self._evicted += 1
         self._events.append(ev)
@@ -226,8 +278,9 @@ class OjinSessionTrace:
         ``response_latency_ms`` summary in :meth:`build`'s ``otherData``.
         """
         latency_ms = (self.now_us() - start_us) / 1000.0
-        self.span("response", f"first_tts→first_video_{kind}", start_us, args=args)
-        self._response_latencies[kind].append(latency_ms)
+        if not self._written:
+            self.span("response", f"first_tts→first_video_{kind}", start_us, args=args)
+            self._response_latencies[kind].append(latency_ms)
         return round(latency_ms, 1)
 
     @staticmethod
@@ -251,12 +304,54 @@ class OjinSessionTrace:
             for kind, series in self._response_latencies.items()
         }
 
+    def record_latency_report(self, metrics: dict) -> None:
+        """Record one completed turn's end-to-end latency breakdown.
+
+        ``metrics`` is the per-turn report produced by the bot pipeline's
+        ``LatencyTracker`` (STT / LLM / TTS / Ojin TTFB, E2E, perceived E2E,
+        pipeline gap). Known numeric fields are kept for the
+        ``otherData.latency_ms`` summary and the raw per-turn list, and the turn
+        is drawn as an instant marker on the ``latency`` lane (full breakdown in
+        its args) plus a counter per headline E2E figure — so the bot-side
+        latency is visible on the Perfetto timeline next to the avatar's video
+        response latency. Missing/non-numeric fields are tolerated (a turn need
+        not measure every stage). No-op once the trace has been written.
+        """
+        if self._written:
+            return
+        record: dict = {}
+        for field in self._LATENCY_FIELDS:
+            val = metrics.get(field)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                record[field] = val
+        if "filler_used" in metrics:
+            record["filler_used"] = bool(metrics["filler_used"])
+        # Nothing measurable this turn — skip rather than store an empty row.
+        if not any(k in record for k in self._LATENCY_FIELDS):
+            return
+        self._latency_turns.append(record)
+        self.instant("latency", "latency_report", args=record)
+        for key in ("e2e_ms", "perceived_e2e_ms"):
+            if key in record:
+                self.counter(key, record[key])
+
+    def _latency_report_summary(self) -> Dict[str, dict]:
+        """Aggregate per-turn bot latency reports (per field) for ``otherData``."""
+        summary: Dict[str, dict] = {}
+        for field in self._LATENCY_FIELDS:
+            vals = [
+                t[field]
+                for t in self._latency_turns
+                if isinstance(t.get(field), (int, float)) and not isinstance(t.get(field), bool)
+            ]
+            if vals:
+                summary[field] = self._summarise_latencies(vals)
+        return summary
+
     # -- build + write --------------------------------------------------
 
     def build(self) -> dict:
-        meta = [
-            {"name": "process_name", "ph": "M", "pid": self._pid, "args": {"name": "ojin_bot"}}
-        ]
+        meta = [{"name": "process_name", "ph": "M", "pid": self._pid, "args": {"name": "ojin_bot"}}]
         for lane, tid in LANES.items():
             meta.append(
                 {
@@ -280,6 +375,8 @@ class OjinSessionTrace:
                 "events_evicted_overflow": self._evicted,
                 "event_counts": dict(self._counts),
                 "response_latency_ms": self._response_latency_summary(),
+                "latency_ms": self._latency_report_summary(),
+                "latency_turns": list(self._latency_turns),
             },
         }
 
@@ -289,7 +386,12 @@ class OjinSessionTrace:
         return os.path.join(self._root_dir, day, f"{stamp}_{self.session_id}")
 
     def write(self) -> str:
-        """Atomically write the trace; returns the path."""
+        """Atomically write the trace; returns the path.
+
+        Freezes the trace afterwards: any further records (e.g. a turn that
+        completes during teardown, via a producer that still holds a reference)
+        are dropped rather than mutating an already-flushed doc.
+        """
         out_dir = self.session_dir()
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, "session.json")
@@ -297,4 +399,5 @@ class OjinSessionTrace:
         with open(tmp, "w") as f:
             json.dump(self.build(), f)
         os.replace(tmp, path)
+        self._written = True
         return path

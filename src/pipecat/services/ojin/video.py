@@ -66,7 +66,6 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.ojin.session_trace import (
     OjinSessionTrace,
-    new_session_id,
     play_lane_for_idx,
     recv_lane_for_idx,
 )
@@ -109,21 +108,6 @@ def _rms_int16(audio: bytes) -> Optional[float]:
     if samples.size == 0:
         return None
     return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-
-
-def _session_trace_enabled(settings_flag: bool) -> bool:
-    """Whether to write the per-session Perfetto trace.
-
-    On for every session by default; ``OJIN_BOT_SESSION_TRACE=0`` (or
-    ``false``/``no``/``off``) is a kill-switch, read at session start so it can
-    be toggled without a code change.
-    """
-    if not settings_flag:
-        return False
-    env = os.getenv("OJIN_BOT_SESSION_TRACE")
-    if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
-        return False
-    return True
 
 
 @dataclass
@@ -242,11 +226,6 @@ class OjinVideoSettings:
     # Max leading frames to search/trim when aligning at swap (bounds cost and
     # blast radius). 50 frames = 2 s, well above any realistic drop window.
     align_audio_max_frames: int = 50
-    # Write a per-session Perfetto trace (audio/video events) under
-    # session_trace_dir. On for every session by default; env
-    # OJIN_BOT_SESSION_TRACE=0 disables. See session_trace.py.
-    session_trace_enabled: bool = True
-    session_trace_dir: str = "/root/debug/sessions/bot"
 
 
 class OjinVideoService(FrameProcessor):
@@ -256,6 +235,7 @@ class OjinVideoService(FrameProcessor):
         self,
         settings: OjinVideoSettings,
         client: IOjinClient | None = None,
+        session_trace: OjinSessionTrace | None = None,
     ) -> None:
         super().__init__(name="ojin")
         logger.debug(
@@ -319,8 +299,12 @@ class OjinVideoService(FrameProcessor):
         # per-tick frame/audio correlations; empty + untouched in production.
         self._lipsync_trace: deque[LipsyncTraceEntry] = deque(maxlen=4000)
 
-        # Per-session Perfetto trace (created in _start, written in _stop).
-        # All event recording is guarded by ``self._trace is not None``.
+        # Per-session Perfetto trace, injected by the caller and shared with the
+        # bot's LatencyTracker so both producers write one file. The bot owns
+        # creation; this service only activates it in _start, records into it,
+        # and flushes it in _stop. All recording is guarded by
+        # ``self._trace is not None`` (None ⇒ this session is untraced).
+        self._injected_trace: Optional[OjinSessionTrace] = session_trace
         self._trace: Optional[OjinSessionTrace] = None
         self._tr_session_start: float = 0.0  # session span anchor (µs)
         self._tr_connect_start: float = 0.0  # connect span anchor (µs)
@@ -1278,20 +1262,14 @@ class OjinVideoService(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _start(self) -> None:
-        # Open the per-session Perfetto trace before connecting so the connect
-        # latency itself is captured.
-        if _session_trace_enabled(self._settings.session_trace_enabled):
-            try:
-                self._trace = OjinSessionTrace(
-                    session_id=new_session_id(),
-                    config_id=self._settings.config_id,
-                    root_dir=self._settings.session_trace_dir,
-                )
-                self._tr_session_start = self._trace.mark()
-                self._tr_connect_start = self._tr_session_start
-            except Exception as e:  # never let tracing break the session
-                logger.warning(f"session trace init failed: {e}")
-                self._trace = None
+        # Activate the caller-injected per-session Perfetto trace before
+        # connecting so the connect latency itself is captured. The bot owns
+        # trace creation (shared with its LatencyTracker); without an injected
+        # trace this session is untraced.
+        if self._injected_trace is not None:
+            self._trace = self._injected_trace
+            self._tr_session_start = self._trace.mark()
+            self._tr_connect_start = self._tr_session_start
         if not await self.connect_with_retry():
             return
         assert self._client is not None

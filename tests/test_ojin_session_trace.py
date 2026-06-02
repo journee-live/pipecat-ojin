@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock
 
 from ojin.ojin_client_messages import OjinInteractionResponseMessage
+
 from pipecat.services.ojin.session_trace import LANES, OjinSessionTrace
 from pipecat.services.ojin.video import OjinVideoService, OjinVideoSettings
 
@@ -94,6 +95,99 @@ class TestResponseLatencyRecording(unittest.TestCase):
     def test_schema_version_bumped_to_2(self) -> None:
         trace, _ = _make_trace()
         self.assertEqual(trace.build()["otherData"]["schema_version"], 2)
+
+
+class TestLatencyReportRecording(unittest.TestCase):
+    """The bot's LatencyTracker folds each completed turn's end-to-end latency
+    breakdown into the shared trace via ``record_latency_report``; the raw
+    per-turn list and a per-field summary surface in ``otherData``, and each
+    turn is drawn on the ``latency`` lane.
+    """
+
+    def test_has_dedicated_latency_lane(self) -> None:
+        self.assertIn("latency", LANES)
+
+    def test_records_turns_and_summarises_per_field(self) -> None:
+        trace, _ = _make_trace()
+        trace.record_latency_report(
+            {
+                "stt_ttfb_ms": 50.0,
+                "llm_ttfb_ms": 120.0,
+                "tts_ttfb_ms": 80.0,
+                "ojin_ttfb_ms": 90.0,
+                "e2e_ms": 400.0,
+                "perceived_e2e_ms": 300.0,
+                "gap_ms": 60.0,
+                "ojin_total_ms": 200.0,
+                "filler_used": True,
+            }
+        )
+        # An STS-style turn without a separate LLM measurement.
+        trace.record_latency_report(
+            {"tts_ttfb_ms": 70.0, "e2e_ms": 200.0, "llm_ttfb_ms": None, "filler_used": False}
+        )
+
+        other = trace.build()["otherData"]
+        turns = other["latency_turns"]
+        self.assertEqual(len(turns), 2)
+        self.assertTrue(turns[0]["filler_used"])
+        # None / missing fields are dropped, not stored as null.
+        self.assertNotIn("llm_ttfb_ms", turns[1])
+
+        summary = other["latency_ms"]
+        self.assertEqual(summary["e2e_ms"]["count"], 2)
+        self.assertAlmostEqual(summary["e2e_ms"]["min_ms"], 200.0, places=1)
+        self.assertAlmostEqual(summary["e2e_ms"]["max_ms"], 400.0, places=1)
+        # Only the first turn carried an LLM TTFB.
+        self.assertEqual(summary["llm_ttfb_ms"]["count"], 1)
+
+    def test_empty_report_is_skipped(self) -> None:
+        trace, _ = _make_trace()
+        trace.record_latency_report({"filler_used": True})  # no numeric fields
+        other = trace.build()["otherData"]
+        self.assertEqual(other["latency_turns"], [])
+        self.assertEqual(other["latency_ms"], {})
+
+    def test_draws_instant_and_counter_events(self) -> None:
+        trace, _ = _make_trace()
+        trace.record_latency_report({"e2e_ms": 300.0, "perceived_e2e_ms": 250.0})
+
+        doc = trace.build()
+        markers = [
+            e
+            for e in doc["traceEvents"]
+            if e.get("ph") == "i" and e.get("name") == "latency_report"
+        ]
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0]["tid"], LANES["latency"])
+
+        counters = {
+            e["name"]
+            for e in doc["traceEvents"]
+            if e.get("ph") == "C" and e["name"] in ("e2e_ms", "perceived_e2e_ms")
+        }
+        self.assertEqual(counters, {"e2e_ms", "perceived_e2e_ms"})
+
+    def test_summary_empty_by_default(self) -> None:
+        trace, _ = _make_trace()
+        other = trace.build()["otherData"]
+        self.assertEqual(other["latency_ms"], {})
+        self.assertEqual(other["latency_turns"], [])
+
+    def test_records_are_frozen_after_write(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = OjinSessionTrace(session_id="w", config_id="c", root_dir=tmp)
+            trace.record_latency_report({"e2e_ms": 100.0})
+            trace.write()
+            # A turn completing during teardown (producer still holds a ref)
+            # must not mutate the already-flushed doc.
+            trace.record_latency_report({"e2e_ms": 999.0})
+
+        summary = trace.build()["otherData"]["latency_ms"]
+        self.assertEqual(summary["e2e_ms"]["count"], 1)
+        self.assertAlmostEqual(summary["e2e_ms"]["max_ms"], 100.0, places=1)
 
 
 def _make_video_service() -> OjinVideoService:

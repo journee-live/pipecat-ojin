@@ -12,9 +12,17 @@ the SAME asyncio event loop, so there is no cross-thread access and no locking.
 Each record is one cheap ``deque.append`` (bounded, evict-oldest), guarded by a
 single ``None`` check at the call site, so it costs ~nothing when disabled.
 
-Layout written to::
+On :meth:`write` (session stop) the trace builds the document once and fans it
+out to every attached :class:`~pipecat.services.ojin.trace_sinks.TraceSink`,
+isolating failures so one sink erroring never costs another. By default a single
+:class:`~pipecat.services.ojin.trace_sinks.PerfettoFileSink` is attached, which
+writes::
 
     /root/debug/sessions/bot/{YYYY-MM-DD}/{HH-MM-SS}_{session_id}/session.json
+
+Callers attach more sinks — e.g. a Sentry latency forwarder — via the
+constructor's ``sinks=`` or :meth:`add_sink`, the bot-side equivalent of the
+inference server's single ``MetricsSink`` but fanned out to N sinks.
 
 Lanes (Perfetto threads), grouped so the received stream and the played stream
 are split by frame type (speech / new-turn / idle / fade), making a
@@ -53,13 +61,16 @@ per-field summary are written under ``otherData.latency_turns`` /
 
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Sequence
+
+from loguru import logger
+
+from pipecat.services.ojin.trace_sinks import PerfettoFileSink, TraceSink
 
 # Perfetto thread (lane) ids. Stable integers; names are attached via ``M``
 # metadata events at build time.
@@ -102,14 +113,17 @@ _PLAY_LANE_FOR_IDX = {
 
 
 def recv_lane_for_idx(frame_idx: int) -> str:
+    """Return the received-stream lane name for a wire ``frame_idx`` marker."""
     return _RECV_LANE_FOR_IDX.get(frame_idx, "recv:speech")
 
 
 def play_lane_for_idx(frame_idx: int) -> str:
+    """Return the played-stream lane name for a wire ``frame_idx`` marker."""
     return _PLAY_LANE_FOR_IDX.get(frame_idx, "play:speech")
 
 
 def new_session_id() -> str:
+    """Return a short random session id (12 hex chars)."""
     return uuid.uuid4().hex[:12]
 
 
@@ -157,7 +171,9 @@ class OjinSessionTrace:
         clock: Callable[[], float] = time.perf_counter,
         max_events: int = 500_000,
         root_dir: str = "/root/debug/sessions/bot",
+        sinks: Optional[Sequence[TraceSink]] = None,
     ) -> None:
+        """Create a session trace; defaults to a single Perfetto file sink."""
         self.session_id = session_id or new_session_id()
         self.config_id = config_id
         self._pid = pid
@@ -166,6 +182,14 @@ class OjinSessionTrace:
         self._start_wall = datetime.now(timezone.utc)
         self._events: deque[dict] = deque(maxlen=max_events)
         self._root_dir = root_dir
+        # Sinks the built document is fanned out to on :meth:`write`. Defaults
+        # to the Perfetto file writer (the trace's original behaviour); callers
+        # attach more (e.g. a Sentry latency forwarder) via the constructor or
+        # :meth:`add_sink`. Mirrors the inference server's single ``MetricsSink``
+        # but fans out to N sinks over the one trace.
+        self._sinks: list[TraceSink] = (
+            [PerfettoFileSink(root_dir=root_dir)] if sinks is None else list(sinks)
+        )
         self._evicted = 0
         # Lightweight running summary for otherData.
         self._counts: Dict[str, int] = {}
@@ -212,6 +236,7 @@ class OjinSessionTrace:
         self._counts[name] = self._counts.get(name, 0) + 1
 
     def instant(self, lane: str, name: str, *, cat: str = "", args: Optional[dict] = None) -> None:
+        """Record an instant marker event (``ph='i'``) on ``lane``."""
         self._append(
             {
                 "name": name,
@@ -252,6 +277,7 @@ class OjinSessionTrace:
         self._bump(name)
 
     def counter(self, name: str, value: float, *, extra: Optional[dict] = None) -> None:
+        """Record a counter (line-plot) event (``ph='C'``) for ``name``."""
         series = {name: value}
         if extra:
             series.update(extra)
@@ -351,6 +377,7 @@ class OjinSessionTrace:
     # -- build + write --------------------------------------------------
 
     def build(self) -> dict:
+        """Return the Chrome Trace document (events + ``otherData`` summary)."""
         meta = [{"name": "process_name", "ph": "M", "pid": self._pid, "args": {"name": "ojin_bot"}}]
         for lane, tid in LANES.items():
             meta.append(
@@ -381,23 +408,44 @@ class OjinSessionTrace:
         }
 
     def session_dir(self) -> str:
+        """Return this session's default output directory (under ``root_dir``)."""
         day = self._start_wall.strftime("%Y-%m-%d")
         stamp = self._start_wall.strftime("%H-%M-%S")
         return os.path.join(self._root_dir, day, f"{stamp}_{self.session_id}")
 
-    def write(self) -> str:
-        """Atomically write the trace; returns the path.
+    def add_sink(self, sink: TraceSink) -> None:
+        """Attach another sink to receive the built document at :meth:`write`.
 
-        Freezes the trace afterwards: any further records (e.g. a turn that
-        completes during teardown, via a producer that still holds a reference)
-        are dropped rather than mutating an already-flushed doc.
+        No-op once the trace has been written (the doc is already flushed).
         """
-        out_dir = self.session_dir()
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, "session.json")
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.build(), f)
-        os.replace(tmp, path)
+        if self._written:
+            return
+        self._sinks.append(sink)
+
+    def write(self) -> Optional[str]:
+        """Build the trace document once and hand it to every attached sink.
+
+        Each sink is isolated: one failing (e.g. a Sentry forwarder hitting a
+        network blip) neither raises nor stops the others (e.g. the Perfetto
+        file on disk). Freezes the trace afterwards — any further records (e.g.
+        a turn that completes during teardown, via a producer that still holds a
+        reference) are dropped rather than mutating an already-flushed doc.
+
+        Returns the path written by the first :class:`PerfettoFileSink`, if any,
+        for back-compat logging at the call site.
+        """
+        if self._written:
+            return None
+        doc = self.build()
+        first_path: Optional[str] = None
+        for sink in self._sinks:
+            try:
+                sink.write(doc)
+            except Exception as e:
+                logger.warning(f"trace sink {type(sink).__name__} write failed: {e}")
+                continue
+            path = getattr(sink, "path", None)
+            if isinstance(path, str) and first_path is None:
+                first_path = path
         self._written = True
-        return path
+        return first_path

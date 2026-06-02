@@ -121,9 +121,11 @@ class VideoFrame:
     volume: int
 
     def is_silence(self) -> bool:
+        """Whether this is an idle/silence frame (frame_idx 0)."""
         return self.frame_idx == 0
 
     def is_fade_out(self) -> bool:
+        """Whether this is a fade-out frame (frame_idx 2)."""
         return self.frame_idx == 2
 
     def is_new_turn_start(self) -> bool:
@@ -237,6 +239,7 @@ class OjinVideoService(FrameProcessor):
         client: IOjinClient | None = None,
         session_trace: OjinSessionTrace | None = None,
     ) -> None:
+        """Create the avatar service, optionally bound to a session trace."""
         super().__init__(name="ojin")
         logger.debug(
             f"OjinVideoService v3 initialised, version={OJIN_VIDEO_SERVICE_VERSION}, "
@@ -329,15 +332,18 @@ class OjinVideoService(FrameProcessor):
     # ------------------------------------------------------------------
 
     def can_generate_metrics(self) -> bool:
+        """Enable pipecat metrics (TTFB/processing) for this service."""
         return True
 
     def pause_playback(self) -> None:
+        """Pause the video playback loop (idempotent)."""
         if not self._playback_paused:
             self._playback_paused = True
             self._playback_resume_event.clear()
             logger.info("OjinVideoService: playback paused")
 
     def resume_playback(self) -> None:
+        """Resume a paused video playback loop (idempotent)."""
         if self._playback_paused:
             self._playback_paused = False
             self._playback_resume_event.set()
@@ -348,6 +354,7 @@ class OjinVideoService(FrameProcessor):
             )
 
     async def connect_with_retry(self) -> bool:
+        """Connect the Ojin client, retrying up to the configured max attempts."""
         last_error: Optional[Exception] = None
         assert self._client is not None
         for attempt in range(self._settings.client_connect_max_retries):
@@ -378,6 +385,7 @@ class OjinVideoService(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Route an incoming frame (TTS audio in, lifecycle, passthrough)."""
         await super().process_frame(frame, direction)
 
         if isinstance(frame, self._settings.start_frame_cls):
@@ -1149,6 +1157,18 @@ class OjinVideoService(FrameProcessor):
                             "played",
                             self._tr_first_tts_audio_at,
                             args={"frame_idx": video_frame.frame_idx},
+                        )
+                        # Also draw this first-tts-audio → first-speech-frame-
+                        # played window as the "ojin" span on the single
+                        # ``latency`` lane, so the avatar's stage sits in the
+                        # per-turn latency waterfall next to STT/LLM/TTS. Uses the
+                        # precise "played" endpoint (not bot-started-speaking,
+                        # which lands a playback tick later).
+                        tr.span(
+                            "latency",
+                            "ojin",
+                            self._tr_first_tts_audio_at,
+                            args={"played_ms": latency_ms, "frame_idx": video_frame.frame_idx},
                         )
                         logger.info(
                             f"📹 First speech video frame played {latency_ms}ms "

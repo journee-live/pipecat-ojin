@@ -96,15 +96,15 @@ LANES: Dict[str, int] = {
     "latency": 19,
 }
 
-# frame_idx wire marker (0/1/2/3) → received-stream lane.
-_RECV_LANE_FOR_IDX = {
+# frame_type wire marker (0/1/2/3) → received-stream lane.
+_RECV_LANE_FOR_FRAME_TYPE = {
     0: "recv:idle",
     1: "recv:speech",
     2: "recv:fade",
     3: "recv:new_turn",
 }
-# frame_idx wire marker → played-stream lane.
-_PLAY_LANE_FOR_IDX = {
+# frame_type wire marker → played-stream lane.
+_PLAY_LANE_FOR_FRAME_TYPE = {
     0: "play:idle",
     1: "play:speech",
     2: "play:fade",
@@ -112,14 +112,14 @@ _PLAY_LANE_FOR_IDX = {
 }
 
 
-def recv_lane_for_idx(frame_idx: int) -> str:
-    """Return the received-stream lane name for a wire ``frame_idx`` marker."""
-    return _RECV_LANE_FOR_IDX.get(frame_idx, "recv:speech")
+def recv_lane_for_frame_type(frame_type: int) -> str:
+    """Return the received-stream lane name for a wire ``frame_type`` marker."""
+    return _RECV_LANE_FOR_FRAME_TYPE.get(frame_type, "recv:speech")
 
 
-def play_lane_for_idx(frame_idx: int) -> str:
-    """Return the played-stream lane name for a wire ``frame_idx`` marker."""
-    return _PLAY_LANE_FOR_IDX.get(frame_idx, "play:speech")
+def play_lane_for_frame_type(frame_type: int) -> str:
+    """Return the played-stream lane name for a wire ``frame_type`` marker."""
+    return _PLAY_LANE_FOR_FRAME_TYPE.get(frame_type, "play:speech")
 
 
 def new_session_id() -> str:

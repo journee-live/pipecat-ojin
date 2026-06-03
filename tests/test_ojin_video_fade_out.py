@@ -1,7 +1,7 @@
 """Tests for the OjinVideoService FADE_OUT interrupt strategy.
 
 The bot reacts to the server's fade-out wire signal (a video frame with
-``frame_idx == 2``). On the cut-on-pop path, the audio cut fires from inside
+``frame_type == 2``). On the cut-on-pop path, the audio cut fires from inside
 ``_video_playback_loop`` at the exact tick when the fade-out frame is
 consumed for playback — keeping audio and video transitions visually in
 sync. The TTS lockout (``_discard_tts``) stays armed until the next
@@ -39,7 +39,7 @@ def _make_service(*, strategy: InterruptStrategy = InterruptStrategy.FADE_OUT) -
 
 def _fade_out_frame() -> VideoFrame:
     return VideoFrame(
-        frame_idx=2,
+        frame_type=2,
         image_bytes=b"\x00" * 32,
         audio_bytes=b"\x00" * 1280,
         is_final=False,
@@ -49,7 +49,7 @@ def _fade_out_frame() -> VideoFrame:
 
 def _speech_frame() -> VideoFrame:
     return VideoFrame(
-        frame_idx=1,
+        frame_type=1,
         image_bytes=b"\x00" * 32,
         audio_bytes=b"\x00" * 1280,
         is_final=False,
@@ -58,7 +58,7 @@ def _speech_frame() -> VideoFrame:
 
 
 class TestVideoFramePredicates(unittest.TestCase):
-    def test_is_fade_out_true_only_for_frame_idx_2(self) -> None:
+    def test_is_fade_out_true_only_for_frame_type_2(self) -> None:
         self.assertTrue(_fade_out_frame().is_fade_out())
         self.assertFalse(_speech_frame().is_fade_out())
         silence = VideoFrame(0, b"", b"", False, 0)
@@ -216,7 +216,7 @@ class TestCutOnPopInPlaybackLoop(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_five_fade_pops_only_trim_once(self) -> None:
-        """The server emits 5 frame_idx==2 frames. Only the first pop trims;
+        """The server emits 5 frame_type==2 frames. Only the first pop trims;
         subsequent pops must no-op because _fade_cut_done is True.
         """
         service = _make_service()

@@ -45,10 +45,10 @@ class TestResponseLatencyRecording(unittest.TestCase):
 
         # First speech video frame received from the server 200 ms later.
         clock.t = 1.2
-        recv_ms = trace.record_response_latency("recv", anchor, args={"frame_idx": 3})
+        recv_ms = trace.record_response_latency("recv", anchor, args={"frame_type": 3})
         # …and played downstream 50 ms after that (250 ms from the anchor).
         clock.t = 1.25
-        played_ms = trace.record_response_latency("played", anchor, args={"frame_idx": 3})
+        played_ms = trace.record_response_latency("played", anchor, args={"frame_type": 3})
 
         self.assertAlmostEqual(recv_ms, 200.0, places=1)
         self.assertAlmostEqual(played_ms, 250.0, places=1)
@@ -198,14 +198,16 @@ def _make_video_service() -> OjinVideoService:
     return service
 
 
-def _response_msg(index: int) -> OjinInteractionResponseMessage:
-    """A server response frame whose ``index`` is the wire marker
-    (0 idle/silence, 1 speech, 2 fade, 3 new-turn)."""
+def _response_msg(frame_type: int) -> OjinInteractionResponseMessage:
+    """A server response frame whose ``frame_type`` is the classification
+    marker (0 idle/silence, 1 speech, 2 fade, 3 new-turn). The wire ``index``
+    is the collapsed legacy tag (0 for idle/fade, 1 for speech)."""
     return OjinInteractionResponseMessage(
         interaction_id="t",
         video_frame_bytes=b"\x00" * 16,
         audio_frame_bytes=b"\x00" * 16,
-        index=index,
+        index=0 if frame_type in (0, 2) else 1,
+        frame_type=frame_type,
     )
 
 
@@ -227,7 +229,7 @@ class TestVideoServiceRecvLatencyWiring(unittest.IsolatedAsyncioTestCase):
         service = self._armed_service(clock)
 
         clock.t = 1.15  # first new-turn speech frame arrives 150 ms later
-        await service._handle_ojin_message(_response_msg(index=3))
+        await service._handle_ojin_message(_response_msg(frame_type=3))
 
         self.assertFalse(service._awaiting_first_recv_video)
         recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
@@ -236,7 +238,7 @@ class TestVideoServiceRecvLatencyWiring(unittest.IsolatedAsyncioTestCase):
 
         # A second speech frame in the same turn must not re-record.
         clock.t = 1.30
-        await service._handle_ojin_message(_response_msg(index=1))
+        await service._handle_ojin_message(_response_msg(frame_type=1))
         recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
         self.assertEqual(recv["count"], 1)
 
@@ -245,11 +247,45 @@ class TestVideoServiceRecvLatencyWiring(unittest.IsolatedAsyncioTestCase):
         service = self._armed_service(clock)
 
         clock.t = 1.15
-        await service._handle_ojin_message(_response_msg(index=0))  # idle/silence
+        await service._handle_ojin_message(_response_msg(frame_type=0))  # idle/silence
 
         self.assertTrue(service._awaiting_first_recv_video)
         recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
         self.assertEqual(recv["count"], 0)
+
+
+class TestVideoFrameClassifiedByFrameType(unittest.IsolatedAsyncioTestCase):
+    """video.py must classify frames by the wire ``frame_type`` field, NOT by
+    ``index`` — which now only carries the collapsed 0/1 tag. IDLE and FADE_OUT
+    both arrive with index==0; SPEECH and START_OF_SPEECH both with index==1, so
+    only ``frame_type`` can distinguish them.
+    """
+
+    async def test_fade_out_distinguished_from_idle_at_index_0(self) -> None:
+        service = _make_video_service()
+
+        await service._handle_ojin_message(_response_msg(frame_type=2))  # FADE_OUT
+        fade = service._video_frames[-1]
+        self.assertEqual(fade.frame_type, 2)
+        self.assertTrue(fade.is_fade_out())
+        self.assertFalse(fade.is_silence())
+
+        await service._handle_ojin_message(_response_msg(frame_type=0))  # IDLE
+        idle = service._video_frames[-1]
+        self.assertTrue(idle.is_silence())
+        self.assertFalse(idle.is_fade_out())
+
+    async def test_new_turn_distinguished_from_speech_at_index_1(self) -> None:
+        service = _make_video_service()
+
+        await service._handle_ojin_message(_response_msg(frame_type=3))  # START_OF_SPEECH
+        new_turn = service._video_frames[-1]
+        self.assertTrue(new_turn.is_new_turn_start())
+
+        await service._handle_ojin_message(_response_msg(frame_type=1))  # SPEECH
+        speech = service._video_frames[-1]
+        self.assertFalse(speech.is_new_turn_start())
+        self.assertFalse(speech.is_silence())
 
 
 if __name__ == "__main__":

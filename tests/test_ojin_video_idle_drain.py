@@ -33,13 +33,13 @@ def _make_service(*, target: int = 10) -> OjinVideoService:
 
 def _silence() -> VideoFrame:
     return VideoFrame(
-        frame_idx=0, image_bytes=b"\x00" * 8, audio_bytes=b"", is_final=False, volume=0
+        frame_type=0, image_bytes=b"\x00" * 8, audio_bytes=b"", is_final=False, volume=0
     )
 
 
 def _speech() -> VideoFrame:
     return VideoFrame(
-        frame_idx=1, image_bytes=b"\x00" * 8, audio_bytes=b"\x01" * 1280, is_final=False, volume=100
+        frame_type=1, image_bytes=b"\x00" * 8, audio_bytes=b"\x01" * 1280, is_final=False, volume=100
     )
 
 

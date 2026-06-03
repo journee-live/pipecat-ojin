@@ -198,7 +198,11 @@ For each payload entry:
   [4 bytes]  Payload size (uint32)
   [1 byte]   Payload type (1 = audio, 2 = image)
   [N bytes]  Payload data
+
+[1 byte]     Frame type (uint8, appended after all payload entries: 0 = idle, 1 = speech, 2 = fade-out, 3 = start-of-speech)
 ```
+
+The `Frame type` byte is the authoritative frame classifier. The `Frame index` field now carries only the coarse `0`/`1` split (0 = silence, 1 = speech). The trailing byte is strictly additive — older parsers that read the header and loop over the payload entries simply ignore it.
 
 **Interaction ID:**
 - `00000000-0000-0000-0000-000000000000`: Idle frames (persona in rest state)
@@ -243,11 +247,16 @@ async def receive_response(ws):
         elif payload_type == 1:  # Audio
             audio_chunk = payload_data
     
+    # Trailing frame type byte (0/1/2/3 = idle/speech/fade-out/start-of-speech).
+    # Guard keeps this backward-compatible with servers that don't send it.
+    frame_type = data[offset] if offset < len(data) else index
+    
     return {
         'is_final': bool(is_final),
         'interaction_id': interaction_id,
         'is_idle': is_idle,
         'index': index,
+        'frame_type': frame_type,
         'video_frame': video_frame,
         'audio_chunk': audio_chunk
     }

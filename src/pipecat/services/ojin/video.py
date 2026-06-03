@@ -5,16 +5,16 @@ Spec: ``demo-modal-agents/docs/ojin_video_service_v3_redesign.md``.
 Key differences from v2:
 
 * No bot-side first-speech-frame inference. The server emits
-  ``frame_idx == 3`` for the first SPEECH frame of a new turn (either
+  ``frame_type == 3`` for the first SPEECH frame of a new turn (either
   cancel-armed or silence-streak-armed). The bot swaps its audio buffer
   on that signal alone.
 * No 4-state machine. The bot's effective state is derived from
   ``_current_buffer`` (existence + interrupted flag): if a buffer
   exists and is not interrupted, we're speaking; otherwise we're idle.
-* No receive-side trim of the video deque. Mid-speech ``frame_idx == 0``
+* No receive-side trim of the video deque. Mid-speech ``frame_type == 0``
   frames (audio-feeder starvation glitches at the server) flow through
   the current buffer's video as-is.
-* No IDLE silence-buffer trim. The audio buffer queue + ``frame_idx == 3``
+* No IDLE silence-buffer trim. The audio buffer queue + ``frame_type == 3``
   swap already bounds head silence.
 
 Audio remains the playback clock — audio drains every tick when the
@@ -24,7 +24,7 @@ underrun is an accepted trade-off (audio crackle would be worse).
 Fadeout audio-cut: when a user barges in, the current buffer is marked
 ``interrupted = True``. The buffer keeps draining (bytes consumed) but
 audio is silenced. Visual playback continues from the server's fade
-frames until the next ``frame_idx == 3`` triggers the swap.
+frames until the next ``frame_type == 3`` triggers the swap.
 """
 
 from __future__ import annotations
@@ -66,8 +66,8 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.ojin.session_trace import (
     OjinSessionTrace,
-    play_lane_for_idx,
-    recv_lane_for_idx,
+    play_lane_for_frame_type,
+    recv_lane_for_frame_type,
 )
 
 
@@ -114,23 +114,23 @@ def _rms_int16(audio: bytes) -> Optional[float]:
 class VideoFrame:
     """One video frame from the inference server, with bundled audio."""
 
-    frame_idx: int
+    frame_type: int
     image_bytes: bytes
     audio_bytes: bytes
     is_final: bool
     volume: int
 
     def is_silence(self) -> bool:
-        """Whether this is an idle/silence frame (frame_idx 0)."""
-        return self.frame_idx == 0
+        """Whether this is an idle/silence frame (frame_type 0)."""
+        return self.frame_type == 0
 
     def is_fade_out(self) -> bool:
-        """Whether this is a fade-out frame (frame_idx 2)."""
-        return self.frame_idx == 2
+        """Whether this is a fade-out frame (frame_type 2)."""
+        return self.frame_type == 2
 
     def is_new_turn_start(self) -> bool:
         """First speech frame of a new turn (v3 marker)."""
-        return self.frame_idx == 3
+        return self.frame_type == 3
 
 
 _AUDIO_BUFFER_COUNTER = 0
@@ -177,7 +177,7 @@ class LipsyncTraceEntry:
     """
 
     tick: int
-    frame_idx: int  # wire marker: 0 silence / 1 speech / 2 fade / 3 new-turn
+    frame_type: int  # wire marker: 0 silence / 1 speech / 2 fade / 3 new-turn
     swapped: bool  # a buffer-swap trigger fired this tick
     current_buffer_id: Optional[int]
     interrupted: bool  # current buffer was interrupted (audio silenced)
@@ -245,6 +245,20 @@ class OjinVideoService(FrameProcessor):
             f"OjinVideoService v3 initialised, version={OJIN_VIDEO_SERVICE_VERSION}, "
             f"settings={settings}"
         )
+        # Log which ojin-client (the STV wire client) is actually loaded, so we
+        # can confirm from the bot logs that the local editable 0.6.6 — not a
+        # stale PyPI build — is in use. Defensive: never break init.
+        try:
+            import importlib.metadata as _md
+
+            import ojin as _ojin
+
+            logger.info(
+                f"ojin-client version={_md.version('ojin-client')} "
+                f"loaded_from={os.path.dirname(_ojin.__file__)}"
+            )
+        except Exception as _exc:  # pragma: no cover - diagnostic only
+            logger.warning(f"could not resolve ojin-client version: {_exc}")
 
         self._settings = settings
         if client is None:
@@ -543,10 +557,10 @@ class OjinVideoService(FrameProcessor):
             # server's input buffer. On cancel the server drains ALL of that
             # pre-sent audio and renders the genuinely-new turn from audio that
             # arrives after the drain. If we kept these stale queued buffers,
-            # the next frame_idx==3 would swap playback to one of them and the
+            # the next frame_type==3 would swap playback to one of them and the
             # avatar would lip-sync the new turn over the cancelled turn's
             # audio. Dropping them here keeps client and server symmetric:
-            # both discard everything pre-interrupt, so the next frame_idx==3
+            # both discard everything pre-interrupt, so the next frame_type==3
             # lands on the new turn's fresh buffer.
             discarded_buffers = len(self._audio_buffers)
             self._audio_buffers.clear()
@@ -567,7 +581,7 @@ class OjinVideoService(FrameProcessor):
                     },
                 )
                 # Anchor the cancel→new-turn round-trip span (closed when the
-                # next frame_idx==3 arrives).
+                # next frame_type==3 arrives).
                 self._tr_interrupt_start = self._trace.mark()
         else:
             logger.debug(
@@ -616,7 +630,9 @@ class OjinVideoService(FrameProcessor):
             self.fps_tracker.update(1)
             self.last_frame_time = time.monotonic()
 
-            frame_idx = message.index
+            # Authoritative frame classification now rides on the explicit
+            # frame_type field (0/1/2/3). The wire index only carries 0/1.
+            frame_type = int(message.frame_type)
             samples = [
                 int.from_bytes(message.audio_frame_bytes[i : i + 2], "little", signed=True)
                 for i in range(0, len(message.audio_frame_bytes) - 1, 2)
@@ -626,31 +642,34 @@ class OjinVideoService(FrameProcessor):
             )
 
             video_frame = VideoFrame(
-                frame_idx=frame_idx,
+                frame_type=frame_type,
                 image_bytes=message.video_frame_bytes,
                 audio_bytes=message.audio_frame_bytes,
                 is_final=message.is_final_response,
                 volume=volume,
             )
-            # logger.debug(f"Received frame_idx={frame_idx} (volume={volume})")
+            # logger.debug(f"Received frame_type={frame_type} (volume={volume})")
             self._video_frames.append(video_frame)
 
             if self._trace is not None:
                 self._trace.instant(
-                    recv_lane_for_idx(frame_idx),
+                    recv_lane_for_frame_type(frame_type),
                     "frame_recv",
-                    cat=str(frame_idx),
+                    cat=str(frame_type),
                     args={
-                        "frame_idx": frame_idx,
+                        "frame_type": frame_type,
                         "volume": volume,
                         "audio_len": len(message.audio_frame_bytes),
                         "recv_buf": len(self._video_frames),
                     },
                 )
+                # Numeric frame_type timeline so the wire classification is
+                # visible at a glance alongside the per-type recv lanes.
+                self._trace.counter("recv_frame_type", frame_type)
                 # Close the cancel→new-turn round-trip span on the first
                 # new-turn frame after a barge-in (the client-observed fade
                 # latency — the lip-sync KPI).
-                if frame_idx == 3 and self._tr_interrupt_start is not None:
+                if frame_type == 3 and self._tr_interrupt_start is not None:
                     self._trace.span("interruption", "interrupt→new_turn", self._tr_interrupt_start)
                     self._tr_interrupt_start = None
 
@@ -666,11 +685,11 @@ class OjinVideoService(FrameProcessor):
                     latency_ms = self._trace.record_response_latency(
                         "recv",
                         self._tr_first_tts_audio_at,
-                        args={"frame_idx": frame_idx},
+                        args={"frame_type": frame_type},
                     )
                     logger.info(
                         f"📹 First speech video frame received {latency_ms}ms "
-                        f"after first TTS audio (frame_idx={frame_idx})"
+                        f"after first TTS audio (frame_type={frame_type})"
                     )
 
             # Backstop: never let the receive buffer grow unbounded.
@@ -720,7 +739,7 @@ class OjinVideoService(FrameProcessor):
                 )
 
     # ------------------------------------------------------------------
-    # Buffer swap on frame_idx == 3
+    # Buffer swap on frame_type == 3
     # ------------------------------------------------------------------
 
     async def _swap_to_next_buffer(self, align_to_frame: Optional["VideoFrame"] = None) -> None:
@@ -728,7 +747,7 @@ class OjinVideoService(FrameProcessor):
 
         Discards whatever bytes remain in ``_current_buffer`` (in-flight
         audio of a cancelled turn, or audio buffered ahead of playback
-        for a natural-turn-end case). Server's ``frame_idx == 3`` marker
+        for a natural-turn-end case). Server's ``frame_type == 3`` marker
         is authoritative — bytes before this point belonged to the prior
         turn, bytes from now on belong to the new turn.
 
@@ -740,11 +759,11 @@ class OjinVideoService(FrameProcessor):
 
         If the queue is empty when we get a swap signal, log a warning
         and skip — server-bot desync, but harmless (next swap will
-        come on the next ``frame_idx == 3``).
+        come on the next ``frame_type == 3``).
         """
         if not self._audio_buffers:
             logger.warning(
-                f"frame_idx=3 received but audio buffer queue is empty "
+                f"frame_type=3 received but audio buffer queue is empty "
                 f"(current={'present' if self._current_buffer else 'none'}) "
                 f"— skipping swap"
             )
@@ -766,7 +785,7 @@ class OjinVideoService(FrameProcessor):
 
         if new_buffer is None:
             logger.warning(
-                f"frame_idx=3 received but all queued buffers were empty — skipping swap"
+                f"frame_type=3 received but all queued buffers were empty — skipping swap"
             )
             self._current_buffer = None
             await self._maybe_emit_stopped_speaking()
@@ -774,7 +793,7 @@ class OjinVideoService(FrameProcessor):
 
         self._current_buffer = new_buffer
         logger.info(
-            f"frame_idx=3 swap: prev buffer #{prev_id} discarded "
+            f"frame_type=3 swap: prev buffer #{prev_id} discarded "
             f"({prev_remnant}B remnant) → new buffer #{new_buffer.buffer_id} "
             f"({len(new_buffer.bytes_)}B; queue={len(self._audio_buffers)}); "
             f"prev-turn emitted audio_chunks={self._audio_chunks_emitted} "
@@ -954,7 +973,7 @@ class OjinVideoService(FrameProcessor):
         Each 40 ms tick:
           1. If paused, wait for resume.
           2. Sleep + spin-lock until the next tick boundary.
-          3. Pop one video frame (if any). On ``frame_idx == 3``, swap to
+          3. Pop one video frame (if any). On ``frame_type == 3``, swap to
              the next audio buffer BEFORE draining audio this tick.
           4. Drain one chunk from the current buffer (regardless of
              video pop — audio is the clock).
@@ -1003,7 +1022,7 @@ class OjinVideoService(FrameProcessor):
             # Two swap triggers, both fire BEFORE we drain audio this tick
             # so the popped frame pairs with the new buffer's first chunk:
             #
-            #   (1) frame_idx == 3 — cancel-armed boundary from the server.
+            #   (1) frame_type == 3 — cancel-armed boundary from the server.
             #       Deterministic. The ONLY swap trigger when the current
             #       buffer is interrupted (post-cancel fadeout in progress).
             #
@@ -1017,7 +1036,7 @@ class OjinVideoService(FrameProcessor):
             # fade/silence frames; without the guard, a stale in-flight
             # SPEECH frame from the OLD turn could pop while current is
             # empty, triggering a premature swap. For cancel boundaries
-            # we rely exclusively on (1) — frame_idx=3 from the server.
+            # we rely exclusively on (1) — frame_type=3 from the server.
             video_frame: Optional[VideoFrame] = None
             swapped = False
             if self._video_frames:
@@ -1112,7 +1131,7 @@ class OjinVideoService(FrameProcessor):
                 self._lipsync_trace.append(
                     LipsyncTraceEntry(
                         tick=tick_count,
-                        frame_idx=video_frame.frame_idx,
+                        frame_type=video_frame.frame_type,
                         swapped=swapped,
                         current_buffer_id=(
                             self._current_buffer.buffer_id
@@ -1134,10 +1153,10 @@ class OjinVideoService(FrameProcessor):
             if tr is not None:
                 if video_frame is not None:
                     tr.instant(
-                        play_lane_for_idx(video_frame.frame_idx),
+                        play_lane_for_frame_type(video_frame.frame_type),
                         "video_emit",
-                        cat=str(video_frame.frame_idx),
-                        args={"frame_idx": video_frame.frame_idx, "swapped": swapped},
+                        cat=str(video_frame.frame_type),
+                        args={"frame_type": video_frame.frame_type, "swapped": swapped},
                     )
                     now_us = tr.now_us()
                     self._tr_emit_times.append(now_us)
@@ -1156,7 +1175,7 @@ class OjinVideoService(FrameProcessor):
                         latency_ms = tr.record_response_latency(
                             "played",
                             self._tr_first_tts_audio_at,
-                            args={"frame_idx": video_frame.frame_idx},
+                            args={"frame_type": video_frame.frame_type},
                         )
                         # Also draw this first-tts-audio → first-speech-frame-
                         # played window as the "ojin" span on the single
@@ -1168,11 +1187,11 @@ class OjinVideoService(FrameProcessor):
                             "latency",
                             "ojin",
                             self._tr_first_tts_audio_at,
-                            args={"played_ms": latency_ms, "frame_idx": video_frame.frame_idx},
+                            args={"played_ms": latency_ms, "frame_type": video_frame.frame_type},
                         )
                         logger.info(
                             f"📹 First speech video frame played {latency_ms}ms "
-                            f"after first TTS audio (frame_idx={video_frame.frame_idx})"
+                            f"after first TTS audio (frame_type={video_frame.frame_type})"
                         )
                 elif self._last_played_image_bytes is not None:
                     tr.instant("play:repeat", "video_repeat")

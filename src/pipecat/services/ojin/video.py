@@ -33,13 +33,13 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    InterruptionTaskFrame,
     OutputAudioRawFrame,
     OutputImageRawFrame,
     StartFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     UserStartedSpeakingFrame,
-    InterruptionTaskFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -81,6 +81,7 @@ class VideoFrame:
     is_first_speech_frame: bool = False
 
     def is_silence(self) -> bool:
+        """Return True if this is a silence/idle frame (frame_idx 0)."""
         return self.frame_idx == 0
 
 
@@ -133,6 +134,7 @@ class OjinVideoService(FrameProcessor):
         settings: OjinVideoSettings,
         client: IOjinClient | None = None,
     ) -> None:
+        """Initialize the service with its settings and an optional Ojin client."""
         super().__init__(name="ojin")
         logger.debug(
             f"OjinVideoService initialized with settings {settings} version: {OJIN_VIDEO_SERVICE_VERSION}"
@@ -716,9 +718,13 @@ class OjinVideoService(FrameProcessor):
         await self.stop_ttfb_metrics()
 
     async def _stop_audio_playback(self):
-        if not self._is_playing_speech_audio:
-            return
-
+        # No early-return guard: the natural-end branch of _video_playback_loop
+        # pre-sets _is_playing_speech_audio to False before calling this, so a
+        # guard on that flag would short-circuit and skip both the frame push
+        # and the buffer clear. The method is idempotent and always emits the
+        # stopped-speaking signal + clears residual audio. Downstream consumers
+        # (e.g. the bot's nudge/turn state machine) gate on their own
+        # is-speaking flag, so a repeated emit is harmless.
         self._is_playing_speech_audio = False
         await self.push_frame(OjinBotStoppedSpeakingFrame(), direction=FrameDirection.DOWNSTREAM)
         self._speech_buffer.clear()
@@ -738,6 +744,7 @@ class OjinVideoService(FrameProcessor):
     async def prepare_video_frame(
         self, video: bytes, is_first: bool = False, pts: Optional[int] = None
     ) -> OutputImageRawFrame:
+        """Decode, scale-to-cover, and wrap raw JPEG bytes into an output image frame."""
         if pts is None:
             pts = int(time.monotonic() * 1_000_000_000)
         image_array = np.frombuffer(video, dtype=np.uint8)
@@ -762,7 +769,9 @@ class OjinVideoService(FrameProcessor):
             rgb_image = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
             rgb_bytes = rgb_image.tobytes()
 
-            rgb_frame = OutputImageRawFrame(image=rgb_bytes, size=(target_w, target_h), format="RGB")
+            rgb_frame = OutputImageRawFrame(
+                image=rgb_bytes, size=(target_w, target_h), format="RGB"
+            )
             rgb_frame.pts = pts
             if is_first:
                 logger.warning(f"First image frame played!")

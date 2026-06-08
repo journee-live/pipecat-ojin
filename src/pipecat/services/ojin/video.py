@@ -30,7 +30,10 @@ frames until the next ``frame_type == 3`` triggers the swap.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import os
+import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -312,6 +315,26 @@ class OjinVideoService(FrameProcessor):
         # Tasks.
         self._receive_msg_task: Optional[asyncio.Task] = None
         self._video_playback_task: Optional[asyncio.Task] = None
+
+        # Event-loop stall diagnostics (see the audio_freeze investigation:
+        # a ~0.66s synchronous block on the bot's asyncio loop froze BOTH
+        # playback ticks and the websocket reader, while the server kept
+        # pacing). The watchdog thread dumps every thread's stack when a
+        # playback tick fails to advance within the threshold (captures the
+        # main thread even while it is blocked in a C extension, since
+        # faulthandler walks frames without the GIL). Per-tick work timing
+        # (loop_lag_ms / tick_work_ms / frame_prepare_ms counters + a slow-
+        # tick warning) attributes a stall to a code region. The loop
+        # exception handler names the connection behind socket errors.
+        # All knobs default-on, gated by env; 0 disables.
+        self._loop_stall_watchdog_ms = float(
+            os.environ.get("OJIN_LOOP_STALL_WATCHDOG_MS", "250")
+        )
+        self._tick_warn_ms = float(os.environ.get("OJIN_TICK_WARN_MS", "80"))
+        self._last_tick_perf: float = 0.0
+        self._loop_watchdog_thread: Optional[threading.Thread] = None
+        self._loop_watchdog_stop: Optional[threading.Event] = None
+        self._prev_loop_exc_handler = None
 
         # Derived speaking state — fires the downstream "started/stopped
         # speaking" signals at edges of this predicate. Tracked here so
@@ -1047,6 +1070,15 @@ class OjinVideoService(FrameProcessor):
                 pass
             next_tick += self._frame_duration
 
+            # Loop-stall diagnostics: pet the watchdog and measure the inter-tick
+            # gap (a stall on the PREVIOUS tick shows up as the gap here) plus this
+            # tick's own synchronous work below. _prepare_s accumulates the cv2
+            # image-prep cost — the prime suspect for an event-loop block.
+            _now_perf = time.perf_counter()
+            _prev_tick_perf = self._last_tick_perf
+            self._last_tick_perf = _now_perf
+            _prepare_s = 0.0
+
             # Initial buffer warm-up.
             if self._video_frames and initial_buffer > 0:
                 initial_buffer -= 1
@@ -1281,14 +1313,18 @@ class OjinVideoService(FrameProcessor):
             # Push frames downstream.
             if video_frame is not None:
                 self._last_played_image_bytes = video_frame.image_bytes
+                _t_prep = time.perf_counter()
                 out_image = await self._prepare_video_frame(video_frame.image_bytes, pts)
+                _prepare_s += time.perf_counter() - _t_prep
                 if out_image is not None:
                     await self.push_frame(out_image)
                     self._video_frames_emitted += 1
 
             elif self._last_played_image_bytes is not None:
                 # No new frame — repeat the last one to keep the video flowing.
+                _t_prep = time.perf_counter()
                 out_image = await self._prepare_video_frame(self._last_played_image_bytes, pts)
+                _prepare_s += time.perf_counter() - _t_prep
                 if out_image is not None:
                     await self.push_frame(out_image)
                     self._video_frames_emitted += 1
@@ -1299,6 +1335,29 @@ class OjinVideoService(FrameProcessor):
             # Edge detection for the started/stopped-speaking signals.
             await self._maybe_emit_started_speaking()
             await self._maybe_emit_stopped_speaking()
+
+            # Loop-stall attribution (see the audio_freeze investigation).
+            # loop_lag_ms: scheduling delay carried in from the previous tick
+            # (a block elsewhere on the loop). tick_work_ms: this tick's own
+            # synchronous cost. frame_prepare_ms: the cv2 decode/resize slice.
+            _work_ms = (time.perf_counter() - _now_perf) * 1000.0
+            if tr is not None:
+                _lag_ms = (
+                    (_now_perf - _prev_tick_perf) * 1000.0 - self._frame_duration * 1000.0
+                    if _prev_tick_perf > 0
+                    else 0.0
+                )
+                tr.counter("loop_lag_ms", round(max(0.0, _lag_ms), 1))
+                tr.counter("tick_work_ms", round(_work_ms, 1))
+                tr.counter("frame_prepare_ms", round(_prepare_s * 1000.0, 1))
+            if self._tick_warn_ms > 0 and _work_ms > self._tick_warn_ms:
+                logger.warning(
+                    f"[ojin-tick-slow] tick work {_work_ms:.0f}ms "
+                    f"(frame_prepare={_prepare_s * 1000.0:.0f}ms, swapped={swapped}, "
+                    f"video={'y' if video_frame is not None else 'n'}, "
+                    f"pending_frames={len(self._video_frames)}, "
+                    f"queued_buffers={len(self._audio_buffers)}) — main loop blocked this tick"
+                )
 
     # ------------------------------------------------------------------
     # Started/Stopped speaking signalling — derived from buffer state
@@ -1339,6 +1398,128 @@ class OjinVideoService(FrameProcessor):
             await self.push_frame(OjinBotStoppedSpeakingFrame())
 
     # ------------------------------------------------------------------
+    # Event-loop stall diagnostics
+    # ------------------------------------------------------------------
+
+    def _loop_stall_watchdog(self, threshold_s: float, stop: threading.Event) -> None:
+        """Dump all thread stacks when a playback tick stalls (background thread).
+
+        Reads the playback loop's last-tick timestamp; if it has not advanced
+        within ``threshold_s`` (and playback is not intentionally paused), dumps
+        every thread's stack to stderr once per stall. faulthandler walks frames
+        without holding the GIL, so this captures the main thread even while it
+        is blocked inside a synchronous C call (cv2, GC, native SDK). Diagnostic
+        only — never raises into the session.
+        """
+        check_s = max(0.01, min(threshold_s / 2.0, 0.05))
+        dumped = False
+        while not stop.wait(check_s):
+            try:
+                last = self._last_tick_perf
+                if last <= 0.0 or self._playback_paused:
+                    dumped = False
+                    continue
+                stalled_s = time.perf_counter() - last
+                if stalled_s >= threshold_s:
+                    if not dumped:
+                        dumped = True
+                        print(
+                            f"\n[ojin-loop-watchdog] playback loop stalled "
+                            f"{stalled_s * 1000:.0f}ms (threshold {threshold_s * 1000:.0f}ms) "
+                            f"— dumping all thread stacks:",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                else:
+                    dumped = False
+            except Exception:  # pragma: no cover - diagnostic only
+                pass
+
+    def _loop_exception_handler(self, loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        """Loop exception handler that names the connection behind socket errors.
+
+        asyncio's default handler prints SSL/transport failures (e.g. ``Bad file
+        descriptor`` → ``Event loop is closed``) with a traceback that is wholly
+        asyncio-internal — no application frames — so there is no hint which
+        connection died. Log the transport's peer/host/fd so the next occurrence
+        is attributable, then delegate to the previous handler. Never raises.
+        """
+        try:
+            transport = context.get("transport")
+            info: dict = {}
+            get_extra = getattr(transport, "get_extra_info", None)
+            if callable(get_extra):
+                for key in ("peername", "sockname", "server_hostname"):
+                    try:
+                        info[key] = get_extra(key)
+                    except Exception:
+                        pass
+                try:
+                    sock = get_extra("socket")
+                    info["fd"] = sock.fileno() if sock is not None else None
+                except Exception:
+                    pass
+            exc = context.get("exception")
+            logger.warning(
+                f"[ojin-loop-exc] msg={context.get('message')!r} "
+                f"exc={type(exc).__name__ if exc else None}:{exc} "
+                f"transport_info={info}"
+            )
+        except Exception:  # pragma: no cover - diagnostic only
+            pass
+        finally:
+            try:
+                if self._prev_loop_exc_handler is not None:
+                    self._prev_loop_exc_handler(loop, context)
+                else:
+                    loop.default_exception_handler(context)
+            except Exception:  # pragma: no cover - diagnostic only
+                pass
+
+    def _start_loop_diagnostics(self) -> None:
+        """Install the loop exception handler + start the stall watchdog thread.
+
+        Defensive: a diagnostics failure must never break session startup.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            self._prev_loop_exc_handler = loop.get_exception_handler()
+            loop.set_exception_handler(self._loop_exception_handler)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            logger.warning(f"could not install loop exception handler: {exc}")
+        if self._loop_stall_watchdog_ms > 0 and self._loop_watchdog_thread is None:
+            try:
+                stop = threading.Event()
+                thread = threading.Thread(
+                    target=self._loop_stall_watchdog,
+                    args=(self._loop_stall_watchdog_ms / 1000.0, stop),
+                    name="ojin-loop-watchdog",
+                    daemon=True,
+                )
+                self._loop_watchdog_stop = stop
+                self._loop_watchdog_thread = thread
+                thread.start()
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                logger.warning(f"could not start loop stall watchdog: {exc}")
+
+    def _stop_loop_diagnostics(self) -> None:
+        """Restore the previous loop exception handler + stop the watchdog."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(self._prev_loop_exc_handler)
+        except Exception:  # pragma: no cover - diagnostic only
+            pass
+        stop = self._loop_watchdog_stop
+        thread = self._loop_watchdog_thread
+        self._loop_watchdog_stop = None
+        self._loop_watchdog_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    # ------------------------------------------------------------------
     # Service lifecycle
     # ------------------------------------------------------------------
 
@@ -1351,6 +1532,7 @@ class OjinVideoService(FrameProcessor):
             self._trace = self._injected_trace
             self._tr_session_start = self._trace.mark()
             self._tr_connect_start = self._tr_session_start
+        self._start_loop_diagnostics()
         if not await self.connect_with_retry():
             return
         assert self._client is not None
@@ -1377,6 +1559,7 @@ class OjinVideoService(FrameProcessor):
 
     async def _stop(self) -> None:
         self._initialized = False
+        self._stop_loop_diagnostics()
         self._write_session_trace()
         if self._client is not None:
             try:

@@ -1228,13 +1228,23 @@ class OjinVideoService(FrameProcessor):
                 # Lip-sync envelope — the closest thing to a live offset without
                 # tagged audio: the played-audio RMS should track the shown
                 # frame's bundled-audio RMS. Divergence = drift.
-                if video_frame is not None and drained_chunk:
-                    fa = _rms_int16(video_frame.audio_bytes)
+                #
+                # output_audio_rms tracks the ACTUAL emitted audio, so it must be
+                # sampled on the audio cadence — every tick a chunk drains —
+                # independent of whether a NEW video frame popped this tick.
+                # Gating it on `video_frame is not None` made the counter
+                # flat-line during a video freeze even though audio kept playing,
+                # so the trace read like an audio stall when it was only a video
+                # stall. frame_audio_rms stays frame-gated: it is the shown
+                # frame's bundled audio, which only exists when a frame popped.
+                if drained_chunk:
                     oa = _rms_int16(drained_chunk)
-                    if fa is not None:
-                        tr.counter("frame_audio_rms", round(fa, 1))
                     if oa is not None:
                         tr.counter("output_audio_rms", round(oa, 1))
+                if video_frame is not None and drained_chunk:
+                    fa = _rms_int16(video_frame.audio_bytes)
+                    if fa is not None:
+                        tr.counter("frame_audio_rms", round(fa, 1))
 
             # Push frames downstream.
             if video_frame is not None:

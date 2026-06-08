@@ -280,6 +280,12 @@ class OjinVideoService(FrameProcessor):
         # Audio buffer queue.
         self._audio_buffers: deque[AudioBuffer] = deque()
         self._current_buffer: Optional[AudioBuffer] = None
+        # Set when a new-turn boundary (frame_type=3) arrived but no replacement
+        # buffer was queued yet, so the edge-triggered swap was skipped. Lets the
+        # playback loop promote the buffer the moment it lands (level-triggered
+        # recovery) instead of waiting for a frame_type=3 that never repeats —
+        # otherwise the late buffer is orphaned and playback is silent forever.
+        self._swap_pending: bool = False
 
         # Resampler for TTS → server sample rate.
         self._resampler = create_default_resampler()
@@ -550,6 +556,10 @@ class OjinVideoService(FrameProcessor):
                 f"sending cancel"
             )
             self._current_buffer.interrupted = True
+            # A fresh interrupt supersedes any earlier orphaned-swap recovery:
+            # the queue is about to be cleared and a new frame_type=3 boundary
+            # will arrive for this turn, so drop any stale pending-swap intent.
+            self._swap_pending = False
             # Discard the queued buffers of the cancelled turn. A long agent
             # response is split into several TTS groups → several buffers; the
             # bot forwards every TTS frame to the inference server eagerly
@@ -742,6 +752,27 @@ class OjinVideoService(FrameProcessor):
     # Buffer swap on frame_type == 3
     # ------------------------------------------------------------------
 
+    def _current_replaceable(self) -> bool:
+        """Whether a queued buffer may be promoted over the current one this tick.
+
+        Normally only when there is no current buffer, or it has fully drained
+        and was NOT interrupted. The ``not interrupted`` guard stops a stale
+        old-turn SPEECH frame from triggering a premature swap during a
+        post-cancel fadeout — before the server's ``frame_type == 3`` boundary.
+
+        Once that boundary HAS passed without a buffer to swap
+        (``_swap_pending``), the current (interrupted) buffer IS the orphaned
+        prior turn, so allow replacing it as soon as the next turn's buffer is
+        available — discarding any interrupted remnant, but still letting a
+        *valid* mid-play buffer finish draining first.
+        """
+        cur = self._current_buffer
+        if cur is None:
+            return True
+        if self._swap_pending:
+            return cur.interrupted or len(cur.bytes_) == 0
+        return not cur.interrupted and len(cur.bytes_) == 0
+
     async def _swap_to_next_buffer(self, align_to_frame: Optional["VideoFrame"] = None) -> None:
         """Promote the head of the audio buffer queue to current.
 
@@ -765,8 +796,12 @@ class OjinVideoService(FrameProcessor):
             logger.warning(
                 f"frame_type=3 received but audio buffer queue is empty "
                 f"(current={'present' if self._current_buffer else 'none'}) "
-                f"— skipping swap"
+                f"— deferring swap until the replacement buffer lands"
             )
+            # The new-turn boundary passed before the replacement TTS was queued.
+            # Remember it so the playback loop promotes the buffer the moment it
+            # arrives, rather than waiting for a frame_type=3 that won't repeat.
+            self._swap_pending = True
             return
 
         prev_remnant = len(self._current_buffer.bytes_) if self._current_buffer is not None else 0
@@ -788,10 +823,12 @@ class OjinVideoService(FrameProcessor):
                 f"frame_type=3 received but all queued buffers were empty — skipping swap"
             )
             self._current_buffer = None
+            self._swap_pending = True
             await self._maybe_emit_stopped_speaking()
             return
 
         self._current_buffer = new_buffer
+        self._swap_pending = False
         logger.info(
             f"frame_type=3 swap: prev buffer #{prev_id} discarded "
             f"({prev_remnant}B remnant) → new buffer #{new_buffer.buffer_id} "
@@ -1048,18 +1085,13 @@ class OjinVideoService(FrameProcessor):
                     not video_frame.is_silence()
                     and not video_frame.is_fade_out()
                     and self._audio_buffers
-                    and (
-                        self._current_buffer is None
-                        or (
-                            not self._current_buffer.interrupted
-                            and len(self._current_buffer.bytes_) == 0
-                        )
-                    )
+                    and self._current_replaceable()
                 ):
                     logger.info(
-                        f"Natural turn end detected: current buffer "
+                        f"{'Deferred-swap recovery' if self._swap_pending else 'Natural turn end'} "
+                        f"detected: current buffer "
                         f"#{self._current_buffer.buffer_id if self._current_buffer else 'None'} "
-                        f"drained, popped SPEECH frame, "
+                        f"replaceable, popped SPEECH frame, "
                         f"queue has {len(self._audio_buffers)} buffer(s) — swapping"
                     )
                     await self._swap_to_next_buffer(align_to_frame=video_frame)

@@ -124,6 +124,23 @@ class TestStallWatchdog(unittest.TestCase):
         calls = self._run_watchdog(s, hold_s=0.4, pet=True)
         self.assertFalse(calls, "watchdog must stay silent while ticks keep advancing")
 
+    def test_probe_dumps_on_small_stall_below_full_threshold(self) -> None:
+        s = _make_service()
+        s._stall_probe_ms = 30.0  # probe at 30ms
+        s._playback_paused = False
+        s._last_tick_perf = time.perf_counter() - 0.1  # 100ms stale
+        # Full watchdog threshold high (5s) so ONLY the probe tier can fire.
+        calls = self._run_watchdog(s, threshold_s=5.0, hold_s=1.0)
+        self.assertTrue(calls, "probe must dump on a small stall the full watchdog misses")
+
+    def test_probe_disabled_does_not_dump_small_stall(self) -> None:
+        s = _make_service()
+        s._stall_probe_ms = 0.0  # probe off
+        s._playback_paused = False
+        s._last_tick_perf = time.perf_counter() - 0.1  # 100ms stale
+        calls = self._run_watchdog(s, threshold_s=5.0, hold_s=0.4)
+        self.assertFalse(calls, "with the probe off a sub-threshold stall must not dump")
+
 
 if __name__ == "__main__":
     unittest.main()

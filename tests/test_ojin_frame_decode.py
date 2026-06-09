@@ -126,7 +126,8 @@ class TestPipelineThroughLoop(unittest.IsolatedAsyncioTestCase):
             deadline = asyncio.get_event_loop().time() + 3.0
             while asyncio.get_event_loop().time() < deadline:
                 imgs = [f for f in pushed if isinstance(f, OutputImageRawFrame)]
-                if imgs:
+                audio = [f for f in pushed if isinstance(f, OutputAudioRawFrame)]
+                if imgs and audio:
                     break
                 await asyncio.sleep(0.02)
         finally:

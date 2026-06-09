@@ -102,6 +102,13 @@ OJIN_VIDEO_SERVICE_VERSION = 30  # idle backlog drain (skip silence frames)
 _ALIGN_ANCHOR_FRAMES = 6  # how many leading new-turn frames to match on
 _ALIGN_MIN_RMS = 1.0  # below this the anchor is silence — skip aligning
 _ALIGN_REL_TOL = 0.05  # match tolerance as a fraction of the anchor RMS
+# OJIN FIX (lipsync_0609): minimum anchor frames before a non-zero trim is
+# trusted. A 1–2 frame RMS signature cannot uniquely localize a position inside
+# a multi-second buffer — a single 40 ms RMS scalar trivially matches *some*
+# window deep in the buffer within tolerance, producing a false trim. With only
+# 1 anchor a swap once trimmed 1.64 s of real new-turn audio off the head and
+# desynced the whole turn. Require a real multi-frame signature.
+_ALIGN_MIN_ANCHORS = 4
 
 
 def _rms_int16(audio: bytes) -> Optional[float]:
@@ -379,6 +386,14 @@ class OjinVideoService(FrameProcessor):
         # All knobs default-on, gated by env; 0 disables.
         self._loop_stall_watchdog_ms = float(os.environ.get("OJIN_LOOP_STALL_WATCHDOG_MS", "250"))
         self._tick_warn_ms = float(os.environ.get("OJIN_TICK_WARN_MS", "80"))
+        # Low-threshold stall PROBE: dumps all-thread stacks for *small* loop
+        # stalls (default >=35ms) the big 250ms watchdog never catches — to find
+        # the offender behind the post-LLM loop_lag spike. Steady-state lag is
+        # ~0, so this rarely fires. Crucially the dump happens WHILE the loop is
+        # still blocked (the watchdog thread polls fast and faulthandler walks
+        # frames without the GIL), so the stack shows what is actually running.
+        # 0 disables.
+        self._stall_probe_ms = float(os.environ.get("OJIN_STALL_PROBE_MS", "70"))
         self._last_tick_perf: float = 0.0
         self._loop_watchdog_thread: Optional[threading.Thread] = None
         self._loop_watchdog_stop: Optional[threading.Event] = None
@@ -925,7 +940,19 @@ class OjinVideoService(FrameProcessor):
 
         # Line the new buffer's read head up with the audio the server's first
         # new-turn frame was generated from. No-op when they already match.
-        if self._settings.align_audio_on_swap and align_to_frame is not None:
+        #
+        # OJIN FIX (lipsync_0609): only the server-signalled new-turn boundary
+        # (frame_type==3, the cancel/fade path) can drop leading speech, so it is
+        # the only path that ever needs alignment. A natural turn end (a SPEECH
+        # frame popped while the prior buffer drained cleanly) has no fade and no
+        # drop — the correct trim is always 0, so aligning there can only inject
+        # error. A natural swap once trimmed 1.64 s of real audio and desynced
+        # the turn; gate alignment to the new-turn-start path.
+        if (
+            self._settings.align_audio_on_swap
+            and align_to_frame is not None
+            and align_to_frame.is_new_turn_start()
+        ):
             self._align_current_buffer_to_frame(align_to_frame)
 
         self._audio_chunks_emitted = 0
@@ -964,6 +991,14 @@ class OjinVideoService(FrameProcessor):
             anchor_rms.append(r)
         if not anchor_rms or max(anchor_rms) < _ALIGN_MIN_RMS:
             return  # nothing to anchor on (silence / empty)
+
+        # OJIN FIX (lipsync_0609): a 1–2 frame signature can't localize within a
+        # multi-second buffer (one RMS scalar matches some window by chance →
+        # false trim → whole-turn desync). Only trust a trim when a real
+        # multi-frame signature has arrived; otherwise leave the head at d=0,
+        # which is correct whenever the server didn't drop leading speech.
+        if len(anchor_rms) < _ALIGN_MIN_ANCHORS:
+            return
 
         # Buffer is int16 at its own sample rate; one 40 ms frame == one tick.
         buf_frame_bytes = int(buf.sample_rate * self._frame_duration) * buf.num_channels * 2
@@ -1363,7 +1398,6 @@ class OjinVideoService(FrameProcessor):
                 # so the trace read like an audio stall when it was only a video
                 # stall. frame_audio_rms stays frame-gated: it is the shown
                 # frame's bundled audio, which only exists when a frame popped.
-                
 
             # Push frames downstream. Pixels are already decoded (worker thread),
             # so the loop only wraps cached RGB bytes — no cv2, no blocking. If a
@@ -1389,17 +1423,17 @@ class OjinVideoService(FrameProcessor):
                 out_image.pts = pts
                 _prepare_s += time.perf_counter() - _t_prep
                 await self.push_frame(out_image)
-                
-                if video_frame is not None and drained_chunk:
+
+                if tr is not None and video_frame is not None and drained_chunk:
                     fa = _rms_int16(video_frame.audio_bytes)
                     if fa is not None:
                         tr.counter("frame_audio_rms", round(fa, 1))
-                        
+
                 self._video_frames_emitted += 1
             await asyncio.sleep(0.01)  # yield to let the image frame land before the audio
             await self.push_frame(audio_frame or silence_audio)
             self._audio_chunks_emitted += 1
-            if drained_chunk:
+            if tr is not None and drained_chunk:
                 oa = _rms_int16(drained_chunk)
                 if oa is not None:
                     tr.counter("output_audio_rms", round(oa, 1))
@@ -1476,34 +1510,62 @@ class OjinVideoService(FrameProcessor):
         """Dump all thread stacks when a playback tick stalls (background thread).
 
         Reads the playback loop's last-tick timestamp; if it has not advanced
-        within ``threshold_s`` (and playback is not intentionally paused), dumps
+        within a threshold (and playback is not intentionally paused), dumps
         every thread's stack to stderr once per stall. faulthandler walks frames
         without holding the GIL, so this captures the main thread even while it
         is blocked inside a synchronous C call (cv2, GC, native SDK). Diagnostic
         only — never raises into the session.
+
+        Two tiers, each latched so a single stall dumps once:
+
+        * the big ``threshold_s`` watchdog (default 250ms) for hard freezes;
+        * a low ``_stall_probe_ms`` PROBE (default 35ms) for the small post-LLM
+          loop_lag spike. Because the probe must catch a ~tens-of-ms stall while
+          it is still in progress, the poll interval drops to ~5ms when the
+          probe is enabled.
         """
-        check_s = max(0.01, min(threshold_s / 2.0, 0.05))
-        dumped = False
+        probe_s = self._stall_probe_ms / 1000.0 if self._stall_probe_ms > 0 else 0.0
+        if probe_s > 0:
+            check_s = max(0.005, min(probe_s / 2.0, 0.02))
+        else:
+            check_s = max(0.01, min(threshold_s / 2.0, 0.05))
+        dumped_full = False
+        dumped_probe = False
         while not stop.wait(check_s):
             try:
                 last = self._last_tick_perf
                 if last <= 0.0 or self._playback_paused:
-                    dumped = False
+                    dumped_full = dumped_probe = False
                     continue
                 stalled_s = time.perf_counter() - last
-                if stalled_s >= threshold_s:
-                    if not dumped:
-                        dumped = True
-                        print(
-                            f"\n[ojin-loop-watchdog] playback loop stalled "
-                            f"{stalled_s * 1000:.0f}ms (threshold {threshold_s * 1000:.0f}ms) "
-                            f"— dumping all thread stacks:",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-                else:
-                    dumped = False
+                # Probe tier — small stalls (e.g. the post-LLM spike). Dumped
+                # first/once so the stack reflects the live block, before the
+                # bigger watchdog (if the stall keeps growing) fires too.
+                if probe_s > 0 and stalled_s >= probe_s and not dumped_probe:
+                    dumped_probe = True
+                    print(
+                        f"\n[ojin-stall-probe] playback loop stalled "
+                        f"{stalled_s * 1000:.0f}ms (probe threshold {self._stall_probe_ms:.0f}ms) "
+                        f"— dumping all thread stacks (the offender is the running frame):",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                if stalled_s >= threshold_s and not dumped_full:
+                    dumped_full = True
+                    print(
+                        f"\n[ojin-loop-watchdog] playback loop stalled "
+                        f"{stalled_s * 1000:.0f}ms (threshold {threshold_s * 1000:.0f}ms) "
+                        f"— dumping all thread stacks:",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                # Re-arm each tier once the loop is advancing again.
+                if stalled_s < threshold_s:
+                    dumped_full = False
+                if probe_s > 0 and stalled_s < probe_s:
+                    dumped_probe = False
             except Exception:  # pragma: no cover - diagnostic only
                 pass
 

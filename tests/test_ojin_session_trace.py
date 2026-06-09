@@ -264,14 +264,17 @@ class TestVideoFrameClassifiedByFrameType(unittest.IsolatedAsyncioTestCase):
     async def test_fade_out_distinguished_from_idle_at_index_0(self) -> None:
         service = _make_video_service()
 
+        # Received frames are enqueued to the decode pipeline (``_decode_in``)
+        # before, post-decode, reaching ``_video_frames``. The worker is not
+        # running here, so pull the just-enqueued frame straight off the queue.
         await service._handle_ojin_message(_response_msg(frame_type=2))  # FADE_OUT
-        fade = service._video_frames[-1]
+        fade = service._decode_in.get_nowait()
         self.assertEqual(fade.frame_type, 2)
         self.assertTrue(fade.is_fade_out())
         self.assertFalse(fade.is_silence())
 
         await service._handle_ojin_message(_response_msg(frame_type=0))  # IDLE
-        idle = service._video_frames[-1]
+        idle = service._decode_in.get_nowait()
         self.assertTrue(idle.is_silence())
         self.assertFalse(idle.is_fade_out())
 
@@ -279,11 +282,11 @@ class TestVideoFrameClassifiedByFrameType(unittest.IsolatedAsyncioTestCase):
         service = _make_video_service()
 
         await service._handle_ojin_message(_response_msg(frame_type=3))  # START_OF_SPEECH
-        new_turn = service._video_frames[-1]
+        new_turn = service._decode_in.get_nowait()
         self.assertTrue(new_turn.is_new_turn_start())
 
         await service._handle_ojin_message(_response_msg(frame_type=1))  # SPEECH
-        speech = service._video_frames[-1]
+        speech = service._decode_in.get_nowait()
         self.assertFalse(speech.is_new_turn_start())
         self.assertFalse(speech.is_silence())
 

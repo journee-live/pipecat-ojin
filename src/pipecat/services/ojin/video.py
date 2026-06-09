@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 import os
+import queue
 import sys
 import threading
 import time
@@ -122,6 +123,11 @@ class VideoFrame:
     audio_bytes: bytes
     is_final: bool
     volume: int
+    # Pre-decoded, cropped RGB pixels, filled by the decode worker thread BEFORE
+    # the frame reaches the playback loop so the loop never runs cv2 inline. None
+    # until decoded (or on decode failure) — the loop then repeats the last
+    # frame rather than blocking. See ``_decode_to_rgb`` / ``_decode_worker``.
+    out_rgb: Optional[bytes] = None
 
     def is_silence(self) -> bool:
         """Whether this is an idle/silence frame (frame_type 0)."""
@@ -134,6 +140,36 @@ class VideoFrame:
     def is_new_turn_start(self) -> bool:
         """First speech frame of a new turn (v3 marker)."""
         return self.frame_type == 3
+
+
+def _decode_to_rgb(video_bytes: bytes, target_w: int, target_h: int) -> Optional[bytes]:
+    """Decode a JPEG frame to cropped, target-sized RGB bytes (off-loop work).
+
+    This is the cv2 cost that used to run inline on the playback loop. It is
+    pure and side-effect free so it can run on the decode worker thread (cv2
+    releases the GIL during imdecode/resize, so it genuinely parallelises the
+    loop). Returns ``None`` for empty input or an undecodable frame; the loop
+    treats that as "no new frame" and repeats the last one.
+
+    The pixel pipeline (decode → scale-to-cover → centre-crop → BGR→RGB) is
+    unchanged from the previous in-loop implementation, so image quality is
+    identical — only the thread it runs on changed.
+    """
+    if not video_bytes:
+        return None
+    arr = np.frombuffer(video_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return None
+    h, w = bgr.shape[:2]
+    scale = max(target_w / w, target_h / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    x = (new_w - target_w) // 2
+    y = (new_h - target_h) // 2
+    bgr = bgr[y : y + target_h, x : x + target_w]
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return rgb.tobytes()
 
 
 _AUDIO_BUFFER_COUNTER = 0
@@ -277,8 +313,20 @@ class OjinVideoService(FrameProcessor):
         self._session_data: Optional[dict] = None
         self._initialized = False
 
-        # Server frames (incoming, popped by the playback loop).
+        # Server frames, pre-decoded and ready for the playback loop to pop.
+        # Touched only by the loop thread (the decode worker hands frames over
+        # via ``_decode_out``, which the loop drains at the top of each tick).
         self._video_frames: deque[VideoFrame] = deque()
+
+        # Off-loop JPEG decode pipeline. The receive path enqueues raw frames on
+        # ``_decode_in``; a dedicated worker thread decodes their pixels (cv2
+        # releases the GIL, so it runs truly parallel to the event loop) and
+        # hands the decoded frame back on ``_decode_out``. This keeps the cv2
+        # cost — the dominant per-tick work — off the audio-clocked playback
+        # loop, so audio is never delayed by frame preparation.
+        self._decode_in: "queue.Queue[Optional[VideoFrame]]" = queue.Queue()
+        self._decode_out: "queue.Queue[VideoFrame]" = queue.Queue()
+        self._decode_thread: Optional[threading.Thread] = None
 
         # Audio buffer queue.
         self._audio_buffers: deque[AudioBuffer] = deque()
@@ -298,7 +346,9 @@ class OjinVideoService(FrameProcessor):
         self._frame_duration = 1.0 / self.fps  # 40 ms
         self.fps_tracker = FPSTracker("Ojin")
         self.last_frame_time = 0.0
-        self._last_played_image_bytes: Optional[bytes] = None
+        # Last decoded RGB pixels, reused (rewrapped, never re-decoded) when a
+        # tick has no new frame so idle repeats cost nothing on the loop.
+        self._last_played_rgb: Optional[bytes] = None
 
         # Pause/resume. Paused on construction; consumer (widget) calls
         # ``resume_playback()`` once the room is ready.
@@ -327,9 +377,7 @@ class OjinVideoService(FrameProcessor):
         # tick warning) attributes a stall to a code region. The loop
         # exception handler names the connection behind socket errors.
         # All knobs default-on, gated by env; 0 disables.
-        self._loop_stall_watchdog_ms = float(
-            os.environ.get("OJIN_LOOP_STALL_WATCHDOG_MS", "250")
-        )
+        self._loop_stall_watchdog_ms = float(os.environ.get("OJIN_LOOP_STALL_WATCHDOG_MS", "250"))
         self._tick_warn_ms = float(os.environ.get("OJIN_TICK_WARN_MS", "80"))
         self._last_tick_perf: float = 0.0
         self._loop_watchdog_thread: Optional[threading.Thread] = None
@@ -682,7 +730,9 @@ class OjinVideoService(FrameProcessor):
                 volume=volume,
             )
             # logger.debug(f"Received frame_type={frame_type} (volume={volume})")
-            self._video_frames.append(video_frame)
+            # Hand the frame to the decode worker; it lands in ``_video_frames``
+            # (already decoded) when the loop drains ``_decode_out`` next tick.
+            self._decode_in.put(video_frame)
 
             if self._trace is not None:
                 self._trace.instant(
@@ -693,7 +743,7 @@ class OjinVideoService(FrameProcessor):
                         "frame_type": frame_type,
                         "volume": volume,
                         "audio_len": len(message.audio_frame_bytes),
-                        "recv_buf": len(self._video_frames),
+                        "recv_buf": len(self._video_frames) + self._decode_in.qsize(),
                     },
                 )
                 # Numeric frame_type timeline so the wire classification is
@@ -725,15 +775,9 @@ class OjinVideoService(FrameProcessor):
                         f"after first TTS audio (frame_type={frame_type})"
                     )
 
-            # Backstop: never let the receive buffer grow unbounded.
-            cap = self._settings.max_buffered_video_frames
-            if len(self._video_frames) > cap:
-                drop = len(self._video_frames) - cap
-                for _ in range(drop):
-                    self._video_frames.popleft()
-                logger.warning(f"Receive buffer overflow: dropped {drop} oldest frames")
-                if self._trace is not None:
-                    self._trace.instant("recv:idle", "recv_overflow_drop", args={"dropped": drop})
+            # Overflow backstop now lives in the playback loop, after it drains
+            # the decode pipeline into ``_video_frames`` (the receive path no
+            # longer owns that deque).
 
         elif isinstance(message, ErrorResponseMessage):
             if self._trace is not None:
@@ -1079,6 +1123,24 @@ class OjinVideoService(FrameProcessor):
             self._last_tick_perf = _now_perf
             _prepare_s = 0.0
 
+            # Drain decoded frames from the worker into the playback deque (O(1)
+            # per frame — pixels were decoded off-thread), then apply the
+            # unbounded-growth backstop here now that the receive path no longer
+            # owns ``_video_frames``.
+            while True:
+                try:
+                    self._video_frames.append(self._decode_out.get_nowait())
+                except queue.Empty:
+                    break
+            cap = self._settings.max_buffered_video_frames
+            if len(self._video_frames) > cap:
+                drop = len(self._video_frames) - cap
+                for _ in range(drop):
+                    self._video_frames.popleft()
+                logger.warning(f"Receive buffer overflow: dropped {drop} oldest frames")
+                if self._trace is not None:
+                    self._trace.instant("recv:idle", "recv_overflow_drop", args={"dropped": drop})
+
             # Initial buffer warm-up.
             if self._video_frames and initial_buffer > 0:
                 initial_buffer -= 1
@@ -1257,7 +1319,7 @@ class OjinVideoService(FrameProcessor):
                             f"📹 First speech video frame played {latency_ms}ms "
                             f"after first TTS audio (frame_type={video_frame.frame_type})"
                         )
-                elif self._last_played_image_bytes is not None:
+                elif self._last_played_rgb is not None:
                     tr.instant("play:repeat", "video_repeat")
 
                 interrupted = (
@@ -1301,37 +1363,46 @@ class OjinVideoService(FrameProcessor):
                 # so the trace read like an audio stall when it was only a video
                 # stall. frame_audio_rms stays frame-gated: it is the shown
                 # frame's bundled audio, which only exists when a frame popped.
-                if drained_chunk:
-                    oa = _rms_int16(drained_chunk)
-                    if oa is not None:
-                        tr.counter("output_audio_rms", round(oa, 1))
+                
+
+            # Push frames downstream. Pixels are already decoded (worker thread),
+            # so the loop only wraps cached RGB bytes — no cv2, no blocking. If a
+            # frame's decode lagged (out_rgb is None) we fall back to repeating
+            # the last frame so video degrades gracefully while audio (below)
+            # always emits on the clock. ``_prepare_s`` stays as the per-tick
+            # wrap cost for the trace; it should now be ~0.
+            target_size = self._settings.image_size
+            rgb: Optional[bytes] = None
+            if video_frame is not None:
+                if video_frame.out_rgb is not None:
+                    rgb = video_frame.out_rgb
+                    self._last_played_rgb = rgb
+                else:
+                    # Decode failed for this frame — repeat the last good one.
+                    rgb = self._last_played_rgb
+            elif self._last_played_rgb is not None:
+                rgb = self._last_played_rgb
+
+            if rgb is not None:
+                _t_prep = time.perf_counter()
+                out_image = OutputImageRawFrame(image=rgb, size=target_size, format="RGB")
+                out_image.pts = pts
+                _prepare_s += time.perf_counter() - _t_prep
+                await self.push_frame(out_image)
+                
                 if video_frame is not None and drained_chunk:
                     fa = _rms_int16(video_frame.audio_bytes)
                     if fa is not None:
                         tr.counter("frame_audio_rms", round(fa, 1))
-
-            # Push frames downstream.
-            if video_frame is not None:
-                self._last_played_image_bytes = video_frame.image_bytes
-                _t_prep = time.perf_counter()
-                out_image = await self._prepare_video_frame(video_frame.image_bytes, pts)
-                _prepare_s += time.perf_counter() - _t_prep
-                if out_image is not None:
-                    await self.push_frame(out_image)
-                    self._video_frames_emitted += 1
-
-            elif self._last_played_image_bytes is not None:
-                # No new frame — repeat the last one to keep the video flowing.
-                _t_prep = time.perf_counter()
-                out_image = await self._prepare_video_frame(self._last_played_image_bytes, pts)
-                _prepare_s += time.perf_counter() - _t_prep
-                if out_image is not None:
-                    await self.push_frame(out_image)
-                    self._video_frames_emitted += 1
-
+                        
+                self._video_frames_emitted += 1
+            await asyncio.sleep(0.01)  # yield to let the image frame land before the audio
             await self.push_frame(audio_frame or silence_audio)
             self._audio_chunks_emitted += 1
-
+            if drained_chunk:
+                oa = _rms_int16(drained_chunk)
+                if oa is not None:
+                    tr.counter("output_audio_rms", round(oa, 1))
             # Edge detection for the started/stopped-speaking signals.
             await self._maybe_emit_started_speaking()
             await self._maybe_emit_stopped_speaking()
@@ -1533,6 +1604,7 @@ class OjinVideoService(FrameProcessor):
             self._tr_session_start = self._trace.mark()
             self._tr_connect_start = self._tr_session_start
         self._start_loop_diagnostics()
+        self._start_decode_worker()
         if not await self.connect_with_retry():
             return
         assert self._client is not None
@@ -1560,6 +1632,7 @@ class OjinVideoService(FrameProcessor):
     async def _stop(self) -> None:
         self._initialized = False
         self._stop_loop_diagnostics()
+        self._stop_decode_worker()
         self._write_session_trace()
         if self._client is not None:
             try:
@@ -1575,28 +1648,47 @@ class OjinVideoService(FrameProcessor):
                     pass
 
     # ------------------------------------------------------------------
-    # Frame preparation (JPEG decode + crop to target aspect)
+    # Off-loop frame preparation (JPEG decode + crop on a worker thread)
     # ------------------------------------------------------------------
 
-    async def _prepare_video_frame(
-        self, video_bytes: bytes, pts: Optional[int] = None
-    ) -> Optional[OutputImageRawFrame]:
-        if not video_bytes:
-            return None
-        arr = np.frombuffer(video_bytes, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return None
+    def _start_decode_worker(self) -> None:
+        """Start the background JPEG→RGB decode thread (idempotent)."""
+        if self._decode_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._decode_worker,
+            name="ojin-frame-decode",
+            daemon=True,
+        )
+        self._decode_thread = thread
+        thread.start()
+
+    def _stop_decode_worker(self) -> None:
+        """Signal the decode thread to drain and exit, then join it."""
+        thread = self._decode_thread
+        if thread is None:
+            return
+        self._decode_thread = None
+        self._decode_in.put(None)  # sentinel
+        thread.join(timeout=1.0)
+
+    def _decode_worker(self) -> None:
+        """Decode queued JPEG frames to RGB off the event loop, in order.
+
+        Pulls one frame at a time from ``_decode_in`` (FIFO, single consumer →
+        order preserved), decodes its pixels, and hands the frame back on
+        ``_decode_out`` for the loop to pop. A decode failure leaves
+        ``out_rgb=None`` so the loop repeats the last frame instead of blocking.
+        Exits on the ``None`` sentinel from :meth:`_stop_decode_worker`.
+        """
         target_w, target_h = self._settings.image_size
-        h, w = bgr.shape[:2]
-        scale = max(target_w / w, target_h / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        x = (new_w - target_w) // 2
-        y = (new_h - target_h) // 2
-        bgr = bgr[y : y + target_h, x : x + target_w]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        out = OutputImageRawFrame(image=rgb.tobytes(), size=(target_w, target_h), format="RGB")
-        if pts is not None:
-            out.pts = pts
-        return out
+        while True:
+            frame = self._decode_in.get()
+            if frame is None:  # shutdown sentinel
+                break
+            try:
+                frame.out_rgb = _decode_to_rgb(frame.image_bytes, target_w, target_h)
+            except Exception as exc:  # never let a bad frame kill the worker
+                frame.out_rgb = None
+                logger.warning(f"frame decode failed: {exc}")
+            self._decode_out.put(frame)

@@ -121,6 +121,32 @@ def _rms_int16(audio: bytes) -> Optional[float]:
     return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
 
 
+def _fade_chunk(chunk: bytes, samples_emitted: int, fade_total_samples: int) -> bytes:
+    """Linearly ramp int16 PCM volume toward silence across a fade window.
+
+    Scales ``chunk`` by a per-sample gain that decreases linearly from
+    ``1 - samples_emitted / fade_total_samples`` at the first sample, reaching 0
+    once ``fade_total_samples`` samples have been emitted. The gain is computed
+    in flat int16-sample space (channels interleaved), so it is channel-agnostic
+    and click-free across chunk boundaries as long as the caller threads
+    ``samples_emitted`` forward. Pure: no I/O, no shared state.
+
+    Args:
+        chunk: int16 little-endian PCM bytes for this tick.
+        samples_emitted: flat int16 samples already emitted since the fade began.
+        fade_total_samples: total flat int16 samples over which to ramp to
+            silence (``fade_s * sample_rate * num_channels``); must be > 0.
+
+    Returns:
+        Scaled int16 little-endian PCM bytes (same sample count as ``chunk``).
+    """
+    n = len(chunk) // 2
+    samples = np.frombuffer(chunk[: n * 2], dtype="<i2").astype(np.float32)
+    idx = np.arange(samples_emitted, samples_emitted + n, dtype=np.float32)
+    gain = np.clip(1.0 - idx / float(fade_total_samples), 0.0, 1.0)
+    return (samples * gain).astype("<i2").tobytes()
+
+
 @dataclass
 class VideoFrame:
     """One video frame from the inference server, with bundled audio."""
@@ -195,8 +221,10 @@ class AudioBuffer:
     Opened by ``TTSStartedFrame``, extended by subsequent ``TTSAudioRawFrame``s
     for the same turn. The ``interrupted`` flag is set when the user barges
     in: the buffer keeps being drained (so its in-flight video frames can
-    pop in time with the audio clock) but the audio chunks are silenced
-    on output, producing the visible fadeout effect.
+    pop in time with the audio clock) and the audio chunks are ramped to
+    silence on output over ``interrupt_audio_fade_s`` — ``fade_samples_emitted``
+    tracks how far into that ramp we are (in flat int16 samples), so the gain is
+    continuous across ticks and resets naturally when a fresh buffer swaps in.
     """
 
     sample_rate: int = OJIN_PERSONA_SAMPLE_RATE
@@ -205,6 +233,9 @@ class AudioBuffer:
     started_at: float = field(default_factory=time.monotonic)
     buffer_id: int = field(default_factory=_next_audio_buffer_id)
     interrupted: bool = False
+    # Flat int16 samples emitted since this buffer was interrupted; drives the
+    # barge-in fade ramp. Only advances while ``interrupted`` is True.
+    fade_samples_emitted: int = 0
 
 
 @dataclass
@@ -274,6 +305,14 @@ class OjinVideoSettings:
     # Max leading frames to search/trim when aligning at swap (bounds cost and
     # blast radius). 50 frames = 2 s, well above any realistic drop window.
     align_audio_max_frames: int = 50
+    # On barge-in the current turn's audio is faded to silence over this many
+    # seconds (per-sample linear ramp) instead of hard-cut. Keyed to samples
+    # emitted since the interrupt, so it stays smooth across tick jitter/stalls.
+    # The fade is cancelled at the swap: a frame_type=3 new-turn boundary swaps
+    # in a fresh, non-interrupted buffer that plays at full volume. 0 disables
+    # the ramp (restores the previous hard cut). Video keeps its own server-side
+    # frame_type=2 fade — this only governs audio output.
+    interrupt_audio_fade_s: float = 0.75
 
 
 class OjinVideoService(FrameProcessor):
@@ -1277,13 +1316,33 @@ class OjinVideoService(FrameProcessor):
 
                 drained_chunk = chunk
 
-                if chunk is not None and not self._current_buffer.interrupted:
-                    audio_frame = OutputAudioRawFrame(
-                        audio=chunk,
-                        sample_rate=self._current_buffer.sample_rate,
-                        num_channels=self._current_buffer.num_channels,
-                    )
-                    audio_frame.pts = pts
+                if chunk is not None:
+                    cur = self._current_buffer
+                    if not cur.interrupted:
+                        out_audio: Optional[bytes] = chunk
+                    else:
+                        # Barge-in fade: ramp this turn's audio to silence over
+                        # interrupt_audio_fade_s instead of hard-cutting. The gain
+                        # is keyed to samples emitted since the interrupt (smooth
+                        # across tick jitter/GC stalls). Cancel-at-the-swap is
+                        # implicit: a frame_type=3 boundary swaps in a fresh,
+                        # non-interrupted buffer that lands here at full volume.
+                        fade_total = int(
+                            self._settings.interrupt_audio_fade_s * sample_rate * num_channels
+                        )
+                        if fade_total <= 0 or cur.fade_samples_emitted >= fade_total:
+                            out_audio = None  # ramp disabled or complete → silence
+                        else:
+                            out_audio = _fade_chunk(chunk, cur.fade_samples_emitted, fade_total)
+                            cur.fade_samples_emitted += len(chunk) // 2
+
+                    if out_audio is not None:
+                        audio_frame = OutputAudioRawFrame(
+                            audio=out_audio,
+                            sample_rate=cur.sample_rate,
+                            num_channels=cur.num_channels,
+                        )
+                        audio_frame.pts = pts
 
             # Lip-sync verification trace (opt-in). Record the pairing of the
             # displayed frame with the audio drained this tick, so a post-swap
@@ -1430,7 +1489,7 @@ class OjinVideoService(FrameProcessor):
                         tr.counter("frame_audio_rms", round(fa, 1))
 
                 self._video_frames_emitted += 1
-            await asyncio.sleep(0.01)  # yield to let the image frame land before the audio
+
             await self.push_frame(audio_frame or silence_audio)
             self._audio_chunks_emitted += 1
             if tr is not None and drained_chunk:

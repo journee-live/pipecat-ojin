@@ -1,19 +1,19 @@
-"""Tests for the per-turn video response-latency metric in OjinSessionTrace.
+"""Tests for the per-turn latency surfaces in OjinSessionTrace.
 
-The OjinVideoService anchors each turn at its first TTS audio frame and closes
-two measurements against it — ``recv`` (first speech video frame arriving from
-the server) and ``played`` (that frame reaching the transport downstream). This
-module exercises the recording/summary surface those call sites rely on, using a
-controllable clock so the durations are deterministic.
+Each turn is anchored at its first TTS audio frame, and two measurements close
+against that anchor — ``recv`` (first speech video frame arriving from the
+server) and ``played`` (that frame reaching the transport downstream). With the
+v3 refactor the *caller* of these anchors moved into ``ojin.stv.OjinSTVClient``
+(the avatar client), but the recording/summary surface they rely on still lives
+on ``OjinSessionTrace`` and is exercised here with a controllable clock so the
+durations are deterministic. The bot's ``LatencyTracker`` likewise folds each
+completed turn's end-to-end breakdown into the shared trace via
+``record_latency_report``.
 """
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock
-
-from ojin.ojin_client_messages import OjinInteractionResponseMessage
 
 from pipecat.services.ojin.session_trace import LANES, OjinSessionTrace
-from pipecat.services.ojin.video import OjinVideoService, OjinVideoSettings
 
 
 class _FakeClock:
@@ -188,107 +188,6 @@ class TestLatencyReportRecording(unittest.TestCase):
         summary = trace.build()["otherData"]["latency_ms"]
         self.assertEqual(summary["e2e_ms"]["count"], 1)
         self.assertAlmostEqual(summary["e2e_ms"]["max_ms"], 100.0, places=1)
-
-
-def _make_video_service() -> OjinVideoService:
-    client = MagicMock()
-    client.send_message = AsyncMock()
-    service = OjinVideoService(settings=OjinVideoSettings(), client=client)
-    service._initialized = True
-    return service
-
-
-def _response_msg(frame_type: int) -> OjinInteractionResponseMessage:
-    """A server response frame whose ``frame_type`` is the classification
-    marker (0 idle/silence, 1 speech, 2 fade, 3 new-turn). The wire ``index``
-    is the collapsed legacy tag (0 for idle/fade, 1 for speech)."""
-    return OjinInteractionResponseMessage(
-        interaction_id="t",
-        video_frame_bytes=b"\x00" * 16,
-        audio_frame_bytes=b"\x00" * 16,
-        index=0 if frame_type in (0, 2) else 1,
-        frame_type=frame_type,
-    )
-
-
-class TestVideoServiceRecvLatencyWiring(unittest.IsolatedAsyncioTestCase):
-    """The recv-side measurement is driven from ``_handle_ojin_message`` when
-    the first speech video frame of a turn arrives from the server.
-    """
-
-    def _armed_service(self, clock: _FakeClock) -> OjinVideoService:
-        service = _make_video_service()
-        service._trace = OjinSessionTrace(session_id="s", clock=clock)
-        clock.t = 1.0
-        service._tr_first_tts_audio_at = service._trace.mark()
-        service._awaiting_first_recv_video = True
-        return service
-
-    async def test_recv_fires_once_on_first_speech_frame(self) -> None:
-        clock = _FakeClock()
-        service = self._armed_service(clock)
-
-        clock.t = 1.15  # first new-turn speech frame arrives 150 ms later
-        await service._handle_ojin_message(_response_msg(frame_type=3))
-
-        self.assertFalse(service._awaiting_first_recv_video)
-        recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
-        self.assertEqual(recv["count"], 1)
-        self.assertAlmostEqual(recv["last_ms"], 150.0, places=1)
-
-        # A second speech frame in the same turn must not re-record.
-        clock.t = 1.30
-        await service._handle_ojin_message(_response_msg(frame_type=1))
-        recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
-        self.assertEqual(recv["count"], 1)
-
-    async def test_idle_frame_does_not_record_and_stays_armed(self) -> None:
-        clock = _FakeClock()
-        service = self._armed_service(clock)
-
-        clock.t = 1.15
-        await service._handle_ojin_message(_response_msg(frame_type=0))  # idle/silence
-
-        self.assertTrue(service._awaiting_first_recv_video)
-        recv = service._trace.build()["otherData"]["response_latency_ms"]["recv"]
-        self.assertEqual(recv["count"], 0)
-
-
-class TestVideoFrameClassifiedByFrameType(unittest.IsolatedAsyncioTestCase):
-    """video.py must classify frames by the wire ``frame_type`` field, NOT by
-    ``index`` — which now only carries the collapsed 0/1 tag. IDLE and FADE_OUT
-    both arrive with index==0; SPEECH and START_OF_SPEECH both with index==1, so
-    only ``frame_type`` can distinguish them.
-    """
-
-    async def test_fade_out_distinguished_from_idle_at_index_0(self) -> None:
-        service = _make_video_service()
-
-        # Received frames are enqueued to the decode pipeline (``_decode_in``)
-        # before, post-decode, reaching ``_video_frames``. The worker is not
-        # running here, so pull the just-enqueued frame straight off the queue.
-        await service._handle_ojin_message(_response_msg(frame_type=2))  # FADE_OUT
-        fade = service._decode_in.get_nowait()
-        self.assertEqual(fade.frame_type, 2)
-        self.assertTrue(fade.is_fade_out())
-        self.assertFalse(fade.is_silence())
-
-        await service._handle_ojin_message(_response_msg(frame_type=0))  # IDLE
-        idle = service._decode_in.get_nowait()
-        self.assertTrue(idle.is_silence())
-        self.assertFalse(idle.is_fade_out())
-
-    async def test_new_turn_distinguished_from_speech_at_index_1(self) -> None:
-        service = _make_video_service()
-
-        await service._handle_ojin_message(_response_msg(frame_type=3))  # START_OF_SPEECH
-        new_turn = service._decode_in.get_nowait()
-        self.assertTrue(new_turn.is_new_turn_start())
-
-        await service._handle_ojin_message(_response_msg(frame_type=1))  # SPEECH
-        speech = service._decode_in.get_nowait()
-        self.assertFalse(speech.is_new_turn_start())
-        self.assertFalse(speech.is_silence())
 
 
 if __name__ == "__main__":

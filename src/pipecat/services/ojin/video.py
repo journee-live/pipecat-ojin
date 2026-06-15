@@ -1,59 +1,41 @@
-"""OjinVideoService v3 — server-signalled turn boundary.
+"""OjinVideoService — thin pipecat adapter over the framework-agnostic OjinSTVClient.
 
-Spec: ``demo-modal-agents/docs/ojin_video_service_v3_redesign.md``.
+All avatar behavior (connect/retry, TTS-audio buffering + playback, the
+audio-as-clock 40 ms playback loop, post-interruption re-sync, idle-backlog
+drain, off-loop JPEG decode, and session tracing) lives in
+``ojin.stv.OjinSTVClient`` and is unit-tested in ``services/tests/stv``. This
+module is a small ``FrameProcessor`` that:
 
-Key differences from v2:
+1. Translates inbound pipecat frames into ``OjinSTVClient`` calls.
+2. Implements the client's ``STVOutput`` sink, pushing pipecat
+   ``OutputAudioRawFrame`` / ``OutputImageRawFrame`` downstream — behind the
+   playback-start gate (:meth:`OjinVideoService.set_can_start_playback`).
+3. Maps client events to the pipecat frames the bot expects, plus TTFB metrics.
 
-* No bot-side first-speech-frame inference. The server emits
-  ``frame_type == 3`` for the first SPEECH frame of a new turn (either
-  cancel-armed or silence-streak-armed). The bot swaps its audio buffer
-  on that signal alone.
-* No 4-state machine. The bot's effective state is derived from
-  ``_current_buffer`` (existence + interrupted flag): if a buffer
-  exists and is not interrupted, we're speaking; otherwise we're idle.
-* No receive-side trim of the video deque. Mid-speech ``frame_type == 0``
-  frames (audio-feeder starvation glitches at the server) flow through
-  the current buffer's video as-is.
-* No IDLE silence-buffer trim. The audio buffer queue + ``frame_type == 3``
-  swap already bounds head silence.
+**The gate (default closed) is the adapter's job, not the client's.** The client
+never pauses — it always produces synced frames into the sink. While the gate is
+closed (the connect→participant-join window) the adapter *drops* whatever the
+client emits, so no idle-frame backlog enters the transport ``output_buffer``.
+At join the gate opens and the live edge is forwarded with no playback warm-up to
+re-arm — strictly lower join latency than the old pause/resume approach.
 
-Audio remains the playback clock — audio drains every tick when the
-current buffer has bytes available. Within-turn lipsync drift on video
-underrun is an accepted trade-off (audio crackle would be worse).
-
-Fadeout audio-cut: when a user barges in, the current buffer is marked
-``interrupted = True``. The buffer keeps draining (bytes consumed) but
-audio is silenced. Visual playback continues from the server's fade
-frames until the next ``frame_type == 3`` triggers the swap.
+See ``services/docs/ojin_video_service_refactor.md``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import faulthandler
 import os
-import queue
-import sys
-import threading
-import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple, Type
 
-import cv2
-import numpy as np
-from loguru import logger
-from ojin.entities.interaction_messages import ErrorResponseMessage
-from ojin.ojin_client import OjinClient
-from ojin.ojin_client_messages import (
-    IOjinClient,
-    OjinAudioInputMessage,
-    OjinCancelInteractionMessage,
-    OjinInteractionResponseMessage,
-    OjinSessionReadyMessage,
+from ojin.ojin_client_messages import IOjinClient
+from ojin.stv import (
+    OjinSTVClient,
+    STVAudioFrame,
+    STVConfig,
+    STVEvent,
+    STVVideoFrame,
 )
-from ojin.profiling_utils import FPSTracker
-from pydantic import BaseModel
 
 from pipecat.audio.utils import create_default_resampler
 from pipecat.frames.frames import (
@@ -68,11 +50,7 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.ojin.session_trace import (
-    OjinSessionTrace,
-    play_lane_for_frame_type,
-    recv_lane_for_frame_type,
-)
+from pipecat.services.ojin.session_trace import OjinSessionTrace
 
 
 @dataclass
@@ -83,188 +61,28 @@ class OjinVideoInitializedFrame(Frame):
 
 
 class OjinBotStartedSpeakingFrame(Frame):
-    """Emitted when a new audio buffer is promoted to current (speaking)."""
+    """Emitted when the avatar starts speaking (a buffer is promoted to current)."""
 
     pass
 
 
 class OjinBotStoppedSpeakingFrame(Frame):
-    """Emitted when the current buffer drains/finishes and no next buffer."""
+    """Emitted when the avatar stops speaking (current buffer drains, none queued)."""
 
     pass
 
 
-OJIN_PERSONA_SAMPLE_RATE = 16_000
-BYTES_PER_FRAME = int(OJIN_PERSONA_SAMPLE_RATE / 25 * 2)  # 40 ms @ 16 kHz int16
-OJIN_VIDEO_SERVICE_VERSION = 30  # idle backlog drain (skip silence frames)
-
-# Swap-time audio alignment (see _align_current_buffer_to_frame).
-_ALIGN_ANCHOR_FRAMES = 6  # how many leading new-turn frames to match on
-_ALIGN_MIN_RMS = 1.0  # below this the anchor is silence — skip aligning
-_ALIGN_REL_TOL = 0.05  # match tolerance as a fraction of the anchor RMS
-# OJIN FIX (lipsync_0609): minimum anchor frames before a non-zero trim is
-# trusted. A 1–2 frame RMS signature cannot uniquely localize a position inside
-# a multi-second buffer — a single 40 ms RMS scalar trivially matches *some*
-# window deep in the buffer within tolerance, producing a false trim. With only
-# 1 anchor a swap once trimmed 1.64 s of real new-turn audio off the head and
-# desynced the whole turn. Require a real multi-frame signature.
-_ALIGN_MIN_ANCHORS = 4
-
-
-def _rms_int16(audio: bytes) -> Optional[float]:
-    """RMS amplitude of int16 PCM bytes, or None if empty/odd-length."""
-    if not audio or len(audio) < 2:
-        return None
-    samples = np.frombuffer(audio[: len(audio) - (len(audio) % 2)], dtype="<i2")
-    if samples.size == 0:
-        return None
-    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-
-
-def _fade_chunk(chunk: bytes, samples_emitted: int, fade_total_samples: int) -> bytes:
-    """Linearly ramp int16 PCM volume toward silence across a fade window.
-
-    Scales ``chunk`` by a per-sample gain that decreases linearly from
-    ``1 - samples_emitted / fade_total_samples`` at the first sample, reaching 0
-    once ``fade_total_samples`` samples have been emitted. The gain is computed
-    in flat int16-sample space (channels interleaved), so it is channel-agnostic
-    and click-free across chunk boundaries as long as the caller threads
-    ``samples_emitted`` forward. Pure: no I/O, no shared state.
-
-    Args:
-        chunk: int16 little-endian PCM bytes for this tick.
-        samples_emitted: flat int16 samples already emitted since the fade began.
-        fade_total_samples: total flat int16 samples over which to ramp to
-            silence (``fade_s * sample_rate * num_channels``); must be > 0.
-
-    Returns:
-        Scaled int16 little-endian PCM bytes (same sample count as ``chunk``).
-    """
-    n = len(chunk) // 2
-    samples = np.frombuffer(chunk[: n * 2], dtype="<i2").astype(np.float32)
-    idx = np.arange(samples_emitted, samples_emitted + n, dtype=np.float32)
-    gain = np.clip(1.0 - idx / float(fade_total_samples), 0.0, 1.0)
-    return (samples * gain).astype("<i2").tobytes()
-
-
-@dataclass
-class VideoFrame:
-    """One video frame from the inference server, with bundled audio."""
-
-    frame_type: int
-    image_bytes: bytes
-    audio_bytes: bytes
-    is_final: bool
-    volume: int
-    # Pre-decoded, cropped RGB pixels, filled by the decode worker thread BEFORE
-    # the frame reaches the playback loop so the loop never runs cv2 inline. None
-    # until decoded (or on decode failure) — the loop then repeats the last
-    # frame rather than blocking. See ``_decode_to_rgb`` / ``_decode_worker``.
-    out_rgb: Optional[bytes] = None
-
-    def is_silence(self) -> bool:
-        """Whether this is an idle/silence frame (frame_type 0)."""
-        return self.frame_type == 0
-
-    def is_fade_out(self) -> bool:
-        """Whether this is a fade-out frame (frame_type 2)."""
-        return self.frame_type == 2
-
-    def is_new_turn_start(self) -> bool:
-        """First speech frame of a new turn (v3 marker)."""
-        return self.frame_type == 3
-
-
-def _decode_to_rgb(video_bytes: bytes, target_w: int, target_h: int) -> Optional[bytes]:
-    """Decode a JPEG frame to cropped, target-sized RGB bytes (off-loop work).
-
-    This is the cv2 cost that used to run inline on the playback loop. It is
-    pure and side-effect free so it can run on the decode worker thread (cv2
-    releases the GIL during imdecode/resize, so it genuinely parallelises the
-    loop). Returns ``None`` for empty input or an undecodable frame; the loop
-    treats that as "no new frame" and repeats the last one.
-
-    The pixel pipeline (decode → scale-to-cover → centre-crop → BGR→RGB) is
-    unchanged from the previous in-loop implementation, so image quality is
-    identical — only the thread it runs on changed.
-    """
-    if not video_bytes:
-        return None
-    arr = np.frombuffer(video_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return None
-    h, w = bgr.shape[:2]
-    scale = max(target_w / w, target_h / h)
-    new_w, new_h = int(w * scale), int(h * scale)
-    bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    x = (new_w - target_w) // 2
-    y = (new_h - target_h) // 2
-    bgr = bgr[y : y + target_h, x : x + target_w]
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb.tobytes()
-
-
-_AUDIO_BUFFER_COUNTER = 0
-
-
-def _next_audio_buffer_id() -> int:
-    global _AUDIO_BUFFER_COUNTER
-    _AUDIO_BUFFER_COUNTER += 1
-    return _AUDIO_BUFFER_COUNTER
-
-
-@dataclass
-class AudioBuffer:
-    """Holds the resampled TTS audio for one logical utterance.
-
-    Opened by ``TTSStartedFrame``, extended by subsequent ``TTSAudioRawFrame``s
-    for the same turn. The ``interrupted`` flag is set when the user barges
-    in: the buffer keeps being drained (so its in-flight video frames can
-    pop in time with the audio clock) and the audio chunks are ramped to
-    silence on output over ``interrupt_audio_fade_s`` — ``fade_samples_emitted``
-    tracks how far into that ramp we are (in flat int16 samples), so the gain is
-    continuous across ticks and resets naturally when a fresh buffer swaps in.
-    """
-
-    sample_rate: int = OJIN_PERSONA_SAMPLE_RATE
-    num_channels: int = 1
-    bytes_: bytearray = field(default_factory=bytearray)
-    started_at: float = field(default_factory=time.monotonic)
-    buffer_id: int = field(default_factory=_next_audio_buffer_id)
-    interrupted: bool = False
-    # Flat int16 samples emitted since this buffer was interrupted; drives the
-    # barge-in fade ramp. Only advances while ``interrupted`` is True.
-    fade_samples_emitted: int = 0
-
-
-@dataclass
-class LipsyncTraceEntry:
-    """Correlates a displayed video frame with the audio played that tick.
-
-    Captured only when ``OjinVideoSettings.lipsync_trace_enabled`` is set, so
-    it costs nothing in production. The point of the record is to make the
-    post-swap lip-sync invariant *measurable*: ``frame_audio_bytes`` is the
-    audio slice the server generated this video frame from (it travels bundled
-    in the ``OjinInteractionResponseMessage``), and ``output_audio_bytes`` is
-    the audio chunk drained from ``_current_buffer`` and pushed downstream the
-    same tick. If the two correspond to the same underlying speech, lip-sync is
-    correct; a persistent divergence after a swap is a desync whose size is the
-    lag between them.
-    """
-
-    tick: int
-    frame_type: int  # wire marker: 0 silence / 1 speech / 2 fade / 3 new-turn
-    swapped: bool  # a buffer-swap trigger fired this tick
-    current_buffer_id: Optional[int]
-    interrupted: bool  # current buffer was interrupted (audio silenced)
-    frame_audio_bytes: bytes  # popped frame's bundled audio (server input slice)
-    output_audio_bytes: Optional[bytes]  # audio drained from the current buffer (None on underrun)
-
-
 @dataclass
 class OjinVideoSettings:
-    """Settings for OjinVideoService v3."""
+    """Settings for :class:`OjinVideoService`.
+
+    Connection identity plus behavioral knobs. The behavioral fields are mapped
+    onto :class:`ojin.stv.STVConfig` by :func:`_config_from`; the remaining
+    fields are pipecat-adapter concerns. ``started_speaking_delay_s`` /
+    ``stopped_speaking_delay_s`` / ``frame_debugging_enabled`` are retained for
+    call-site compatibility but are not wired to any behavior (they were unused
+    in the previous implementation too).
+    """
 
     api_key: str = ""
     ws_url: str = "wss://models.ojin.ai/realtime"
@@ -277,1539 +95,206 @@ class OjinVideoSettings:
     stopped_speaking_delay_s: float = 0.5
     frame_debugging_enabled: bool = False
     start_frame_cls: Type[Frame] = StartFrame
-    # Maximum buffered server video frames before we start dropping oldest.
     max_buffered_video_frames: int = 700
-    # Idle backlog drain. The playback loop pops exactly one frame per 40 ms
-    # tick — the same rate the server produces them — so any video backlog that
-    # accrued while playback was paused (frames buffering during client connect)
-    # is otherwise carried for the whole session, adding its depth as constant
-    # latency to every reply. When the pending video buffer exceeds this many
-    # frames AND the upcoming frames are silence, the loop drops the next
-    # silence frame(s) this tick (skip 1-of-2, or 2 while a reply's speech is
-    # already waiting behind the silence) so the buffer shrinks back toward this
-    # target. Only silence frames are ever dropped — speech/fade are never
-    # trimmed and audio sync is untouched. Mirrors the pre-v3
-    # MAX_FRAMES_BUFFER drain. 6 frames == 240 ms lead. 0 disables draining.
     idle_buffer_target_frames: int = 6
-    # When set, the playback loop records a LipsyncTraceEntry per tick (into
-    # ``_lipsync_trace``) pairing each displayed frame's bundled audio with the
-    # audio chunk played that tick. Off in production; on for verification.
     lipsync_trace_enabled: bool = False
-    # On a buffer swap, align the new buffer's read head to the audio the
-    # server's first new-turn frame was generated from. The server can drop
-    # leading new-turn speech (e.g. the post-fade SPEECH-drop window), which
-    # would otherwise leave the new turn's audio lagging the video by the
-    # dropped amount for the whole turn. On by default — it's a no-op when the
-    # head already matches (the steady-state case).
     align_audio_on_swap: bool = True
-    # Max leading frames to search/trim when aligning at swap (bounds cost and
-    # blast radius). 50 frames = 2 s, well above any realistic drop window.
     align_audio_max_frames: int = 50
-    # On barge-in the current turn's audio is faded to silence over this many
-    # seconds (per-sample linear ramp) instead of hard-cut. Keyed to samples
-    # emitted since the interrupt, so it stays smooth across tick jitter/stalls.
-    # The fade is cancelled at the swap: a frame_type=3 new-turn boundary swaps
-    # in a fresh, non-interrupted buffer that plays at full volume. 0 disables
-    # the ramp (restores the previous hard cut). Video keeps its own server-side
-    # frame_type=2 fade — this only governs audio output.
     interrupt_audio_fade_s: float = 0.75
 
 
+def _config_from(settings: OjinVideoSettings) -> STVConfig:
+    """Map the behavioral fields of ``OjinVideoSettings`` onto an ``STVConfig``.
+
+    The loop-stall watchdog thresholds additionally honour the operator env-var
+    escape hatches the old ``video.py`` exposed (``OJIN_LOOP_STALL_WATCHDOG_MS`` /
+    ``OJIN_TICK_WARN_MS`` / ``OJIN_STALL_PROBE_MS``); when unset they fall back to
+    ``STVConfig``'s defaults.
+    """
+    config = STVConfig(
+        client_connect_max_retries=settings.client_connect_max_retries,
+        client_reconnect_delay=settings.client_reconnect_delay,
+        image_size=settings.image_size,
+        max_buffered_video_frames=settings.max_buffered_video_frames,
+        idle_buffer_target_frames=settings.idle_buffer_target_frames,
+        align_audio_on_swap=settings.align_audio_on_swap,
+        align_audio_max_frames=settings.align_audio_max_frames,
+        interrupt_audio_fade_s=settings.interrupt_audio_fade_s,
+        lipsync_trace_enabled=settings.lipsync_trace_enabled,
+    )
+    for env_name, attr in (
+        ("OJIN_LOOP_STALL_WATCHDOG_MS", "loop_stall_watchdog_ms"),
+        ("OJIN_TICK_WARN_MS", "tick_warn_ms"),
+        ("OJIN_STALL_PROBE_MS", "stall_probe_ms"),
+    ):
+        raw = os.environ.get(env_name)
+        if raw is not None:
+            setattr(config, attr, float(raw))
+    return config
+
+
+def _is_trailing_silence(pcm: bytes, sample_rate: int, num_channels: int) -> bool:
+    """True for the ~0.5 s all-zero sentinel the client discards in ``send_tts_audio``.
+
+    Mirrors ``OjinSTVClient.send_tts_audio``'s discard so the adapter neither arms
+    TTFB nor forwards a frame that will never be buffered/played — matching the old
+    ``video.py``, which dropped this frame before the metrics + passthrough.
+    """
+    if not pcm:
+        return False
+    duration = len(pcm) / (sample_rate * num_channels * 2)
+    return abs(duration - 0.5) < 0.01 and pcm == b"\x00" * len(pcm)
+
+
+class _PushFrameOutput:
+    """``STVOutput`` sink: forwards the client's frames downstream, behind the gate.
+
+    While the gate is closed everything is dropped (no ``push_frame``), so the
+    connect→join idle backlog never reaches the transport ``output_buffer``. Once
+    open, the live edge is forwarded.
+    """
+
+    def __init__(self, service: "OjinVideoService") -> None:
+        """Bind the sink to its owning :class:`OjinVideoService`."""
+        self._svc = service
+
+    async def write_audio(self, frame: STVAudioFrame) -> None:
+        """Forward one tick of played audio downstream when the gate is open."""
+        if self._svc._can_start_playback:
+            await self._svc.push_frame(
+                OutputAudioRawFrame(frame.pcm, frame.sample_rate, frame.num_channels)
+            )
+
+    async def write_video(self, frame: STVVideoFrame) -> None:
+        """Forward one decoded avatar frame downstream when the gate is open."""
+        if self._svc._can_start_playback and frame.rgb is not None:
+            await self._svc.push_frame(
+                OutputImageRawFrame(
+                    image=frame.rgb,
+                    size=(frame.width, frame.height),
+                    format=frame.format,
+                )
+            )
+
+    def on_event(self, event: STVEvent, **kwargs) -> None:
+        """No-op: lifecycle events are handled via the client's emitter, not here."""
+
+
 class OjinVideoService(FrameProcessor):
-    """v3 service — server-signalled turn boundary, no state machine."""
+    """Thin pipecat adapter delegating all avatar behavior to :class:`OjinSTVClient`."""
 
     def __init__(
         self,
         settings: OjinVideoSettings,
-        client: IOjinClient | None = None,
-        session_trace: OjinSessionTrace | None = None,
+        client: Optional[IOjinClient] = None,
+        session_trace: Optional[OjinSessionTrace] = None,
+        *,
+        stv_client: Optional[OjinSTVClient] = None,
     ) -> None:
-        """Create the avatar service, optionally bound to a session trace."""
+        """Build the adapter.
+
+        Args:
+            settings: pipecat-facing settings (identity + behavioral knobs).
+            client: optional low-level ``IOjinClient`` transport, passed through
+                to ``OjinSTVClient`` (defaults to a WebSocket client).
+            session_trace: the bot's ``OjinSessionTrace``, injected as the
+                client's tracer so the avatar and ``LatencyTracker`` share one
+                trace. ``None`` → the client uses a ``NullTracer``.
+            stv_client: optional pre-built client (dependency injection for tests
+                or alternative transports). When provided, ``client`` and the
+                settings-derived client configuration are ignored.
+        """
         super().__init__(name="ojin")
-        logger.debug(
-            f"OjinVideoService v3 initialised, version={OJIN_VIDEO_SERVICE_VERSION}, "
-            f"settings={settings}"
-        )
-        # Log which ojin-client (the STV wire client) is actually loaded, so we
-        # can confirm from the bot logs that the local editable 0.6.6 — not a
-        # stale PyPI build — is in use. Defensive: never break init.
-        try:
-            import importlib.metadata as _md
-
-            import ojin as _ojin
-
-            logger.info(
-                f"ojin-client version={_md.version('ojin-client')} "
-                f"loaded_from={os.path.dirname(_ojin.__file__)}"
-            )
-        except Exception as _exc:  # pragma: no cover - diagnostic only
-            logger.warning(f"could not resolve ojin-client version: {_exc}")
-
         self._settings = settings
-        if client is None:
-            self._client = OjinClient(
-                ws_url=settings.ws_url,
-                api_key=settings.api_key,
-                config_id=settings.config_id,
-                mode=os.getenv("OJIN_MODE", ""),
-            )
-        else:
-            self._client = client
-
-        self._session_data: Optional[dict] = None
-        self._initialized = False
-
-        # Server frames, pre-decoded and ready for the playback loop to pop.
-        # Touched only by the loop thread (the decode worker hands frames over
-        # via ``_decode_out``, which the loop drains at the top of each tick).
-        self._video_frames: deque[VideoFrame] = deque()
-
-        # Off-loop JPEG decode pipeline. The receive path enqueues raw frames on
-        # ``_decode_in``; a dedicated worker thread decodes their pixels (cv2
-        # releases the GIL, so it runs truly parallel to the event loop) and
-        # hands the decoded frame back on ``_decode_out``. This keeps the cv2
-        # cost — the dominant per-tick work — off the audio-clocked playback
-        # loop, so audio is never delayed by frame preparation.
-        self._decode_in: "queue.Queue[Optional[VideoFrame]]" = queue.Queue()
-        self._decode_out: "queue.Queue[VideoFrame]" = queue.Queue()
-        self._decode_thread: Optional[threading.Thread] = None
-
-        # Audio buffer queue.
-        self._audio_buffers: deque[AudioBuffer] = deque()
-        self._current_buffer: Optional[AudioBuffer] = None
-        # Set when a new-turn boundary (frame_type=3) arrived but no replacement
-        # buffer was queued yet, so the edge-triggered swap was skipped. Lets the
-        # playback loop promote the buffer the moment it lands (level-triggered
-        # recovery) instead of waiting for a frame_type=3 that never repeats —
-        # otherwise the late buffer is orphaned and playback is silent forever.
-        self._swap_pending: bool = False
-
-        # Resampler for TTS → server sample rate.
-        self._resampler = create_default_resampler()
-
-        # Playback timing.
-        self.fps = 25
-        self._frame_duration = 1.0 / self.fps  # 40 ms
-        self.fps_tracker = FPSTracker("Ojin")
-        self.last_frame_time = 0.0
-        # Last decoded RGB pixels, reused (rewrapped, never re-decoded) when a
-        # tick has no new frame so idle repeats cost nothing on the loop.
-        self._last_played_rgb: Optional[bytes] = None
-
-        # Pause/resume. Paused on construction; consumer (widget) calls
-        # ``resume_playback()`` once the room is ready.
-        self._playback_paused = True
-        self._playback_resume_event = asyncio.Event()
-
-        # Bot-side counters for logging.
-        self._audio_chunks_emitted: int = 0
-        self._video_frames_emitted: int = 0
-
-        # TTFB metrics.
+        self._start_frame_cls = settings.start_frame_cls
+        self._can_start_playback = False  # gated until participant join
         self._waiting_for_first_tts = False
+        self._output = _PushFrameOutput(self)
+        self._stv = stv_client or OjinSTVClient(
+            api_key=settings.api_key,
+            config_id=settings.config_id,
+            ws_url=settings.ws_url,
+            output=self._output,
+            resampler=create_default_resampler(),
+            tracer=session_trace,
+            client=client,
+            config=_config_from(settings),
+        )
+        self._wire_events()
 
-        # Tasks.
-        self._receive_msg_task: Optional[asyncio.Task] = None
-        self._video_playback_task: Optional[asyncio.Task] = None
+    def set_can_start_playback(self, value: bool) -> None:
+        """Open (``True``) or close (``False``) the playback gate.
 
-        # Event-loop stall diagnostics (see the audio_freeze investigation:
-        # a ~0.66s synchronous block on the bot's asyncio loop froze BOTH
-        # playback ticks and the websocket reader, while the server kept
-        # pacing). The watchdog thread dumps every thread's stack when a
-        # playback tick fails to advance within the threshold (captures the
-        # main thread even while it is blocked in a C extension, since
-        # faulthandler walks frames without the GIL). Per-tick work timing
-        # (loop_lag_ms / tick_work_ms / frame_prepare_ms counters + a slow-
-        # tick warning) attributes a stall to a code region. The loop
-        # exception handler names the connection behind socket errors.
-        # All knobs default-on, gated by env; 0 disables.
-        self._loop_stall_watchdog_ms = float(os.environ.get("OJIN_LOOP_STALL_WATCHDOG_MS", "250"))
-        self._tick_warn_ms = float(os.environ.get("OJIN_TICK_WARN_MS", "80"))
-        # Low-threshold stall PROBE: dumps all-thread stacks for *small* loop
-        # stalls (default >=35ms) the big 250ms watchdog never catches — to find
-        # the offender behind the post-LLM loop_lag spike. Steady-state lag is
-        # ~0, so this rarely fires. Crucially the dump happens WHILE the loop is
-        # still blocked (the watchdog thread polls fast and faulthandler walks
-        # frames without the GIL), so the stack shows what is actually running.
-        # 0 disables.
-        self._stall_probe_ms = float(os.environ.get("OJIN_STALL_PROBE_MS", "70"))
-        self._last_tick_perf: float = 0.0
-        self._loop_watchdog_thread: Optional[threading.Thread] = None
-        self._loop_watchdog_stop: Optional[threading.Event] = None
-        self._prev_loop_exc_handler = None
-
-        # Derived speaking state — fires the downstream "started/stopped
-        # speaking" signals at edges of this predicate. Tracked here so
-        # we emit each frame exactly once per transition.
-        self._was_speaking_emitted: bool = False
-
-        # Lip-sync verification trace (opt-in via settings). Bounded ring of
-        # per-tick frame/audio correlations; empty + untouched in production.
-        self._lipsync_trace: deque[LipsyncTraceEntry] = deque(maxlen=4000)
-
-        # Per-session Perfetto trace, injected by the caller and shared with the
-        # bot's LatencyTracker so both producers write one file. The bot owns
-        # creation; this service only activates it in _start, records into it,
-        # and flushes it in _stop. All recording is guarded by
-        # ``self._trace is not None`` (None ⇒ this session is untraced).
-        self._injected_trace: Optional[OjinSessionTrace] = session_trace
-        self._trace: Optional[OjinSessionTrace] = None
-        self._tr_session_start: float = 0.0  # session span anchor (µs)
-        self._tr_connect_start: float = 0.0  # connect span anchor (µs)
-        self._tr_speaking_start: Optional[float] = None  # bot_speaking anchor
-        self._tr_interrupt_start: Optional[float] = None  # cancel→new_turn anchor
-        self._tr_emit_times: deque[float] = deque()  # recent video emits for fps
-        self._tr_underruns: int = 0
-        self._tr_idle_skips: int = 0  # silence frames dropped to drain backlog
-        # Response-latency anchor: µs mark of the first TTS audio frame of the
-        # current turn (when the bot's speech starts flowing into the avatar).
-        # Closed twice per turn — once when the first speech video frame arrives
-        # from the server (recv: the Ojin inference round-trip) and once when it
-        # is played downstream (played: adds bot-side buffering) — each gated by
-        # its own flag so the measurement fires exactly once. Armed only while
-        # the session trace is active.
-        self._tr_first_tts_audio_at: Optional[float] = None
-        self._awaiting_first_recv_video: bool = False
-        self._awaiting_first_played_video: bool = False
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        Called ``True`` at participant-join, after the transport ``output_buffer``
+        has been flushed and before the greeting is triggered. The avatar's A/V is
+        dropped until this is called, keeping the connect→join idle backlog out of
+        the transport.
+        """
+        self._can_start_playback = value
 
     def can_generate_metrics(self) -> bool:
-        """Enable pipecat metrics (TTFB/processing) for this service."""
+        """Enable pipecat TTFB/processing metrics for this service."""
         return True
 
-    def pause_playback(self) -> None:
-        """Pause the video playback loop (idempotent)."""
-        if not self._playback_paused:
-            self._playback_paused = True
-            self._playback_resume_event.clear()
-            logger.info("OjinVideoService: playback paused")
-
-    def resume_playback(self) -> None:
-        """Resume a paused video playback loop (idempotent)."""
-        if self._playback_paused:
-            self._playback_paused = False
-            self._playback_resume_event.set()
-            logger.info(
-                f"OjinVideoService: playback resumed "
-                f"(video_buf={len(self._video_frames)}, "
-                f"audio_buffers={len(self._audio_buffers)})"
-            )
-
     async def connect_with_retry(self) -> bool:
-        """Connect the Ojin client, retrying up to the configured max attempts."""
-        last_error: Optional[Exception] = None
-        assert self._client is not None
-        for attempt in range(self._settings.client_connect_max_retries):
-            try:
-                logger.info(
-                    f"Connection attempt {attempt + 1}/{self._settings.client_connect_max_retries}"
-                )
-                await self._client.connect()
-                logger.info("Successfully connected!")
-                return True
-            except ConnectionError as e:
-                last_error = e
-                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
-                if attempt < self._settings.client_connect_max_retries - 1:
-                    await asyncio.sleep(self._settings.client_reconnect_delay)
-        await self.push_error(
-            error_msg=(
-                f"Failed to connect after "
-                f"{self._settings.client_connect_max_retries} attempts: {last_error}"
-            ),
-            fatal=True,
-        )
-        await self._stop()
-        return False
+        """Connect the underlying client with retry; ``True`` on success.
 
-    # ------------------------------------------------------------------
-    # Frame processing entry point
-    # ------------------------------------------------------------------
+        Preserved from the old public surface (refactor doc §5). The client also
+        connects lazily on ``StartFrame`` via ``start()``; this remains for callers
+        that connect explicitly.
+        """
+        return await self._stv.connect_with_retry()
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Route an incoming frame (TTS audio in, lifecycle, passthrough)."""
-        await super().process_frame(frame, direction)
+    def _wire_events(self) -> None:
+        """Map ``OjinSTVClient`` events onto pipecat frames + TTFB metrics."""
 
-        if isinstance(frame, self._settings.start_frame_cls):
-            await self.push_frame(frame, direction)
-            await self._start()
-
-        elif isinstance(frame, TTSStartedFrame):
-            # Open a new buffer at the tail of the queue.
-            buf = AudioBuffer()
-            self._audio_buffers.append(buf)
-            self._waiting_for_first_tts = True
-            logger.debug(
-                f"TTSStartedFrame: opened buffer #{buf.buffer_id} "
-                f"(queue={len(self._audio_buffers)})"
-            )
-            if self._trace is not None:
-                self._trace.instant(
-                    "tts_input",
-                    "tts_started",
-                    args={"buffer_id": buf.buffer_id, "queue_len": len(self._audio_buffers)},
-                )
-            await self.push_frame(frame, direction)
-
-        elif isinstance(frame, TTSAudioRawFrame):
-            # Check if duration is 0.5s
-            duration = len(frame.audio) / (frame.sample_rate * frame.num_channels * 2)
-            is_silence = frame.audio == b"\x00" * len(frame.audio)  # Check if audio is silence
-            if duration - 0.5 < 0.01 and is_silence:  # Discard trailing silence
-                logger.debug(
-                    f"Received TTSAudioRawFrame with duration 0.5s — "
-                    f"treating as first TTS frame of a turn for TTFB metrics"
-                )
-                if self._trace is not None:
-                    self._trace.instant(
-                        "tts_input",
-                        "tts_silence_discarded",
-                        args={"dur_ms": round(duration * 1000, 1)},
-                    )
-                return
-            await self._on_tts_audio_frame(frame)
-
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            await self._on_user_started_speaking(frame, direction)
-
-        elif isinstance(frame, (EndFrame, CancelFrame)):
-            await self._stop()
-            await self.push_frame(frame, direction)
-
-        else:
-            await self.push_frame(frame, direction)
-
-    # ------------------------------------------------------------------
-    # TTS audio path
-    # ------------------------------------------------------------------
-
-    async def _on_tts_audio_frame(self, frame: TTSAudioRawFrame) -> None:
-        if self._client is None or not self._initialized:
-            logger.warning("TTSAudioRawFrame received before client ready — dropping")
-            return
-
-        # Pick the buffer this audio belongs to:
-        #   - If the queue has any buffers, the tail buffer is the latest
-        #     turn upstream opened (with TTSStartedFrame). Audio extends
-        #     the tail.
-        #   - Else if a non-interrupted current buffer is draining, this
-        #     is in-turn streaming TTS: extend the current buffer.
-        #   - Else drop. The current buffer is interrupted (we're in
-        #     fadeout) and no new TTSStartedFrame has opened a fresh
-        #     buffer yet — the audio is straggler bytes from a cancelled
-        #     turn.
-        target: Optional[AudioBuffer]
-        if self._audio_buffers:
-            target = self._audio_buffers[-1]
-        elif self._current_buffer is not None and not self._current_buffer.interrupted:
-            target = self._current_buffer
-        else:
-            target = None
-
-        if target is None:
-            logger.warning(
-                f"TTSAudioRawFrame received with no target buffer "
-                f"(current={'interrupted' if self._current_buffer is not None else 'none'}) "
-                f"— dropping {len(frame.audio)} bytes"
-            )
-            return
-
-        resampled = await self._resampler.resample(
-            frame.audio, frame.sample_rate, OJIN_PERSONA_SAMPLE_RATE
-        )
-        target.sample_rate = frame.sample_rate
-        target.num_channels = frame.num_channels
-        target.bytes_.extend(frame.audio)
-
-        if self._waiting_for_first_tts:
-            self._waiting_for_first_tts = False
-            await self.start_ttfb_metrics()
-            # Anchor the per-turn video response latency at the first TTS audio
-            # of the turn, and arm both the recv and played measurements.
-            if self._trace is not None:
-                self._tr_first_tts_audio_at = self._trace.mark()
-                self._awaiting_first_recv_video = True
-                self._awaiting_first_played_video = True
-
-        await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=resampled))
-
-        if self._trace is not None:
-            dur_ms = round(
-                len(frame.audio) / (frame.sample_rate * frame.num_channels * 2) * 1000, 1
-            )
-            self._trace.instant(
-                "tts_input",
-                "tts_audio",
-                args={
-                    "bytes": len(frame.audio),
-                    "dur_ms": dur_ms,
-                    "buffer_id": target.buffer_id,
-                    "sample_rate": frame.sample_rate,
-                },
-            )
-            self._trace.instant("to_server", "audio_sent", args={"bytes": len(resampled)})
-
-        if self._settings.tts_audio_passthrough:
+        @self._stv.on(STVEvent.SESSION_READY)
+        async def _on_ready(session_data=None, **_):
+            frame = OjinVideoInitializedFrame(session_data=session_data)
             await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+            await self.push_frame(frame, FrameDirection.UPSTREAM)
 
-    # ------------------------------------------------------------------
-    # Interruption entry point
-    # ------------------------------------------------------------------
-
-    async def _on_user_started_speaking(
-        self, frame: UserStartedSpeakingFrame, direction: FrameDirection
-    ) -> None:
-        can = self._can_interrupt()
-        if self._trace is not None:
-            self._trace.instant(
-                "interruption",
-                "user_started_speaking",
-                args={
-                    "can_interrupt": can,
-                    "buffer_id": (
-                        self._current_buffer.buffer_id if self._current_buffer is not None else None
-                    ),
-                },
-            )
-        if can:
-            logger.info(
-                f"User started speaking while playing buffer "
-                f"#{self._current_buffer.buffer_id} — marking interrupted and "
-                f"sending cancel"
-            )
-            self._current_buffer.interrupted = True
-            # A fresh interrupt supersedes any earlier orphaned-swap recovery:
-            # the queue is about to be cleared and a new frame_type=3 boundary
-            # will arrive for this turn, so drop any stale pending-swap intent.
-            self._swap_pending = False
-            # Discard the queued buffers of the cancelled turn. A long agent
-            # response is split into several TTS groups → several buffers; the
-            # bot forwards every TTS frame to the inference server eagerly
-            # (ahead of playback), so the whole response is already in the
-            # server's input buffer. On cancel the server drains ALL of that
-            # pre-sent audio and renders the genuinely-new turn from audio that
-            # arrives after the drain. If we kept these stale queued buffers,
-            # the next frame_type==3 would swap playback to one of them and the
-            # avatar would lip-sync the new turn over the cancelled turn's
-            # audio. Dropping them here keeps client and server symmetric:
-            # both discard everything pre-interrupt, so the next frame_type==3
-            # lands on the new turn's fresh buffer.
-            discarded_buffers = len(self._audio_buffers)
-            self._audio_buffers.clear()
-            await self._client.send_message(OjinCancelInteractionMessage())
-            if discarded_buffers:
-                logger.info(
-                    f"Barge-in discarded {discarded_buffers} queued buffer(s) "
-                    f"from the cancelled turn"
-                )
-            if self._trace is not None:
-                self._trace.instant("to_server", "cancel_sent")
-                self._trace.instant(
-                    "interruption",
-                    "buffer_interrupted",
-                    args={
-                        "buffer_id": self._current_buffer.buffer_id,
-                        "discarded_queued": discarded_buffers,
-                    },
-                )
-                # Anchor the cancel→new-turn round-trip span (closed when the
-                # next frame_type==3 arrives).
-                self._tr_interrupt_start = self._trace.mark()
-        else:
-            logger.debug(
-                f"User started speaking while idle/already-interrupted — ignoring (no cancel sent)"
-            )
-        await self.push_frame(frame, direction)
-
-    def _can_interrupt(self) -> bool:
-        return (
-            self._current_buffer is not None
-            and not self._current_buffer.interrupted
-            and len(self._current_buffer.bytes_) > 0
-        )
-
-    # ------------------------------------------------------------------
-    # Server message handling
-    # ------------------------------------------------------------------
-
-    async def _handle_ojin_message(self, message: BaseModel) -> None:
-        if isinstance(message, OjinSessionReadyMessage):
-            if message.parameters is not None:
-                self._session_data = message.parameters
-            logger.info(f"Received Session Ready: {message}")
-
-            if self._video_playback_task is None:
-                self._video_playback_task = self.create_task(self._video_playback_loop())
-
-            self._initialized = True
-            if self._trace is not None:
-                self._trace.span("lifecycle", "connect", self._tr_connect_start)
-            init_frame = OjinVideoInitializedFrame(session_data=self._session_data)
-            await self.push_frame(init_frame, direction=FrameDirection.DOWNSTREAM)
-            await self.push_frame(init_frame, direction=FrameDirection.UPSTREAM)
-
-            # Seed the server's audio timeline with one silent chunk so it
-            # starts emitting silence frames.
-            await self._client.send_message(
-                OjinAudioInputMessage(audio_int16_bytes=b"\x00" * BYTES_PER_FRAME)
-            )
-            if self._trace is not None:
-                self._trace.instant("to_server", "seed_sent", args={"bytes": BYTES_PER_FRAME})
-
-        elif isinstance(message, OjinInteractionResponseMessage):
-            if not self.fps_tracker.is_running:
-                self.fps_tracker.start()
-            self.fps_tracker.update(1)
-            self.last_frame_time = time.monotonic()
-
-            # Authoritative frame classification now rides on the explicit
-            # frame_type field (0/1/2/3). The wire index only carries 0/1.
-            frame_type = int(message.frame_type)
-            samples = [
-                int.from_bytes(message.audio_frame_bytes[i : i + 2], "little", signed=True)
-                for i in range(0, len(message.audio_frame_bytes) - 1, 2)
-            ]
-            volume = (
-                0 if len(samples) == 0 else int((sum(s * s for s in samples) / len(samples)) ** 0.5)
-            )
-
-            video_frame = VideoFrame(
-                frame_type=frame_type,
-                image_bytes=message.video_frame_bytes,
-                audio_bytes=message.audio_frame_bytes,
-                is_final=message.is_final_response,
-                volume=volume,
-            )
-            # logger.debug(f"Received frame_type={frame_type} (volume={volume})")
-            # Hand the frame to the decode worker; it lands in ``_video_frames``
-            # (already decoded) when the loop drains ``_decode_out`` next tick.
-            self._decode_in.put(video_frame)
-
-            if self._trace is not None:
-                self._trace.instant(
-                    recv_lane_for_frame_type(frame_type),
-                    "frame_recv",
-                    cat=str(frame_type),
-                    args={
-                        "frame_type": frame_type,
-                        "volume": volume,
-                        "audio_len": len(message.audio_frame_bytes),
-                        "recv_buf": len(self._video_frames) + self._decode_in.qsize(),
-                    },
-                )
-                # Numeric frame_type timeline so the wire classification is
-                # visible at a glance alongside the per-type recv lanes.
-                self._trace.counter("recv_frame_type", frame_type)
-                # Close the cancel→new-turn round-trip span on the first
-                # new-turn frame after a barge-in (the client-observed fade
-                # latency — the lip-sync KPI).
-                if frame_type == 3 and self._tr_interrupt_start is not None:
-                    self._trace.span("interruption", "interrupt→new_turn", self._tr_interrupt_start)
-                    self._tr_interrupt_start = None
-
-                # First speech video frame of the turn arriving from the server
-                # — the Ojin inference round-trip (first TTS audio → video out).
-                if (
-                    self._awaiting_first_recv_video
-                    and self._tr_first_tts_audio_at is not None
-                    and not video_frame.is_silence()
-                    and not video_frame.is_fade_out()
-                ):
-                    self._awaiting_first_recv_video = False
-                    latency_ms = self._trace.record_response_latency(
-                        "recv",
-                        self._tr_first_tts_audio_at,
-                        args={"frame_type": frame_type},
-                    )
-                    logger.info(
-                        f"📹 First speech video frame received {latency_ms}ms "
-                        f"after first TTS audio (frame_type={frame_type})"
-                    )
-
-            # Overflow backstop now lives in the playback loop, after it drains
-            # the decode pipeline into ``_video_frames`` (the receive path no
-            # longer owns that deque).
-
-        elif isinstance(message, ErrorResponseMessage):
-            if self._trace is not None:
-                self._trace.instant(
-                    "lifecycle", "server_error", args={"code": str(message.payload.code)}
-                )
-            await self.push_error(
-                error_msg=f"Ojin server error: {message.payload.code}", fatal=True
-            )
-            await self._stop()
-
-    async def _receive_ojin_messages(self) -> None:
-        """Pull messages off the websocket and dispatch to the handler.
-
-        Wraps each receive + handle in try/except so a malformed message
-        or transient handler exception doesn't silently kill the loop.
-        """
-        while True:
-            assert self._client is not None
-            try:
-                message = await self._client.receive_message()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Error receiving server message — continuing")
-                continue
-            if message is None:
-                continue
-            try:
-                await self._handle_ojin_message(message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    f"Error handling server message {type(message).__name__} — continuing"
-                )
-
-    # ------------------------------------------------------------------
-    # Buffer swap on frame_type == 3
-    # ------------------------------------------------------------------
-
-    def _current_replaceable(self) -> bool:
-        """Whether a queued buffer may be promoted over the current one this tick.
-
-        Normally only when there is no current buffer, or it has fully drained
-        and was NOT interrupted. The ``not interrupted`` guard stops a stale
-        old-turn SPEECH frame from triggering a premature swap during a
-        post-cancel fadeout — before the server's ``frame_type == 3`` boundary.
-
-        Once that boundary HAS passed without a buffer to swap
-        (``_swap_pending``), the current (interrupted) buffer IS the orphaned
-        prior turn, so allow replacing it as soon as the next turn's buffer is
-        available — discarding any interrupted remnant, but still letting a
-        *valid* mid-play buffer finish draining first.
-        """
-        cur = self._current_buffer
-        if cur is None:
-            return True
-        if self._swap_pending:
-            return cur.interrupted or len(cur.bytes_) == 0
-        return not cur.interrupted and len(cur.bytes_) == 0
-
-    async def _swap_to_next_buffer(self, align_to_frame: Optional["VideoFrame"] = None) -> None:
-        """Promote the head of the audio buffer queue to current.
-
-        Discards whatever bytes remain in ``_current_buffer`` (in-flight
-        audio of a cancelled turn, or audio buffered ahead of playback
-        for a natural-turn-end case). Server's ``frame_type == 3`` marker
-        is authoritative — bytes before this point belonged to the prior
-        turn, bytes from now on belong to the new turn.
-
-        ``align_to_frame`` is the video frame that triggered this swap (the
-        first frame of the new turn). When ``align_audio_on_swap`` is set, we
-        line the new buffer's read head up with the audio that frame was
-        generated from — the server can drop leading new-turn speech, which
-        would otherwise leave audio lagging video for the whole turn.
-
-        If the queue is empty when we get a swap signal, log a warning
-        and skip — server-bot desync, but harmless (next swap will
-        come on the next ``frame_type == 3``).
-        """
-        if not self._audio_buffers:
-            logger.warning(
-                f"frame_type=3 received but audio buffer queue is empty "
-                f"(current={'present' if self._current_buffer else 'none'}) "
-                f"— deferring swap until the replacement buffer lands"
-            )
-            # The new-turn boundary passed before the replacement TTS was queued.
-            # Remember it so the playback loop promotes the buffer the moment it
-            # arrives, rather than waiting for a frame_type=3 that won't repeat.
-            self._swap_pending = True
-            return
-
-        prev_remnant = len(self._current_buffer.bytes_) if self._current_buffer is not None else 0
-        prev_id = self._current_buffer.buffer_id if self._current_buffer is not None else None
-
-        # Skip empty buffers at the head — TTSStartedFrame followed by no
-        # audio (e.g. upstream cancelled before any bytes landed).
-        new_buffer: Optional[AudioBuffer] = None
-        while self._audio_buffers:
-            candidate = self._audio_buffers.popleft()
-            if len(candidate.bytes_) == 0:
-                logger.debug(f"Skipping empty audio buffer #{candidate.buffer_id} on swap")
-                continue
-            new_buffer = candidate
-            break
-
-        if new_buffer is None:
-            logger.warning(
-                f"frame_type=3 received but all queued buffers were empty — skipping swap"
-            )
-            self._current_buffer = None
-            self._swap_pending = True
-            await self._maybe_emit_stopped_speaking()
-            return
-
-        self._current_buffer = new_buffer
-        self._swap_pending = False
-        logger.info(
-            f"frame_type=3 swap: prev buffer #{prev_id} discarded "
-            f"({prev_remnant}B remnant) → new buffer #{new_buffer.buffer_id} "
-            f"({len(new_buffer.bytes_)}B; queue={len(self._audio_buffers)}); "
-            f"prev-turn emitted audio_chunks={self._audio_chunks_emitted} "
-            f"video_frames={self._video_frames_emitted}"
-        )
-
-        if self._trace is not None:
-            trigger = (
-                "new_turn"
-                if (align_to_frame is not None and align_to_frame.is_new_turn_start())
-                else "natural"
-            )
-            self._trace.instant(
-                "buffers",
-                "swap",
-                args={
-                    "prev_id": prev_id,
-                    "new_id": new_buffer.buffer_id,
-                    "prev_remnant_b": prev_remnant,
-                    "new_b": len(new_buffer.bytes_),
-                    "queue_len": len(self._audio_buffers),
-                    "trigger": trigger,
-                },
-            )
-
-        # Line the new buffer's read head up with the audio the server's first
-        # new-turn frame was generated from. No-op when they already match.
-        #
-        # OJIN FIX (lipsync_0609): only the server-signalled new-turn boundary
-        # (frame_type==3, the cancel/fade path) can drop leading speech, so it is
-        # the only path that ever needs alignment. A natural turn end (a SPEECH
-        # frame popped while the prior buffer drained cleanly) has no fade and no
-        # drop — the correct trim is always 0, so aligning there can only inject
-        # error. A natural swap once trimmed 1.64 s of real audio and desynced
-        # the turn; gate alignment to the new-turn-start path.
-        if (
-            self._settings.align_audio_on_swap
-            and align_to_frame is not None
-            and align_to_frame.is_new_turn_start()
-        ):
-            self._align_current_buffer_to_frame(align_to_frame)
-
-        self._audio_chunks_emitted = 0
-        self._video_frames_emitted = 0
-        await self._maybe_emit_started_speaking()
-
-    def _align_current_buffer_to_frame(self, align_to_frame: "VideoFrame") -> None:
-        """Align the current buffer's head to the new turn's first server frame.
-
-        Drops leading 40 ms frames from the current buffer so its head lines up
-        with the audio that frame represents. The server can drop leading speech
-        of the new turn (e.g. the post-fade SPEECH-drop window), so the first
-        video frame we receive can correspond to audio further into the buffer
-        than byte 0. We recover that offset by
-        matching the bundled audio of the first server frame(s) against
-        successive 40 ms windows of the buffer using an amplitude-envelope
-        signature (RMS per frame) — robust to the server (16 kHz) vs buffer
-        (TTS rate) sample-rate + resample differences, since RMS is amplitude-
-        domain and rate-independent. Conservative: trims only on a confident,
-        non-zero match, so the steady-state (offset 0) case is untouched.
-        """
-        buf = self._current_buffer
-        if buf is None or not align_to_frame.audio_bytes:
-            return
-        if align_to_frame.is_silence() or align_to_frame.is_fade_out():
-            return
-
-        # Anchor sequence: the swap-triggering frame + the leading new-turn
-        # speech frames already buffered. More anchors → a unique match.
-        anchors_src = [align_to_frame] + [f for f in list(self._video_frames) if not f.is_silence()]
-        anchor_rms: list[float] = []
-        for f in anchors_src[:_ALIGN_ANCHOR_FRAMES]:
-            r = _rms_int16(f.audio_bytes)
-            if r is None:
-                break
-            anchor_rms.append(r)
-        if not anchor_rms or max(anchor_rms) < _ALIGN_MIN_RMS:
-            return  # nothing to anchor on (silence / empty)
-
-        # OJIN FIX (lipsync_0609): a 1–2 frame signature can't localize within a
-        # multi-second buffer (one RMS scalar matches some window by chance →
-        # false trim → whole-turn desync). Only trust a trim when a real
-        # multi-frame signature has arrived; otherwise leave the head at d=0,
-        # which is correct whenever the server didn't drop leading speech.
-        if len(anchor_rms) < _ALIGN_MIN_ANCHORS:
-            return
-
-        # Buffer is int16 at its own sample rate; one 40 ms frame == one tick.
-        buf_frame_bytes = int(buf.sample_rate * self._frame_duration) * buf.num_channels * 2
-        if buf_frame_bytes <= 0:
-            return
-        max_d = min(
-            self._settings.align_audio_max_frames,
-            len(buf.bytes_) // buf_frame_bytes - len(anchor_rms),
-        )
-        if max_d <= 0:
-            return
-
-        def window_err(d: int) -> Optional[float]:
-            err = 0.0
-            for j, a in enumerate(anchor_rms):
-                start = (d + j) * buf_frame_bytes
-                r = _rms_int16(bytes(buf.bytes_[start : start + buf_frame_bytes]))
-                if r is None:
-                    return None
-                err += (r - a) * (r - a)
-            return err / len(anchor_rms)
-
-        base_err = window_err(0)
-        if base_err is None:
-            return
-        best_d, best_err = 0, base_err
-        for d in range(1, max_d + 1):
-            e = window_err(d)
-            if e is None:
-                break
-            if e < best_err:
-                best_d, best_err = d, e
-
-        # Trim only on a confident, better-than-head match. Tolerance scales
-        # with the anchor energy so it works at any volume.
-        tol = (_ALIGN_REL_TOL * (sum(anchor_rms) / len(anchor_rms))) ** 2
-        if best_d > 0 and best_err <= tol and best_err < base_err:
-            trim = best_d * buf_frame_bytes
-            del buf.bytes_[:trim]
-            logger.info(
-                f"swap audio-align: trimmed {best_d} leading frame(s) "
-                f"({trim}B) from buffer #{buf.buffer_id} to match the server's "
-                f"first new-turn frame (head_err={base_err:.0f} → {best_err:.0f})"
-            )
-            if self._trace is not None:
-                self._trace.instant(
-                    "lipsync",
-                    "swap_align_trim",
-                    args={
-                        "trim_frames": best_d,
-                        "trim_ms": round(best_d * self._frame_duration * 1000, 1),
-                        "buffer_id": buf.buffer_id,
-                        "head_err": round(base_err, 1),
-                        "best_err": round(best_err, 1),
-                    },
-                )
-
-    # ------------------------------------------------------------------
-    # Idle backlog drain
-    # ------------------------------------------------------------------
-
-    def _drain_idle_backlog(self, popped: Optional["VideoFrame"]) -> int:
-        """Drop extra leading silence frames to shrink an idle video backlog.
-
-        The playback loop pops exactly one frame per 40 ms tick — the same rate
-        the server produces them — so a backlog that built up while playback was
-        paused (frames buffering during client connect) is otherwise carried for
-        the whole session, delaying every reply by its depth. When we're idle
-        (the frame just popped is silence and no speech audio is draining) and
-        the pending buffer is over ``idle_buffer_target_frames``, drop the next
-        silence frame(s) this tick so the buffer shrinks back toward the target.
-
-        Skips one silence frame (1-of-2) normally; two when a reply's speech is
-        already waiting behind the silence, so it reaches the screen sooner. The
-        scan stops at the first non-silence frame, so a reply that has started
-        arriving is never trimmed, and the current audio buffer is never touched
-        (audio stays the clock). Returns the number of frames dropped (0 in the
-        steady state, where there is no backlog to drain).
-        """
-        target = self._settings.idle_buffer_target_frames
-        if target <= 0 or popped is None or not popped.is_silence():
-            return 0
-        if len(self._video_frames) <= target:
-            return 0
-        # Never advance video past audio: only drain while the current buffer is
-        # idle (drained or absent). During a reply it holds bytes and the video
-        # must stay locked to the audio clock.
-        if self._current_buffer is not None and len(self._current_buffer.bytes_) > 0:
-            return 0
-        # A reply already queued behind the silence → drain two frames this tick
-        # so it surfaces sooner; otherwise skip one (matches pre-v3 behaviour).
-        speech_pending = any(not f.is_silence() for f in self._video_frames)
-        max_skip = 2 if speech_pending else 1
-        skipped = 0
-        while (
-            skipped < max_skip
-            and len(self._video_frames) > target
-            and self._video_frames[0].is_silence()
-        ):
-            self._video_frames.popleft()
-            skipped += 1
-        return skipped
-
-    # ------------------------------------------------------------------
-    # Playback loop — audio-as-clock, no state machine
-    # ------------------------------------------------------------------
-
-    async def _video_playback_loop(self) -> None:
-        """Audio-as-clock playback loop.
-
-        Each 40 ms tick:
-          1. If paused, wait for resume.
-          2. Sleep + spin-lock until the next tick boundary.
-          3. Pop one video frame (if any). On ``frame_type == 3``, swap to
-             the next audio buffer BEFORE draining audio this tick.
-          4. Drain one chunk from the current buffer (regardless of
-             video pop — audio is the clock).
-          5. Emit OutputAudioRawFrame (real audio if buffer present and
-             not interrupted, silence otherwise) + OutputImageRawFrame.
-        """
-        logger.info("Starting v3 playback loop")
-
-        sample_rate = OJIN_PERSONA_SAMPLE_RATE
-        audio_shape_initialized = False
-        num_channels = 1
-        chunk_size = int(sample_rate * self._frame_duration) * num_channels * 2
-        silence_chunk = b"\x00" * chunk_size
-        start_ts = time.perf_counter()
-        next_tick = start_ts + self._frame_duration
-        initial_buffer = 6
-        silence_audio = OutputAudioRawFrame(
-            audio=silence_chunk, sample_rate=OJIN_PERSONA_SAMPLE_RATE, num_channels=1
-        )
-
-        tick_count = 0
-        while self._initialized:
-            if self._playback_paused:
-                await self._playback_resume_event.wait()
-                next_tick = time.perf_counter() + self._frame_duration
-                initial_buffer = 6
-                continue
-
-            now = time.perf_counter()
-            sleep_for = next_tick - now - 0.003
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-            while time.perf_counter() < next_tick:
-                pass
-            next_tick += self._frame_duration
-
-            # Loop-stall diagnostics: pet the watchdog and measure the inter-tick
-            # gap (a stall on the PREVIOUS tick shows up as the gap here) plus this
-            # tick's own synchronous work below. _prepare_s accumulates the cv2
-            # image-prep cost — the prime suspect for an event-loop block.
-            _now_perf = time.perf_counter()
-            _prev_tick_perf = self._last_tick_perf
-            self._last_tick_perf = _now_perf
-            _prepare_s = 0.0
-
-            # Drain decoded frames from the worker into the playback deque (O(1)
-            # per frame — pixels were decoded off-thread), then apply the
-            # unbounded-growth backstop here now that the receive path no longer
-            # owns ``_video_frames``.
-            while True:
-                try:
-                    self._video_frames.append(self._decode_out.get_nowait())
-                except queue.Empty:
-                    break
-            cap = self._settings.max_buffered_video_frames
-            if len(self._video_frames) > cap:
-                drop = len(self._video_frames) - cap
-                for _ in range(drop):
-                    self._video_frames.popleft()
-                logger.warning(f"Receive buffer overflow: dropped {drop} oldest frames")
-                if self._trace is not None:
-                    self._trace.instant("recv:idle", "recv_overflow_drop", args={"dropped": drop})
-
-            # Initial buffer warm-up.
-            if self._video_frames and initial_buffer > 0:
-                initial_buffer -= 1
-                continue
-
-            pts = int(time.monotonic() * 1_000_000_000)
-            tick_count += 1
-
-            # Pop a video frame (if any).
-            # Two swap triggers, both fire BEFORE we drain audio this tick
-            # so the popped frame pairs with the new buffer's first chunk:
-            #
-            #   (1) frame_type == 3 — cancel-armed boundary from the server.
-            #       Deterministic. The ONLY swap trigger when the current
-            #       buffer is interrupted (post-cancel fadeout in progress).
-            #
-            #   (2) Natural turn end — local detection. When the current
-            #       buffer has drained AND a new buffer is queued AND the
-            #       popped frame is a SPEECH frame (idx=1), the new turn
-            #       has started arriving from the server. Swap.
-            #
-            # (2) is gated on `not interrupted`. During a cancel-driven
-            # fadeout the current buffer's bytes drain ahead of the server's
-            # fade/silence frames; without the guard, a stale in-flight
-            # SPEECH frame from the OLD turn could pop while current is
-            # empty, triggering a premature swap. For cancel boundaries
-            # we rely exclusively on (1) — frame_type=3 from the server.
-            video_frame: Optional[VideoFrame] = None
-            swapped = False
-            if self._video_frames:
-                video_frame = self._video_frames.popleft()
-                if video_frame.is_new_turn_start():
-                    await self._swap_to_next_buffer(align_to_frame=video_frame)
-                    swapped = True
-                elif (
-                    not video_frame.is_silence()
-                    and not video_frame.is_fade_out()
-                    and self._audio_buffers
-                    and self._current_replaceable()
-                ):
-                    logger.info(
-                        f"{'Deferred-swap recovery' if self._swap_pending else 'Natural turn end'} "
-                        f"detected: current buffer "
-                        f"#{self._current_buffer.buffer_id if self._current_buffer else 'None'} "
-                        f"replaceable, popped SPEECH frame, "
-                        f"queue has {len(self._audio_buffers)} buffer(s) — swapping"
-                    )
-                    await self._swap_to_next_buffer(align_to_frame=video_frame)
-                    swapped = True
-
-            # Drain any idle backlog: when the server is emitting silence and no
-            # speech audio is draining, drop the next silence frame(s) so a
-            # buffer that built up while playback was paused doesn't add constant
-            # latency to every reply. No-op once the buffer is at its target.
-            idle_skipped = self._drain_idle_backlog(video_frame)
-            if idle_skipped:
-                self._tr_idle_skips += idle_skipped
-                if self._trace is not None:
-                    self._trace.instant(
-                        "play:idle",
-                        "idle_backlog_skip",
-                        args={"skipped": idle_skipped, "pending": len(self._video_frames)},
-                    )
-
-            # Audio drain: gated on _current_buffer existence only.
-            # Audio is emitted as silence if the buffer is interrupted
-            # (fadeout audio-cut). The bytes are still consumed so the
-            # buffer drains in time with the audio clock.
-            audio_frame: Optional[OutputAudioRawFrame] = None
-            drained_chunk: Optional[bytes] = None
-            if self._current_buffer is not None:
-                if not audio_shape_initialized:
-                    audio_shape_initialized = True
-                    sample_rate = self._current_buffer.sample_rate
-                    num_channels = self._current_buffer.num_channels
-                    chunk_size = int(sample_rate * self._frame_duration) * num_channels * 2
-                    silence_chunk = b"\x00" * chunk_size
-                    silence_audio = OutputAudioRawFrame(
-                        audio=silence_chunk, sample_rate=sample_rate, num_channels=num_channels
-                    )
-
-                buf = self._current_buffer.bytes_
-                chunk: Optional[bytes]
-                if len(buf) >= chunk_size:
-                    chunk = bytes(buf[:chunk_size])
-                    del buf[:chunk_size]
-                elif len(buf) > 0:
-                    chunk = bytes(buf)
-                    buf.clear()
-                else:
-                    # Underrun on a non-interrupted buffer mid-turn —
-                    # upstream TTS hasn't caught up. Emit silence; the
-                    # buffer will be extended by the next TTSAudioRawFrame.
-                    # logger.warning(
-                    #     f"[UNDERRUN] current buffer #{self._current_buffer.buffer_id} "
-                    #     f"empty (interrupted={self._current_buffer.interrupted}) — emitting silence"
-                    # )
-                    chunk = None
-
-                drained_chunk = chunk
-
-                if chunk is not None:
-                    cur = self._current_buffer
-                    if not cur.interrupted:
-                        out_audio: Optional[bytes] = chunk
-                    else:
-                        # Barge-in fade: ramp this turn's audio to silence over
-                        # interrupt_audio_fade_s instead of hard-cutting. The gain
-                        # is keyed to samples emitted since the interrupt (smooth
-                        # across tick jitter/GC stalls). Cancel-at-the-swap is
-                        # implicit: a frame_type=3 boundary swaps in a fresh,
-                        # non-interrupted buffer that lands here at full volume.
-                        fade_total = int(
-                            self._settings.interrupt_audio_fade_s * sample_rate * num_channels
-                        )
-                        if fade_total <= 0 or cur.fade_samples_emitted >= fade_total:
-                            out_audio = None  # ramp disabled or complete → silence
-                        else:
-                            out_audio = _fade_chunk(chunk, cur.fade_samples_emitted, fade_total)
-                            cur.fade_samples_emitted += len(chunk) // 2
-
-                    if out_audio is not None:
-                        audio_frame = OutputAudioRawFrame(
-                            audio=out_audio,
-                            sample_rate=cur.sample_rate,
-                            num_channels=cur.num_channels,
-                        )
-                        audio_frame.pts = pts
-
-            # Lip-sync verification trace (opt-in). Record the pairing of the
-            # displayed frame with the audio drained this tick, so a post-swap
-            # desync between "what we show" and "what we play" is measurable.
-            if self._settings.lipsync_trace_enabled and video_frame is not None:
-                self._lipsync_trace.append(
-                    LipsyncTraceEntry(
-                        tick=tick_count,
-                        frame_type=video_frame.frame_type,
-                        swapped=swapped,
-                        current_buffer_id=(
-                            self._current_buffer.buffer_id
-                            if self._current_buffer is not None
-                            else None
-                        ),
-                        interrupted=(
-                            self._current_buffer.interrupted
-                            if self._current_buffer is not None
-                            else False
-                        ),
-                        frame_audio_bytes=video_frame.audio_bytes,
-                        output_audio_bytes=drained_chunk,
-                    )
-                )
-
-            # Perfetto session trace: per-tick audio/video events + counters.
-            tr = self._trace
-            if tr is not None:
-                if video_frame is not None:
-                    tr.instant(
-                        play_lane_for_frame_type(video_frame.frame_type),
-                        "video_emit",
-                        cat=str(video_frame.frame_type),
-                        args={"frame_type": video_frame.frame_type, "swapped": swapped},
-                    )
-                    now_us = tr.now_us()
-                    self._tr_emit_times.append(now_us)
-                    while self._tr_emit_times and now_us - self._tr_emit_times[0] > 1_000_000:
-                        self._tr_emit_times.popleft()
-
-                    # First speech video frame of the turn played downstream —
-                    # the recv latency plus bot-side buffering/playback delay.
-                    if (
-                        self._awaiting_first_played_video
-                        and self._tr_first_tts_audio_at is not None
-                        and not video_frame.is_silence()
-                        and not video_frame.is_fade_out()
-                    ):
-                        self._awaiting_first_played_video = False
-                        latency_ms = tr.record_response_latency(
-                            "played",
-                            self._tr_first_tts_audio_at,
-                            args={"frame_type": video_frame.frame_type},
-                        )
-                        # Also draw this first-tts-audio → first-speech-frame-
-                        # played window as the "ojin" span on the single
-                        # ``latency`` lane, so the avatar's stage sits in the
-                        # per-turn latency waterfall next to STT/LLM/TTS. Uses the
-                        # precise "played" endpoint (not bot-started-speaking,
-                        # which lands a playback tick later).
-                        tr.span(
-                            "latency",
-                            "ojin",
-                            self._tr_first_tts_audio_at,
-                            args={"played_ms": latency_ms, "frame_type": video_frame.frame_type},
-                        )
-                        logger.info(
-                            f"📹 First speech video frame played {latency_ms}ms "
-                            f"after first TTS audio (frame_type={video_frame.frame_type})"
-                        )
-                elif self._last_played_rgb is not None:
-                    tr.instant("play:repeat", "video_repeat")
-
-                interrupted = (
-                    self._current_buffer.interrupted if self._current_buffer is not None else False
-                )
-                if audio_frame is not None:
-                    audio_kind = "real"
-                elif drained_chunk is not None and interrupted:
-                    audio_kind = "silenced"
-                elif self._current_buffer is not None and drained_chunk is None:
-                    audio_kind = "underrun"
-                    self._tr_underruns += 1
-                else:
-                    audio_kind = "silence"
-                tr.instant(
-                    "play_audio",
-                    "audio_emit",
-                    cat=audio_kind,
-                    args={"kind": audio_kind, "bytes": len(drained_chunk or b"")},
-                )
-
-                cur_ms = 0.0
-                cb = self._current_buffer
-                if cb is not None and cb.sample_rate:
-                    cur_ms = len(cb.bytes_) / (cb.sample_rate * cb.num_channels * 2) * 1000.0
-                tr.counter("current_buffer_ms", round(cur_ms, 1))
-                tr.counter("queued_buffers", len(self._audio_buffers))
-                tr.counter("pending_video_frames", len(self._video_frames))
-                tr.counter("playback_fps", len(self._tr_emit_times))
-                tr.counter("audio_underruns_total", self._tr_underruns)
-                tr.counter("idle_backlog_skips_total", self._tr_idle_skips)
-                # Lip-sync envelope — the closest thing to a live offset without
-                # tagged audio: the played-audio RMS should track the shown
-                # frame's bundled-audio RMS. Divergence = drift.
-                #
-                # output_audio_rms tracks the ACTUAL emitted audio, so it must be
-                # sampled on the audio cadence — every tick a chunk drains —
-                # independent of whether a NEW video frame popped this tick.
-                # Gating it on `video_frame is not None` made the counter
-                # flat-line during a video freeze even though audio kept playing,
-                # so the trace read like an audio stall when it was only a video
-                # stall. frame_audio_rms stays frame-gated: it is the shown
-                # frame's bundled audio, which only exists when a frame popped.
-
-            # Push frames downstream. Pixels are already decoded (worker thread),
-            # so the loop only wraps cached RGB bytes — no cv2, no blocking. If a
-            # frame's decode lagged (out_rgb is None) we fall back to repeating
-            # the last frame so video degrades gracefully while audio (below)
-            # always emits on the clock. ``_prepare_s`` stays as the per-tick
-            # wrap cost for the trace; it should now be ~0.
-            target_size = self._settings.image_size
-            rgb: Optional[bytes] = None
-            if video_frame is not None:
-                if video_frame.out_rgb is not None:
-                    rgb = video_frame.out_rgb
-                    self._last_played_rgb = rgb
-                else:
-                    # Decode failed for this frame — repeat the last good one.
-                    rgb = self._last_played_rgb
-            elif self._last_played_rgb is not None:
-                rgb = self._last_played_rgb
-
-            if rgb is not None:
-                _t_prep = time.perf_counter()
-                out_image = OutputImageRawFrame(image=rgb, size=target_size, format="RGB")
-                out_image.pts = pts
-                _prepare_s += time.perf_counter() - _t_prep
-                await self.push_frame(out_image)
-
-                if tr is not None and video_frame is not None and drained_chunk:
-                    fa = _rms_int16(video_frame.audio_bytes)
-                    if fa is not None:
-                        tr.counter("frame_audio_rms", round(fa, 1))
-
-                self._video_frames_emitted += 1
-
-            await self.push_frame(audio_frame or silence_audio)
-            self._audio_chunks_emitted += 1
-            if tr is not None and drained_chunk:
-                oa = _rms_int16(drained_chunk)
-                if oa is not None:
-                    tr.counter("output_audio_rms", round(oa, 1))
-            # Edge detection for the started/stopped-speaking signals.
-            await self._maybe_emit_started_speaking()
-            await self._maybe_emit_stopped_speaking()
-
-            # Loop-stall attribution (see the audio_freeze investigation).
-            # loop_lag_ms: scheduling delay carried in from the previous tick
-            # (a block elsewhere on the loop). tick_work_ms: this tick's own
-            # synchronous cost. frame_prepare_ms: the cv2 decode/resize slice.
-            _work_ms = (time.perf_counter() - _now_perf) * 1000.0
-            if tr is not None:
-                _lag_ms = (
-                    (_now_perf - _prev_tick_perf) * 1000.0 - self._frame_duration * 1000.0
-                    if _prev_tick_perf > 0
-                    else 0.0
-                )
-                tr.counter("loop_lag_ms", round(max(0.0, _lag_ms), 1))
-                tr.counter("tick_work_ms", round(_work_ms, 1))
-                tr.counter("frame_prepare_ms", round(_prepare_s * 1000.0, 1))
-            if self._tick_warn_ms > 0 and _work_ms > self._tick_warn_ms:
-                logger.warning(
-                    f"[ojin-tick-slow] tick work {_work_ms:.0f}ms "
-                    f"(frame_prepare={_prepare_s * 1000.0:.0f}ms, swapped={swapped}, "
-                    f"video={'y' if video_frame is not None else 'n'}, "
-                    f"pending_frames={len(self._video_frames)}, "
-                    f"queued_buffers={len(self._audio_buffers)}) — main loop blocked this tick"
-                )
-
-    # ------------------------------------------------------------------
-    # Started/Stopped speaking signalling — derived from buffer state
-    # ------------------------------------------------------------------
-
-    def _is_currently_speaking(self) -> bool:
-        return (
-            self._current_buffer is not None
-            and not self._current_buffer.interrupted
-            and len(self._current_buffer.bytes_) > 0
-        )
-
-    async def _maybe_emit_started_speaking(self) -> None:
-        if self._is_currently_speaking() and not self._was_speaking_emitted:
-            self._was_speaking_emitted = True
-            if self._trace is not None:
-                self._tr_speaking_start = self._trace.mark()
+        @self._stv.on(STVEvent.BOT_STARTED_SPEAKING)
+        async def _on_started(**_):
             await self.push_frame(OjinBotStartedSpeakingFrame())
             await self.stop_ttfb_metrics()
 
-    async def _maybe_emit_stopped_speaking(self) -> None:
-        if not self._is_currently_speaking() and self._was_speaking_emitted:
-            self._was_speaking_emitted = False
-            if self._trace is not None and self._tr_speaking_start is not None:
-                self._trace.span(
-                    "speaking",
-                    "bot_speaking",
-                    self._tr_speaking_start,
-                    args={
-                        "buffer_id": (
-                            self._current_buffer.buffer_id
-                            if self._current_buffer is not None
-                            else None
-                        )
-                    },
-                )
-                self._tr_speaking_start = None
+        @self._stv.on(STVEvent.BOT_STOPPED_SPEAKING)
+        async def _on_stopped(**_):
             await self.push_frame(OjinBotStoppedSpeakingFrame())
 
-    # ------------------------------------------------------------------
-    # Event-loop stall diagnostics
-    # ------------------------------------------------------------------
+        @self._stv.on(STVEvent.ERROR)
+        async def _on_error(message="", fatal=False, **_):
+            await self.push_error(message, fatal=fatal)
 
-    def _loop_stall_watchdog(self, threshold_s: float, stop: threading.Event) -> None:
-        """Dump all thread stacks when a playback tick stalls (background thread).
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Route inbound pipecat frames to the client; stay transparent otherwise."""
+        await super().process_frame(frame, direction)
 
-        Reads the playback loop's last-tick timestamp; if it has not advanced
-        within a threshold (and playback is not intentionally paused), dumps
-        every thread's stack to stderr once per stall. faulthandler walks frames
-        without holding the GIL, so this captures the main thread even while it
-        is blocked inside a synchronous C call (cv2, GC, native SDK). Diagnostic
-        only — never raises into the session.
-
-        Two tiers, each latched so a single stall dumps once:
-
-        * the big ``threshold_s`` watchdog (default 250ms) for hard freezes;
-        * a low ``_stall_probe_ms`` PROBE (default 35ms) for the small post-LLM
-          loop_lag spike. Because the probe must catch a ~tens-of-ms stall while
-          it is still in progress, the poll interval drops to ~5ms when the
-          probe is enabled.
-        """
-        probe_s = self._stall_probe_ms / 1000.0 if self._stall_probe_ms > 0 else 0.0
-        if probe_s > 0:
-            check_s = max(0.005, min(probe_s / 2.0, 0.02))
+        if isinstance(frame, self._start_frame_cls):
+            await self.push_frame(frame, direction)
+            await self._stv.start()
+        elif isinstance(frame, TTSStartedFrame):
+            self._waiting_for_first_tts = True
+            await self._stv.start_turn()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, TTSAudioRawFrame):
+            # The client discards the ~0.5 s trailing-silence sentinel; drop it here
+            # too so TTFB anchors on audio that is actually buffered/played and the
+            # sentinel is not passed through (parity with the old adapter).
+            if _is_trailing_silence(frame.audio, frame.sample_rate, frame.num_channels):
+                return
+            if self._waiting_for_first_tts:
+                self._waiting_for_first_tts = False
+                await self.start_ttfb_metrics()
+            await self._stv.send_tts_audio(frame.audio, frame.sample_rate, frame.num_channels)
+            if self._settings.tts_audio_passthrough:
+                await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            await self._stv.interrupt()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            await self._stv.close()
+            await self.push_frame(frame, direction)
         else:
-            check_s = max(0.01, min(threshold_s / 2.0, 0.05))
-        dumped_full = False
-        dumped_probe = False
-        while not stop.wait(check_s):
-            try:
-                last = self._last_tick_perf
-                if last <= 0.0 or self._playback_paused:
-                    dumped_full = dumped_probe = False
-                    continue
-                stalled_s = time.perf_counter() - last
-                # Probe tier — small stalls (e.g. the post-LLM spike). Dumped
-                # first/once so the stack reflects the live block, before the
-                # bigger watchdog (if the stall keeps growing) fires too.
-                if probe_s > 0 and stalled_s >= probe_s and not dumped_probe:
-                    dumped_probe = True
-                    print(
-                        f"\n[ojin-stall-probe] playback loop stalled "
-                        f"{stalled_s * 1000:.0f}ms (probe threshold {self._stall_probe_ms:.0f}ms) "
-                        f"— dumping all thread stacks (the offender is the running frame):",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-                if stalled_s >= threshold_s and not dumped_full:
-                    dumped_full = True
-                    print(
-                        f"\n[ojin-loop-watchdog] playback loop stalled "
-                        f"{stalled_s * 1000:.0f}ms (threshold {threshold_s * 1000:.0f}ms) "
-                        f"— dumping all thread stacks:",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-                # Re-arm each tier once the loop is advancing again.
-                if stalled_s < threshold_s:
-                    dumped_full = False
-                if probe_s > 0 and stalled_s < probe_s:
-                    dumped_probe = False
-            except Exception:  # pragma: no cover - diagnostic only
-                pass
-
-    def _loop_exception_handler(self, loop: asyncio.AbstractEventLoop, context: dict) -> None:
-        """Loop exception handler that names the connection behind socket errors.
-
-        asyncio's default handler prints SSL/transport failures (e.g. ``Bad file
-        descriptor`` → ``Event loop is closed``) with a traceback that is wholly
-        asyncio-internal — no application frames — so there is no hint which
-        connection died. Log the transport's peer/host/fd so the next occurrence
-        is attributable, then delegate to the previous handler. Never raises.
-        """
-        try:
-            transport = context.get("transport")
-            info: dict = {}
-            get_extra = getattr(transport, "get_extra_info", None)
-            if callable(get_extra):
-                for key in ("peername", "sockname", "server_hostname"):
-                    try:
-                        info[key] = get_extra(key)
-                    except Exception:
-                        pass
-                try:
-                    sock = get_extra("socket")
-                    info["fd"] = sock.fileno() if sock is not None else None
-                except Exception:
-                    pass
-            exc = context.get("exception")
-            logger.warning(
-                f"[ojin-loop-exc] msg={context.get('message')!r} "
-                f"exc={type(exc).__name__ if exc else None}:{exc} "
-                f"transport_info={info}"
-            )
-        except Exception:  # pragma: no cover - diagnostic only
-            pass
-        finally:
-            try:
-                if self._prev_loop_exc_handler is not None:
-                    self._prev_loop_exc_handler(loop, context)
-                else:
-                    loop.default_exception_handler(context)
-            except Exception:  # pragma: no cover - diagnostic only
-                pass
-
-    def _start_loop_diagnostics(self) -> None:
-        """Install the loop exception handler + start the stall watchdog thread.
-
-        Defensive: a diagnostics failure must never break session startup.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-            self._prev_loop_exc_handler = loop.get_exception_handler()
-            loop.set_exception_handler(self._loop_exception_handler)
-        except Exception as exc:  # pragma: no cover - diagnostic only
-            logger.warning(f"could not install loop exception handler: {exc}")
-        if self._loop_stall_watchdog_ms > 0 and self._loop_watchdog_thread is None:
-            try:
-                stop = threading.Event()
-                thread = threading.Thread(
-                    target=self._loop_stall_watchdog,
-                    args=(self._loop_stall_watchdog_ms / 1000.0, stop),
-                    name="ojin-loop-watchdog",
-                    daemon=True,
-                )
-                self._loop_watchdog_stop = stop
-                self._loop_watchdog_thread = thread
-                thread.start()
-            except Exception as exc:  # pragma: no cover - diagnostic only
-                logger.warning(f"could not start loop stall watchdog: {exc}")
-
-    def _stop_loop_diagnostics(self) -> None:
-        """Restore the previous loop exception handler + stop the watchdog."""
-        try:
-            loop = asyncio.get_running_loop()
-            loop.set_exception_handler(self._prev_loop_exc_handler)
-        except Exception:  # pragma: no cover - diagnostic only
-            pass
-        stop = self._loop_watchdog_stop
-        thread = self._loop_watchdog_thread
-        self._loop_watchdog_stop = None
-        self._loop_watchdog_thread = None
-        if stop is not None:
-            stop.set()
-        if thread is not None:
-            thread.join(timeout=1.0)
-
-    # ------------------------------------------------------------------
-    # Service lifecycle
-    # ------------------------------------------------------------------
-
-    async def _start(self) -> None:
-        # Activate the caller-injected per-session Perfetto trace before
-        # connecting so the connect latency itself is captured. The bot owns
-        # trace creation (shared with its LatencyTracker); without an injected
-        # trace this session is untraced.
-        if self._injected_trace is not None:
-            self._trace = self._injected_trace
-            self._tr_session_start = self._trace.mark()
-            self._tr_connect_start = self._tr_session_start
-        self._start_loop_diagnostics()
-        self._start_decode_worker()
-        if not await self.connect_with_retry():
-            return
-        assert self._client is not None
-        self._receive_msg_task = self.create_task(self._receive_ojin_messages())
-        await self._client.start_interaction()
-
-    def _write_session_trace(self) -> None:
-        """Close open spans and flush the Perfetto trace to disk (once)."""
-        tr = self._trace
-        if tr is None:
-            return
-        self._trace = None
-        try:
-            if self._tr_speaking_start is not None:
-                tr.span("speaking", "bot_speaking", self._tr_speaking_start)
-                self._tr_speaking_start = None
-            tr.span(
-                "lifecycle", "session", self._tr_session_start, args={"session_id": tr.session_id}
-            )
-            path = tr.write()
-            logger.info(f"OjinVideoService session trace written: {path}")
-        except Exception as e:
-            logger.warning(f"session trace write failed: {e}")
-
-    async def _stop(self) -> None:
-        self._initialized = False
-        self._stop_loop_diagnostics()
-        self._stop_decode_worker()
-        self._write_session_trace()
-        if self._client is not None:
-            try:
-                await self._client.close()
-            except Exception as e:
-                logger.warning(f"Error closing client: {e}")
-        for t in (self._receive_msg_task, self._video_playback_task):
-            if t is not None:
-                t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-    # ------------------------------------------------------------------
-    # Off-loop frame preparation (JPEG decode + crop on a worker thread)
-    # ------------------------------------------------------------------
-
-    def _start_decode_worker(self) -> None:
-        """Start the background JPEG→RGB decode thread (idempotent)."""
-        if self._decode_thread is not None:
-            return
-        thread = threading.Thread(
-            target=self._decode_worker,
-            name="ojin-frame-decode",
-            daemon=True,
-        )
-        self._decode_thread = thread
-        thread.start()
-
-    def _stop_decode_worker(self) -> None:
-        """Signal the decode thread to drain and exit, then join it."""
-        thread = self._decode_thread
-        if thread is None:
-            return
-        self._decode_thread = None
-        self._decode_in.put(None)  # sentinel
-        thread.join(timeout=1.0)
-
-    def _decode_worker(self) -> None:
-        """Decode queued JPEG frames to RGB off the event loop, in order.
-
-        Pulls one frame at a time from ``_decode_in`` (FIFO, single consumer →
-        order preserved), decodes its pixels, and hands the frame back on
-        ``_decode_out`` for the loop to pop. A decode failure leaves
-        ``out_rgb=None`` so the loop repeats the last frame instead of blocking.
-        Exits on the ``None`` sentinel from :meth:`_stop_decode_worker`.
-        """
-        target_w, target_h = self._settings.image_size
-        while True:
-            frame = self._decode_in.get()
-            if frame is None:  # shutdown sentinel
-                break
-            try:
-                frame.out_rgb = _decode_to_rgb(frame.image_bytes, target_w, target_h)
-            except Exception as exc:  # never let a bad frame kill the worker
-                frame.out_rgb = None
-                logger.warning(f"frame decode failed: {exc}")
-            self._decode_out.put(frame)
+            await self.push_frame(frame, direction)

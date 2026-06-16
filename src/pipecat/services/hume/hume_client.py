@@ -1,4 +1,5 @@
 """Hume.ai EVI (Empathic Voice Interface) WebSocket client.
+
 Handles speech-to-speech conversation with Hume's API.
 """
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 class SimpleHumeClient:
     """Simplified Hume client using direct WebSocket connection.
+
     More control over the connection for our POC.
     """
 
@@ -27,6 +29,7 @@ class SimpleHumeClient:
         config_id: str | None = None,
         system_prompt: str | None = None,
     ):
+        """Initialize the client with a message callback and optional Hume credentials."""
         self.on_message = on_message
         self.api_key = api_key or os.getenv("HUME_API_KEY")
         self.config_id = config_id or os.getenv("HUME_CONFIG_ID")

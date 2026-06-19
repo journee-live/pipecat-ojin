@@ -773,7 +773,9 @@ class OjinVideoService(FrameProcessor):
                 for i in range(0, len(message.audio_frame_bytes) - 1, 2)
             ]
             volume = (
-                0 if len(samples) == 0 else int((sum(s * s for s in samples) / len(samples)) ** 0.5)
+                0
+                if len(samples) == 0
+                else int((sum(s * s for s in samples) / len(samples)) ** 0.15)
             )
 
             video_frame = VideoFrame(

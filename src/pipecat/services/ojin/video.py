@@ -312,7 +312,7 @@ class OjinVideoSettings:
     # in a fresh, non-interrupted buffer that plays at full volume. 0 disables
     # the ramp (restores the previous hard cut). Video keeps its own server-side
     # frame_type=2 fade — this only governs audio output.
-    interrupt_audio_fade_s: float = 0.75
+    interrupt_audio_fade_s: float = 0.2
 
 
 class OjinVideoService(FrameProcessor):
@@ -773,9 +773,7 @@ class OjinVideoService(FrameProcessor):
                 for i in range(0, len(message.audio_frame_bytes) - 1, 2)
             ]
             volume = (
-                0
-                if len(samples) == 0
-                else int((sum(s * s for s in samples) / len(samples)) ** 0.15)
+                0 if len(samples) == 0 else int((sum(s * s for s in samples) / len(samples)) ** 0.5)
             )
 
             video_frame = VideoFrame(

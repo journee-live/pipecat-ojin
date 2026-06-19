@@ -26,9 +26,11 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ImageRawFrame,
+    InputTransportMessageFrame,
     OutputAudioRawFrame,
     OutputDTMFFrame,
     OutputDTMFUrgentFrame,
+    OutputImageRawFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
     StartFrame,
@@ -49,6 +51,21 @@ except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use LiveKit, you need to `pip install pipecat-ai[livekit]`.")
     raise Exception(f"Missing module: {e}")
+
+# Mapping from pipecat ``OutputImageRawFrame.format`` strings to LiveKit
+# ``rtc.VideoBufferType`` values. ``OjinVideoService`` emits ``"RGB"``; the
+# rest are listed for parity with the formats LiveKit can consume directly
+# so that other avatar pipelines can publish without an intermediate convert().
+_PIPECAT_FORMAT_TO_LIVEKIT_BUFFER = {
+    "RGB": proto_video_frame.VideoBufferType.RGB24,
+    "RGB24": proto_video_frame.VideoBufferType.RGB24,
+    "RGBA": proto_video_frame.VideoBufferType.RGBA,
+    "BGRA": proto_video_frame.VideoBufferType.BGRA,
+    "ARGB": proto_video_frame.VideoBufferType.ARGB,
+    "ABGR": proto_video_frame.VideoBufferType.ABGR,
+    "I420": proto_video_frame.VideoBufferType.I420,
+}
+
 
 # DTMF mapping according to RFC 4733
 DTMF_CODE_MAP = {
@@ -136,10 +153,21 @@ class LiveKitTransportMessageUrgentFrame(LiveKitOutputTransportMessageUrgentFram
 class LiveKitParams(TransportParams):
     """Configuration parameters for LiveKit transport.
 
-    Inherits all parameters from TransportParams without additional configuration.
+    Inherits audio and video parameters from ``TransportParams`` (``audio_in_*``,
+    ``audio_out_*``, ``video_in_enabled``, ``video_out_*``).
+
+    Parameters:
+        av_sync_enabled: When ``True`` and ``video_out_enabled`` is set, route
+            outgoing audio and video frames through ``rtc.AVSynchronizer``.
+            This paces video output to ``video_out_framerate`` while letting
+            audio flow through immediately, so both tracks share a common
+            wall-clock basis on the wire and RTCP Sender Reports keep the
+            client aligned. Disable to publish directly to the underlying
+            sources (lets the caller pass per-frame ``timestamp_us`` for
+            explicit lipsync control).
     """
 
-    pass
+    av_sync_enabled: bool = True
 
 
 class LiveKitCallbacks(BaseModel):
@@ -209,6 +237,9 @@ class LiveKitTransportClient:
         self._audio_track: Optional[rtc.LocalAudioTrack] = None
         self._audio_tracks = {}
         self._audio_queue = asyncio.Queue()
+        self._video_source: Optional[rtc.VideoSource] = None
+        self._video_track: Optional[rtc.LocalVideoTrack] = None
+        self._av_synchronizer: Optional[rtc.AVSynchronizer] = None
         self._video_tracks = {}
         self._video_queue = asyncio.Queue()
         self._other_participant_has_joined = False
@@ -306,6 +337,65 @@ class LiveKitTransportClient:
                 options.source = rtc.TrackSource.SOURCE_MICROPHONE
                 await self.room.local_participant.publish_track(self._audio_track, options)
 
+                # Set up video source and track when video output is enabled.
+                # Avatar pipelines emit OutputImageRawFrame; we publish it as a
+                # camera track and let the client align via RTCP Sender Reports.
+                if self._params.video_out_enabled:
+                    self._video_source = rtc.VideoSource(
+                        self._params.video_out_width,
+                        self._params.video_out_height,
+                    )
+                    self._video_track = rtc.LocalVideoTrack.create_video_track(
+                        "pipecat-video", self._video_source
+                    )
+                    video_options = rtc.TrackPublishOptions()
+                    video_options.source = rtc.TrackSource.SOURCE_CAMERA
+                    # ``video_encoding`` is a nested protobuf message — direct
+                    # assignment raises "Assignment not allowed to message
+                    # field"; CopyFrom is the supported mutation path.
+                    video_options.video_encoding.CopyFrom(
+                        rtc.VideoEncoding(
+                            max_framerate=self._params.video_out_framerate,
+                            max_bitrate=self._params.video_out_bitrate,
+                        )
+                    )
+                    if self._params.video_out_codec:
+                        codec_map = {
+                            "VP8": rtc.VideoCodec.VP8,
+                            "H264": rtc.VideoCodec.H264,
+                            "VP9": rtc.VideoCodec.VP9,
+                            "AV1": rtc.VideoCodec.AV1,
+                        }
+                        codec = codec_map.get(self._params.video_out_codec.upper())
+                        if codec is not None:
+                            video_options.video_codec = codec
+                    await self.room.local_participant.publish_track(
+                        self._video_track, video_options
+                    )
+
+                    # Capture a black frame immediately so the widget never
+                    # sees the uninitialized YUV buffer (renders as green).
+                    _w = self._params.video_out_width
+                    _h = self._params.video_out_height
+                    self._video_source.capture_frame(
+                        rtc.VideoFrame(
+                            width=_w,
+                            height=_h,
+                            type=rtc.VideoBufferType.RGB24,
+                            data=bytearray(_w * _h * 3),
+                        )
+                    )
+
+                    if self._params.av_sync_enabled:
+                        # AVSynchronizer paces video at video_out_framerate and
+                        # lets audio flow through immediately; both share the
+                        # same wall-clock basis on capture.
+                        self._av_synchronizer = rtc.AVSynchronizer(
+                            audio_source=self._audio_source,
+                            video_source=self._video_source,
+                            video_fps=float(self._params.video_out_framerate),
+                        )
+
                 await self._callbacks.on_connected()
 
                 # Check if there are already participants in the room
@@ -328,6 +418,23 @@ class LiveKitTransportClient:
 
             logger.info(f"Disconnecting from {self._room_name}")
             await self._callbacks.on_before_disconnect()
+
+            # Tear down the synchronizer before the underlying sources so its
+            # background capture task stops accessing them.
+            if self._av_synchronizer is not None:
+                try:
+                    await self._av_synchronizer.aclose()
+                except Exception as e:
+                    logger.warning(f"Error closing AVSynchronizer: {e}")
+                self._av_synchronizer = None
+            if self._video_source is not None:
+                try:
+                    await self._video_source.aclose()
+                except Exception as e:
+                    logger.warning(f"Error closing VideoSource: {e}")
+                self._video_source = None
+            self._video_track = None
+
             await self.room.disconnect()
             self._connected = False
             logger.info(f"Disconnected from {self._room_name}")
@@ -383,10 +490,43 @@ class LiveKitTransportClient:
             return False
 
         try:
-            await self._audio_source.capture_frame(audio_frame)
+            if self._av_synchronizer is not None:
+                await self._av_synchronizer.push(audio_frame)
+            else:
+                await self._audio_source.capture_frame(audio_frame)
             return True
         except Exception as e:
             logger.error(f"Error publishing audio: {e}")
+            return False
+
+    async def publish_video(
+        self, video_frame: rtc.VideoFrame, timestamp_us: int = 0
+    ) -> bool:
+        """Publish a video frame to the room.
+
+        Args:
+            video_frame: The LiveKit video frame to publish.
+            timestamp_us: Wall-clock microseconds for the frame. When
+                ``av_sync_enabled`` is False this is forwarded to
+                ``VideoSource.capture_frame`` as the wire RTP timestamp basis,
+                which is how the avatar's PTS reaches the client. When
+                ``av_sync_enabled`` is True the synchronizer paces frames at
+                the configured FPS and the timestamp is recorded for telemetry.
+        """
+        if not self._connected or not self._video_source:
+            return False
+
+        try:
+            if self._av_synchronizer is not None:
+                await self._av_synchronizer.push(
+                    video_frame,
+                    timestamp=(timestamp_us / 1_000_000) if timestamp_us else None,
+                )
+            else:
+                self._video_source.capture_frame(video_frame, timestamp_us=timestamp_us)
+            return True
+        except Exception as e:
+            logger.error(f"Error publishing video: {e}")
             return False
 
     def get_participants(self) -> List[str]:
@@ -718,13 +858,20 @@ class LiveKitInputTransport(BaseInputTransport):
         await self._transport.cleanup()
 
     async def push_app_message(self, message: Any, sender: str):
-        """Push an application message as an urgent transport frame.
+        """Push an application message as an input transport frame.
 
         Args:
-            message: The message data to send.
+            message: The message data to send. Raw strings are JSON-parsed
+                so downstream processors receive a dict, matching Daily's
+                behaviour where the SDK pre-parses app messages.
             sender: ID of the message sender.
         """
-        frame = LiveKitOutputTransportMessageUrgentFrame(message=message, participant_id=sender)
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        frame = InputTransportMessageFrame(message=message)
         await self.push_frame(frame)
 
     async def _audio_in_task_handler(self):
@@ -914,6 +1061,31 @@ class LiveKitOutputTransport(BaseOutputTransport):
         livekit_audio = self._convert_pipecat_audio_to_livekit(frame.audio)
         return await self._client.publish_audio(livekit_audio)
 
+    async def write_video_frame(self, frame: OutputImageRawFrame) -> bool:
+        """Write a video frame to the LiveKit room.
+
+        Converts the pipecat ``OutputImageRawFrame`` into an ``rtc.VideoFrame``
+        and forwards the frame's ``pts`` (nanoseconds) as ``timestamp_us`` so
+        the avatar's audio/video shared-PTS reaches the wire as the RTP
+        timestamp basis used by RTCP Sender Reports for client-side
+        realignment.
+
+        Args:
+            frame: The image frame to write.
+
+        Returns:
+            True if the video frame was written successfully, False otherwise.
+        """
+        if not self._params.video_out_enabled:
+            return False
+        try:
+            livekit_video = self._convert_pipecat_image_to_livekit(frame)
+        except ValueError as e:
+            logger.error(f"Error converting video frame: {e}")
+            return False
+        timestamp_us = (frame.pts // 1000) if frame.pts is not None else 0
+        return await self._client.publish_video(livekit_video, timestamp_us=timestamp_us)
+
     def _supports_native_dtmf(self) -> bool:
         """LiveKit supports native DTMF via telephone events.
 
@@ -941,6 +1113,26 @@ class LiveKitOutputTransport(BaseOutputTransport):
             sample_rate=self.sample_rate,
             num_channels=self._params.audio_out_channels,
             samples_per_channel=samples_per_channel,
+        )
+
+    def _convert_pipecat_image_to_livekit(self, frame: OutputImageRawFrame) -> rtc.VideoFrame:
+        """Convert a Pipecat output image frame to a LiveKit ``VideoFrame``.
+
+        Raises ``ValueError`` when the frame's color format is not supported
+        by the LiveKit buffer types we recognise.
+        """
+        width, height = frame.size
+        buffer_type = _PIPECAT_FORMAT_TO_LIVEKIT_BUFFER.get((frame.format or "").upper())
+        if buffer_type is None:
+            raise ValueError(
+                f"Unsupported OutputImageRawFrame format {frame.format!r}; "
+                f"expected one of {sorted(_PIPECAT_FORMAT_TO_LIVEKIT_BUFFER)}"
+            )
+        return rtc.VideoFrame(
+            width=width,
+            height=height,
+            type=buffer_type,
+            data=frame.image,
         )
 
 
